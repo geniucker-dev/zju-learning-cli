@@ -234,11 +234,11 @@ class AudioCommands(unittest.TestCase):
         for key, value in kw.items():setattr(args, key, value)
         return args
 
-    def test_local_legacy_recording_preference_skip_force_and_dry_run(self):
+    def test_local_recording_preference_skip_force_and_dry_run(self):
         sub = dict(course_id=1, sub_id=2, course_name="课程", sub_name="第一堂")
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            video = root / "课程 (1)/錄播/第一堂 (2).mp4"
+            video = root / "课程 (1)/录播/第一堂 (2).mp4"
             video.parent.mkdir(parents=True)
             video.write_bytes(b"complete video")
             client = mock.Mock()

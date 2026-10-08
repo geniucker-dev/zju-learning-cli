@@ -25,8 +25,8 @@
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
-| `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智云PPT/<堂>.pdf` |
-| `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/转录/<堂>.txt\|srt\|md` |
+| `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程> (<id>)/智云PPT/<堂> (<sub_id>).pdf` |
+| `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程> (<id>)/转录/<堂> (<sub_id>).txt\|srt\|md` |
 | `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
 | `./zju.py recording-audio --course <id> \| --days N [-j 32]` | 優先從本地錄播提取音軌，否則只下載音訊 → `<課程> (<id>)/音频/<堂> (<sub_id>).m4a` |
 
@@ -66,7 +66,7 @@ zju transcript --days 1 --format md
 
 `sync --videos` 下載學在浙大活動的影音附件；`./zju.py recording` 下載智雲課堂的課堂錄播，兩者來源不同。
 
-程式提示與說明改用簡體中文，新資料目錄為 `智云PPT`、`转录`、`录播`。已有繁體目錄中的檔案和影片續傳進度仍會辨識，繼續使用原路徑，不搬移或重複下載；課程名、檔名和轉錄內容保留平台原文。
+程式提示與說明使用簡體中文。智雲資料統一保存在 `<課程名> (<course_id>)` 下，按 `智云PPT`、`转录`、`录播`、`音频` 分類，檔名為 `<堂次名> (<sub_id>).副檔名`。`--keep-images` 保留的截圖也使用含堂次 ID 的子目錄。課程名和轉錄內容保留平台原文；不辨識或遷移舊目錄。
 
 排程範例（cron，每天 22:00）：
 
@@ -82,7 +82,7 @@ zju transcript --days 1 --format md
 
 預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recording` 同時下載錄播，`--recording-audio` 同時取得音訊。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。音訊於這些步驟完成後處理，遠端音訊請求也遵循 `-j` 上限（同步預設 4）；單獨 `recording-audio` 命令預設 32。搭配 `--recording --recording-audio` 時直接從剛下載的錄播提取音軌。
 
-沿用現有資料目錄與增量跳過規則，錄播繼續支援跨次執行的斷點續傳。`--force` 重新下載資料並丟棄錄播分片進度；`--format txt|srt|md` 選擇轉錄格式，`--dedup` 去除重複 PPT 截圖，`--keep-images` 保留全部截圖，`--max-size MB` 限制錄播單檔大小（0 為不限）。
+使用統一資料目錄與增量跳過規則，錄播繼續支援跨次執行的斷點續傳。`--force` 重新下載資料並丟棄錄播分片進度；`--format txt|srt|md` 選擇轉錄格式，`--dedup` 去除重複 PPT 截圖，`--keep-images` 保留全部截圖，`--max-size MB` 限制錄播單檔大小（0 為不限）。
 
 `--dry-run` 不下載、不寫檔：PPT 與轉錄依現有檔案及堂次預覽路徑，標記為待檢查的資料可能尚未發布；錄播讀取目錄後預覽。單項失敗仍繼續處理其他資料，最終退出碼為 2。
 
@@ -134,7 +134,7 @@ zju transcript --days 1 --format md
 ./zju.py classroom sync 89418 --recording --recording-audio -j 8
 ```
 
-優先使用輸出目錄中已完成的錄播，包含舊的 `錄播` 目錄；未完成的 `.part` 不算完整影片。沒有影片時，讀取遠端 MP4 索引並只下載音軌範圍。每批最多 360 個音訊分片，Range 請求頭接近 8KiB 時自動縮小批次。音軌範圍請求固定直連，不讀取環境代理，也不回退到代理。
+優先使用統一目錄中已完成的錄播；未完成的 `.part` 不算完整影片。沒有影片時，讀取遠端 MP4 索引並只下載音軌範圍。每批最多 360 個音訊分片，Range 請求頭接近 8KiB 時自動縮小批次。音軌範圍請求固定直連，不讀取環境代理，也不回退到代理。
 
 輸出為 `<輸出目錄>/<課程名稱> (<course_id>)/音频/<堂次名稱> (<sub_id>).m4a`，多段回放分別編號。已完成音訊會略過；`--force` 重新提取或下載，`--max-size MB` 限制最終音訊大小。成功後才原子替換輸出並更新清單，失敗或中斷會清理暫存資料，保留舊檔案；音訊暫不支援跨次執行的續傳。
 

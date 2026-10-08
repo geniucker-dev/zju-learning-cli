@@ -98,16 +98,11 @@ def safe_name(s: str) -> str:
     return s
 
 
-def material_path(course_dir: Path, kind: str, filename: str) -> Path:
-    """新资料使用简体目录，旧文件和续传分片继续使用原路径。"""
-    legacy_names = {"智云PPT": "智雲PPT", "转录": "轉錄", "录播": "錄播"}
-    target = course_dir / kind / filename
-    legacy = course_dir / legacy_names.get(kind, kind) / filename
-    for candidate in (target, legacy):
-        if (candidate.exists() or candidate.with_name(f".{filename}.part").exists()
-                or candidate.with_name(f".{filename}.part.json").exists()):
-            return candidate
-    return target
+def classroom_material_path(root: Path, sub: dict, kind: str, extension: str, part: str = "") -> Path:
+    """智云资料统一按课程和堂次 ID 命名。"""
+    course = safe_name(f"{sub['course_name']} ({sub['course_id']})")
+    stem = f"{safe_name(sub['sub_name'])} ({sub['sub_id']})"
+    return root / course / kind / f"{stem}{part}.{extension}"
 
 
 # ---------------- config / credentials ----------------
@@ -1914,8 +1909,7 @@ def cmd_classroom_sync(a):
     if a.dry_run:
         for s in subs:
             for kind, suffix in (("智云PPT", "pdf"), ("转录", a.format)):
-                dest = material_path(root / safe_name(s["course_name"]), kind,
-                                     f"{safe_name(s['sub_name'])}.{suffix}")
+                dest = classroom_material_path(root, s, kind, suffix)
                 status = "跳过" if dest.exists() and not a.force else "待检查并下载"
                 print(f"[{status}] {dest.relative_to(root)}")
         if a.recording:
@@ -1968,7 +1962,7 @@ def cmd_ppt(a):
 
 
 def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = None):
-    pdf = material_path(root / safe_name(s["course_name"]), "智云PPT", f"{safe_name(s['sub_name'])}.pdf")
+    pdf = classroom_material_path(root, s, "智云PPT", "pdf")
     cdir = pdf.parent
     if pdf.exists() and not a.force:
         log(f"[跳过] {pdf.relative_to(root)}")
@@ -2001,7 +1995,7 @@ def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = No
         cdir.mkdir(parents=True, exist_ok=True)
         images_to_pdf(pages, pdf)
         if a.keep_images:  # 留全部原图，去重只影响 PDF
-            shutil.copytree(tmpdir, cdir / safe_name(s["sub_name"]), dirs_exist_ok=True)
+            shutil.copytree(tmpdir, cdir / pdf.stem, dirs_exist_ok=True)
         note = f"，去重前 {len(paths)}" if len(pages) != len(paths) else ""
         print(f"[PDF] {pdf.relative_to(root)}（{len(pages)} 页{note}）")
     finally:
@@ -2024,7 +2018,7 @@ def cmd_transcript(a):
 
 
 def transcript_one(z: Zju, a, root: Path, s: dict):
-    out = material_path(root / safe_name(s["course_name"]), "转录", f"{safe_name(s['sub_name'])}.{a.format}")
+    out = classroom_material_path(root, s, "转录", a.format)
     if out.exists() and not a.force:
         log(f"[跳过] {out.relative_to(root)}")
         return
@@ -2058,10 +2052,8 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
 
     for s in subs:
         cid, sid = s["course_id"], s["sub_id"]
-        course_dir = root / safe_name(f"{s['course_name']} ({cid})")
-        stem = f"{safe_name(s['sub_name'])} ({sid})"
-        video = material_path(course_dir, "录播", f"{stem}.mp4")
-        single = material_path(course_dir, "音频", f"{stem}.m4a")
+        video = classroom_material_path(root, s, "录播", "mp4")
+        single = classroom_material_path(root, s, "音频", "m4a")
         if not a.force and complete(single, f"audio:{cid}:{sid}:1"):
             skipped += 1
             log(f"[跳过] {single.relative_to(root)}")
@@ -2088,14 +2080,14 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
                 sources = []
                 for i, url in enumerate(urls, 1):
                     suffix = f" - {i:02d}" if len(urls) > 1 else ""
-                    path = material_path(course_dir, "录播", f"{stem}{suffix}.mp4")
+                    path = classroom_material_path(root, s, "录播", "mp4", suffix)
                     sources.append((i, suffix, url, path if complete(path, f"video:{cid}:{sid}:{i}") else None))
             except ZjuError as e:
                 failed += 1
                 log(f"[失败] 音频 {s['course_name']} {s['sub_name']}: {e}")
                 continue
         for i, suffix, url, video in sources:
-            dest = material_path(course_dir, "音频", f"{stem}{suffix}.m4a")
+            dest = classroom_material_path(root, s, "音频", "m4a", suffix)
             key = f"audio:{cid}:{sid}:{i}"
             if not a.force and complete(dest, key):
                 skipped += 1
@@ -2165,11 +2157,10 @@ def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExec
             failed += 1
             log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
             continue
-        course_dir = root / safe_name(f"{s['course_name']} ({cid})")
         for i, url in enumerate(urls, 1):
             key = f"video:{cid}:{sid}:{i}"
             part = f" - {i:02d}" if len(urls) > 1 else ""
-            dest = material_path(course_dir, "录播", f"{safe_name(s['sub_name'])} ({sid}){part}.mp4")
+            dest = classroom_material_path(root, s, "录播", "mp4", part)
             rec = man.get(key)
             if not a.force and rec and dest.is_file() and dest.stat().st_size == rec.get("size"):
                 skipped += 1

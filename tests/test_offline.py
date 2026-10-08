@@ -116,7 +116,7 @@ class Offline(unittest.TestCase):
                     self.assertEqual(len(list(root.rglob("*.md"))), 3)
                     self.assertEqual(len(list(root.rglob("*.mp4"))), 3)
                     self.assertEqual(download.call_count, 3)
-                    self.assertEqual((root / "课程/转录/第1堂.md").read_text(), "# 课程 第1堂\n\n**[00:00:00]** 转写内容  \n")
+                    self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00]** 转写内容  \n")
                     client.subtitle.reset_mock()
                     client.ppt_urls.reset_mock()
                     zju.cmd_classroom_sync(args)
@@ -613,26 +613,14 @@ class Offline(unittest.TestCase):
                 zju.stream_to(r, Path(d) / "video.mp4", mp4=True)
             self.assertEqual(list(Path(d).iterdir()), [])
 
-    def test_simplified_paths_preserve_existing_materials(self):
-        with tempfile.TemporaryDirectory() as d:
-            course_dir = Path(d) / "课程"
-            for kind, legacy, name in (("智云PPT", "智雲PPT", "课堂.pdf"),
-                                       ("转录", "轉錄", "课堂.md"),
-                                       ("录播", "錄播", "课堂.mp4")):
-                self.assertEqual(zju.material_path(course_dir, kind, name), course_dir / kind / name)
-                old = course_dir / legacy / name
-                old.parent.mkdir(parents=True, exist_ok=True)
-                old.write_bytes(b"existing")
-                self.assertEqual(zju.material_path(course_dir, kind, name), old)
-                new = course_dir / kind / name
-                new.parent.mkdir(parents=True, exist_ok=True)
-                new.write_bytes(b"new")
-                self.assertEqual(zju.material_path(course_dir, kind, name), new)
-            old_video = course_dir / "錄播" / "未完成.mp4"
-            partial = old_video.with_name(f".{old_video.name}.part")
-            partial.write_bytes(b"partial")
-            self.assertEqual(zju.material_path(course_dir, "录播", old_video.name), old_video)
-            self.assertEqual(partial.read_bytes(), b"partial")
+    def test_classroom_paths_use_course_and_sub_ids(self):
+        root = Path("output")
+        sub = dict(course_id=1, sub_id=2, course_name="课/程", sub_name="第:一堂")
+        for kind, ext in (("智云PPT", "pdf"), ("转录", "md"), ("录播", "mp4"), ("音频", "m4a")):
+            self.assertEqual(zju.classroom_material_path(root, sub, kind, ext),
+                             root / "课_程 (1)" / kind / f"第_一堂 (2).{ext}")
+        self.assertEqual(zju.classroom_material_path(root, sub, "录播", "mp4", " - 01"),
+                         root / "课_程 (1)/录播/第_一堂 (2) - 01.mp4")
 
 
 if __name__ == "__main__":
