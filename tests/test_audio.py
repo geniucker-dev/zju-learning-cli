@@ -286,6 +286,40 @@ class AudioCommands(unittest.TestCase):
                 self.assertIsNone(make.call_args_list[1].args[1])
                 self.assertEqual(len(list(root.rglob("*.m4a"))), 2)
 
+    def test_delisted_lessons_skip_but_unexpected_missing_catalogue_fails(self):
+        import contextlib
+        import io
+        sub = dict(course_id=1, sub_id=2, course_name="课程", sub_name="第一堂", show="no")
+        for dry_run in (False, True):
+            for fn in (zju.audio_subs, zju.recording_subs):
+                with tempfile.TemporaryDirectory() as d:
+                    root = Path(d) / "new"
+                    client = mock.Mock()
+                    client.video_catalogue.return_value = {}
+                    output = io.StringIO()
+                    with contextlib.redirect_stderr(output), mock.patch.object(zju, "make_audio") as audio, \
+                            mock.patch.object(zju, "download_video") as video:
+                        self.assertEqual(fn(client, self.args(root, dry_run=dry_run), root, [sub]), 0)
+                        client.video_catalogue.assert_not_called()
+                        audio.assert_not_called()
+                        video.assert_not_called()
+                        self.assertIn("已下架，跳过", output.getvalue())
+                        self.assertFalse(root.exists())
+                        # 非下架堂次缺少目录仍属异常，不能掩盖接口问题。
+                        self.assertEqual(fn(client, self.args(root, dry_run=dry_run), root,
+                                            [dict(sub, show="yes")]), 1)
+
+    def test_course_subs_preserves_visibility(self):
+        client = zju.Zju.__new__(zju.Zju)
+        lessons = [dict(id=2, sub_title="第一堂", show="no"),
+                   dict(id=3, sub_title="第二堂", show="yes")]
+        detail = {"data": {"title": "课程", "sub_list": {"2026": {"9": {"1": lessons}}}}}
+        with mock.patch.object(client, "infosimple", return_value={"account": "test"}), \
+                mock.patch.object(client, "get"), mock.patch.object(client, "bearer", return_value={}), \
+                mock.patch.object(client, "json", return_value=detail):
+            self.assertEqual({s["sub_id"]: s["show"] for s in client.course_subs(1)},
+                             {2: "no", 3: "yes"})
+
     def test_local_extraction_without_external_tools(self):
         import struct
         box = zju.mp4_box

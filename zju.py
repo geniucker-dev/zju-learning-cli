@@ -622,7 +622,7 @@ class Zju:
                     for s in week:
                         subs.append({"course_id": course_id, "course_name": data["title"],
                                      "sub_id": int(s["id"]), "sub_name": s["sub_title"],
-                                     "lecturer": s.get("lecturer_name", "")})
+                                     "lecturer": s.get("lecturer_name", ""), "show": s.get("show")})
         subs.sort(key=lambda s: s["sub_name"])
         return subs
 
@@ -2051,6 +2051,10 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
                 and (not rec or path.stat().st_size == rec.get("size")))
 
     for s in subs:
+        if s.get("show") == "no":
+            skipped += 1
+            log(f"[已下架，跳过] 录播音轨 {s['course_name']} {s['sub_name']}")
+            continue
         cid, sid = s["course_id"], s["sub_id"]
         video = classroom_material_path(root, s, "录播", "mp4")
         single = classroom_material_path(root, s, "音频", "m4a")
@@ -2136,6 +2140,10 @@ def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExec
     failed = downloaded = skipped = unavailable = planned = 0
     limit = a.max_size * 2**20 if a.max_size else None
     for s in subs:
+        if s.get("show") == "no":
+            skipped += 1
+            log(f"[已下架，跳过] 录播 {s['course_name']} {s['sub_name']}")
+            continue
         cid, sid = s["course_id"], s["sub_id"]
         try:
             if cid not in catalogues:

@@ -86,6 +86,8 @@ zju transcript --days 1 --format md
 
 `--dry-run` 不下载、不写文件：PPT 和转写按现有文件及堂次预览路径，标记为待检查的资料可能尚未发布；录播读取目录后预览。单项失败仍继续处理其他资料，最终退出码为 2。
 
+接口标记为已下架（`show: "no"`）的堂次，录播和音轨会显示“已下架，跳过”，不计为失败；PPT 和转写仍按资料可用性处理。
+
 ```bash
 ./zju.py classroom sync -j 8
 ./zju.py classroom sync 89418 --recording -j 8
