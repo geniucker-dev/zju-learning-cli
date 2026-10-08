@@ -311,12 +311,12 @@ class AudioCommands(unittest.TestCase):
 
     def test_audio_cli_defaults_and_invalid_options(self):
         import sys
-        with mock.patch.object(zju, "cmd_audio") as command, mock.patch.object(zju, "load_config", return_value={}):
-            with mock.patch.object(sys, "argv", ["zju.py", "audio", "--course", "1"]):
+        with mock.patch.object(zju, "cmd_recording_audio") as command, mock.patch.object(zju, "load_config", return_value={}):
+            with mock.patch.object(sys, "argv", ["zju.py", "recording-audio", "--course", "1"]):
                 zju.main()
             self.assertEqual(command.call_args.args[0].jobs, 32)
             for options in (["-j", "0"], ["--max-size", "-1"], ["--sub", "2"]):
-                with mock.patch.object(sys, "argv", ["zju.py", "audio", *options]):
+                with mock.patch.object(sys, "argv", ["zju.py", "recording-audio", *options]):
                     with self.assertRaises(SystemExit) as error:
                         zju.main()
                     self.assertEqual(error.exception.code, 2)
@@ -328,7 +328,7 @@ class AudioCommands(unittest.TestCase):
         client.course_subs.return_value = [sub]
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "new"
-            args = self.args(root, course=[], audio=True, recordings=False, format="md", jobs=3)
+            args = self.args(root, course=[], recording_audio=True, recording=False, format="md", jobs=3)
             with mock.patch.object(zju, "Zju", return_value=client), \
                     mock.patch.object(zju, "transcript_one"), mock.patch.object(zju, "ppt_one"), \
                     mock.patch.object(zju, "audio_subs", return_value=0) as audio:

@@ -104,7 +104,7 @@ class Offline(unittest.TestCase):
             with tempfile.TemporaryDirectory() as d:
                 root = Path(d) / "output"
                 args = Namespace(out=str(root), course=["1", "课程"], dry_run=False, force=False,
-                                 recordings=True, jobs=jobs, max_size=0, format="md", dedup=False,
+                                 recording=True, jobs=jobs, max_size=0, format="md", dedup=False,
                                  keep_images=False)
                 with patch.object(zju, "Zju", return_value=client), \
                         patch.object(zju, "ThreadPoolExecutor", side_effect=create_pool), \
@@ -125,7 +125,7 @@ class Offline(unittest.TestCase):
                     self.assertEqual(download.call_count, 3)
                 # 默认不下载录播；预览也不创建目录或调用材料下载。
                 args.out = str(Path(d) / "preview")
-                args.dry_run, args.recordings = True, False
+                args.dry_run, args.recording = True, False
                 with patch.object(zju, "Zju", return_value=client), \
                         patch.object(zju, "ppt_one") as ppt, patch.object(zju, "transcript_one") as transcript, \
                         patch.object(zju, "recording_subs") as recording:
@@ -145,7 +145,7 @@ class Offline(unittest.TestCase):
         client.classroom_courses.return_value = [{"course_id": 1, "title": "课程", "type": "multi"}]
         client.course_subs.return_value = [dict(course_id=1, sub_id=1, course_name="课程", sub_name="第一堂")]
         with tempfile.TemporaryDirectory() as d:
-            args = Namespace(out=d, course=[], dry_run=False, force=False, jobs=1, recordings=True,
+            args = Namespace(out=d, course=[], dry_run=False, force=False, jobs=1, recording=True,
                              format="md", dedup=False, keep_images=False, max_size=0)
             with patch.object(zju, "Zju", return_value=client), \
                     patch.object(zju, "transcript_one", side_effect=zju.ZjuError("转写失败")), \

@@ -21,14 +21,14 @@
 | `zju upload 文件…` | 上传文件到学在浙大，输出 upload id |
 | `zju submit <作业id> --file … [--body …] [--draft] [-y]` | 交作业；默认提交前确认，已截止会拦下 |
 | `./zju.py classroom courses [--has-tasks] [--json]` | 智云个人课程，显示课程 ID、学期、教师和任务数 |
-| `./zju.py classroom sync [课程...] [-j 4] [--recordings] [--audio]` | 同步智云个人课程的 PPT 和转写，可选录播、音频 |
+| `./zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]` | 同步智云个人课程的 PPT 和转写，可选录播、音频 |
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
 | `./zju.py recording --course <id> \| --days N [-j 4]` | 智云录播 → `<课程> (<id>)/录播/<堂> (<sub_id>).mp4`，多连接分片下载 |
-| `./zju.py audio --course <id> \| --days N [-j 32]` | 优先从本地录播提取音轨，否则只下载音频 → `<课程> (<id>)/音频/<堂> (<sub_id>).m4a` |
+| `./zju.py recording-audio --course <id> \| --days N [-j 32]` | 优先从本地录播提取音轨，否则只下载音频 → `<课程> (<id>)/音频/<堂> (<sub_id>).m4a` |
 
 
 ## 安装
@@ -80,7 +80,7 @@ zju transcript --days 1 --format md
 
 ### 智云课程同步
 
-默认同步全部个人录播课程的所有堂次，下载 PPT（PDF）和 Markdown 转写；也可用课程 ID 或名称片段选课。`--recordings` 同时下载录播，`--audio` 同时获取音频。`-j` / `--jobs` 是整个同步的 worker 总数（默认 4）：每张 PPT 截图、每份转写各占一个 worker，录播的每个分片各占一个 worker，不再额外开录播分片线程池。转写、PPT、录播依次处理并复用同一个线程池。音频在这些步骤完成后处理，远端音频请求也遵循 `-j` 上限（同步默认 4）；单独 `audio` 命令默认 32。搭配 `--recordings --audio` 时，音频直接从刚下载的录播提取。
+默认同步全部个人录播课程的所有堂次，下载 PPT（PDF）和 Markdown 转写；也可用课程 ID 或名称片段选课。`--recording` 同时下载录播，`--recording-audio` 同时获取音频。`-j` / `--jobs` 是整个同步的 worker 总数（默认 4）：每张 PPT 截图、每份转写各占一个 worker，录播的每个分片各占一个 worker，不再额外开录播分片线程池。转写、PPT、录播依次处理并复用同一个线程池。音频在这些步骤完成后处理，远端音频请求也遵循 `-j` 上限（同步默认 4）；单独 `recording-audio` 命令默认 32。搭配 `--recording --recording-audio` 时，音频直接从刚下载的录播提取。
 
 沿用现有资料目录和增量跳过规则，录播继续支持跨次运行的断点续传。`--force` 重新下载资料并丢弃录播分片进度；`--format txt|srt|md` 选择转写格式，`--dedup` 去除重复 PPT 截图，`--keep-images` 保留全部截图，`--max-size MB` 限制录播或音频单文件大小（0 为不限）。
 
@@ -88,13 +88,13 @@ zju transcript --days 1 --format md
 
 ```bash
 ./zju.py classroom sync -j 8
-./zju.py classroom sync 89418 --recordings -j 8
-./zju.py classroom sync 人工智能 --dry-run --recordings
+./zju.py classroom sync 89418 --recording -j 8
+./zju.py classroom sync 人工智能 --dry-run --recording
 ```
 
 ### 智云录播下载
 
-默认列出智云「我的课程」中的全部课程，包括任务数为 0 的课程；`--has-tasks` 只列任务数大于 0 的课程。任务数与网页一致，不代表一定有可下载录播。`--json` 输出 `course_id`、`title`、`teacher`、`term`、`type` 和 `task_count`。这些课程 ID 可用于 `classroom subs`、`ppt`、`transcript`、`recording` 和 `audio`；顶层 `courses` 列出的则是学在浙大的 ID。
+默认列出智云「我的课程」中的全部课程，包括任务数为 0 的课程；`--has-tasks` 只列任务数大于 0 的课程。任务数与网页一致，不代表一定有可下载录播。`--json` 输出 `course_id`、`title`、`teacher`、`term`、`type` 和 `task_count`。这些课程 ID 可用于 `classroom subs`、`ppt`、`transcript`、`recording` 和 `recording-audio`；顶层 `courses` 列出的则是学在浙大的 ID。
 
 可以直接运行 `./zju.py`，无需创建软链接。使用智云课程 ID（与学在浙大不同）：
 
@@ -126,12 +126,12 @@ zju transcript --days 1 --format md
 无需安装 `ffmpeg` 或其他音视频工具。程序直接读取 MP4 索引、复制第一条音轨并重建 M4A，不重新编码：
 
 ```bash
-./zju.py audio --course 89418 --sub 2019095    # 指定堂次
-./zju.py audio --course 89418                  # 整门课，默认 32 个协程并发
-./zju.py audio --days 7 -j 8                   # 最近 7 天，调整并发数
-./zju.py audio --course 89418 --dry-run         # 预览本地提取或远端下载，不写文件
-./zju.py classroom sync 89418 --audio -j 32     # PPT、转写和音频
-./zju.py classroom sync 89418 --recordings --audio -j 8
+./zju.py recording-audio --course 89418 --sub 2019095    # 指定堂次
+./zju.py recording-audio --course 89418                  # 整门课，默认 32 个协程并发
+./zju.py recording-audio --days 7 -j 8                   # 最近 7 天，调整并发数
+./zju.py recording-audio --course 89418 --dry-run         # 预览本地提取或远端下载，不写文件
+./zju.py classroom sync 89418 --recording-audio -j 32     # PPT、转写和音频
+./zju.py classroom sync 89418 --recording --recording-audio -j 8
 ```
 
 优先使用输出目录中已完成的录播，包括旧的 `錄播` 目录；未完成的 `.part` 不算完整视频。没有视频时，读取远端 MP4 索引，按音轨偏移下载音频范围，不先下载整个视频。默认最多 32 个异步请求，每批最多 360 个音频分片；Range 请求头接近 8KiB 时自动缩小批次。音频范围请求固定直连，不读取环境代理，也不回退到代理。

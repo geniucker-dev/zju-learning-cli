@@ -21,14 +21,14 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py upload 文件...                 # 上传，印 upload id
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
   zju.py classroom courses [--has-tasks] [--json]  # 智云个人课程与任务数
-  zju.py classroom sync [课程...] [-j 4] [--recordings] [--audio]  # PPT、转写及可选录播和音频
+  zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]  # PPT、转写及可选录播和音频
   zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]
   zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
   zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
-  zju.py audio --course <cid> | --days N [-j 32]  # 本地录播提取或仅下载音轨
+  zju.py recording-audio --course <cid> | --days N [-j 32]  # 本地录播提取或仅下载音轨
 """
 from __future__ import annotations
 
@@ -1918,9 +1918,9 @@ def cmd_classroom_sync(a):
                                      f"{safe_name(s['sub_name'])}.{suffix}")
                 status = "跳过" if dest.exists() and not a.force else "待检查并下载"
                 print(f"[{status}] {dest.relative_to(root)}")
-        if a.recordings:
+        if a.recording:
             failed += recording_subs(z, a, root, subs)
-        if getattr(a, "audio", False):
+        if getattr(a, "recording_audio", False):
             failed += audio_subs(z, a, root, subs)
     else:
         # 主线程负责组织材料，worker 只下载单个文件或录播分片；避免嵌套线程池与 -j 倍增。
@@ -1940,9 +1940,9 @@ def cmd_classroom_sync(a):
                 except Exception as e:
                     failed += 1
                     log(f"[失败] PPT {s['course_name']} {s['sub_name']}: {e}")
-            if a.recordings:
+            if a.recording:
                 failed += recording_subs(z, a, root, subs, pool=pool)
-        if getattr(a, "audio", False):
+        if getattr(a, "recording_audio", False):
             failed += audio_subs(z, a, root, subs)
     log(f"{'预览' if a.dry_run else '同步完成'}：{len(subs)} 堂课，{'有失败' if failed else '无失败'}")
     if failed:
@@ -2037,7 +2037,7 @@ def transcript_one(z: Zju, a, root: Path, s: dict):
     print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
 
 
-def cmd_audio(a):
+def cmd_recording_audio(a):
     z = Zju()
     if audio_subs(z, a, Path(a.out).expanduser(), resolve_subs(z, a)):
         sys.exit(2)
@@ -2299,8 +2299,8 @@ def main():
                       description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写。")
     y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
     y.add_argument("-j", "--jobs", type=int, default=4, help="下载 worker 总数（默认 4）")
-    y.add_argument("--recordings", action="store_true", help="同时下载录播 MP4（支持断点续传）")
-    y.add_argument("--audio", action="store_true", help="同时获取 M4A 音频；优先从已下载录播提取")
+    y.add_argument("--recording", action="store_true", help="同时下载录播 MP4（支持断点续传）")
+    y.add_argument("--recording-audio", action="store_true", help="同时获取 M4A 音频；优先从已下载录播提取")
     y.add_argument("--dry-run", action="store_true", help="预览资料路径，不下载、不写文件")
     y.add_argument("--force", action="store_true", help="重新下载已有资料，丢弃录播分片进度")
     y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md）")
@@ -2309,9 +2309,9 @@ def main():
     y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播或音频单文件上限（默认 0 = 不限）")
     y.set_defaults(fn=cmd_classroom_sync)
 
-    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording), ("audio", cmd_audio)):
+    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording), ("recording-audio", cmd_recording_audio)):
         x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
-                                      "recording": "智云录播 → MP4", "audio": "智云录播音轨 → M4A"}[name])
+                                      "recording": "智云录播 → MP4", "recording-audio": "智云录播音轨 → M4A"}[name])
         x.add_argument("--course", type=int, help="智云课堂 course_id（classroom courses / search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
         x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
@@ -2323,20 +2323,20 @@ def main():
         elif name == "transcript":
             x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
         else:
-            x.add_argument("--dry-run", action="store_true", help="预览待处理音频" if name == "audio" else "只列出待下载录播")
+            x.add_argument("--dry-run", action="store_true", help="预览待处理音频" if name == "recording-audio" else "只列出待下载录播")
             x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")
-            x.add_argument("-j", "--jobs", type=int, default=32 if name == "audio" else 4,
-                           help="音频并发请求数（默认 32 个协程）" if name == "audio" else "每堂录播的并行分片连接数（默认 4）")
+            x.add_argument("-j", "--jobs", type=int, default=32 if name == "recording-audio" else 4,
+                           help="音频并发请求数（默认 32 个协程）" if name == "recording-audio" else "每堂录播的并行分片连接数（默认 4）")
             x.description = ("优先从完整本地录播提取；否则只下载 MP4 音频范围。无需 ffmpeg，不重新编码。"
-                             if name == "audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
+                             if name == "recording-audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
     if a.cmd == "classroom" and a.action == "sync" and (a.jobs < 1 or a.max_size < 0):
         p.error("--jobs 必须 >= 1，--max-size 必须 >= 0")
-    if a.cmd in ("recording", "audio") and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
+    if a.cmd in ("recording", "recording-audio") and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
         p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
-    if a.cmd in ("recording", "audio") and a.sub is not None and not a.course:
+    if a.cmd in ("recording", "recording-audio") and a.sub is not None and not a.course:
         p.error("--sub 需要搭配 --course")
     try:
         a.fn(a)
