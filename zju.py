@@ -25,6 +25,7 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom day [日期] [--days N]
   zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
+  zju.py video --course <cid> | --days N [--dry-run]  # 智雲錄播 MP4
 """
 from __future__ import annotations
 
@@ -624,6 +625,18 @@ class Zju:
         lst = j.get("list") or []
         return lst[0].get("all_content", []) if lst else []
 
+    def video_catalogue(self, course_id: int) -> dict[int, list[str]]:
+        self.ensure(need_classroom=True)
+        r = self.get("https://classroom.zju.edu.cn/courseapi/v2/course/catalogue",
+                     params={"course_id": course_id}, headers=self.bearer())
+        j = self.json(r, "catalogue")
+        if not r.ok or not j.get("success"):
+            raise ZjuError(f"錄播目錄讀取失敗 HTTP {r.status_code}")
+        items = (j.get("result") or {}).get("data")
+        if not isinstance(items, list):
+            raise ZjuError("錄播目錄格式錯誤：缺少 result.data 列表")
+        return parse_video_catalogue(items)
+
 
 # ---------------- helpers ----------------
 
@@ -644,7 +657,7 @@ class Manifest:
         os.replace(tmp, self.path)
 
 
-def stream_to(r: requests.Response, dest: Path, limit: int | None = None) -> Path:
+def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4: bool = False) -> Path:
     """寫暫存檔再 rename；驗證長度、拒收空檔和錯誤頁，免得壞檔被記進 manifest 後永遠不再重抓。"""
     expected = r.headers.get("Content-Length")
     expected = int(expected) if expected and expected.isdigit() and not r.headers.get("Content-Encoding") else None
@@ -669,9 +682,11 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None) -> Pat
         if expected is not None and written != expected:
             raise ZjuError(f"下載不完整：{written}/{expected} bytes")
         with open(tmp, "rb") as f:
-            head = f.read(5)
+            head = f.read(12)
+        if mp4 and head[4:8] != b"ftyp":
+            raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
         # preview 版常是 PDF，但檔名還是 .pptx/.docx — 補副檔名免得打不開
-        if head == b"%PDF-" and dest.suffix.lower() != ".pdf":
+        if head[:5] == b"%PDF-" and dest.suffix.lower() != ".pdf":
             dest = dest.with_name(dest.name + ".pdf")
         os.replace(tmp, dest)
         return dest
@@ -680,6 +695,95 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None) -> Pat
         raise
     finally:
         r.close()
+
+
+def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
+                   *, chunk_size: int = 32 * 2**20) -> Path:
+    """Range 分片平行寫入同一暫存檔，全部校驗成功後原子替換。"""
+    headers = {"Range": "bytes=0-0", "Accept-Encoding": "identity"}
+    probe = z.get(url, headers=headers, stream=True)
+    if probe.status_code == 200:
+        log("[單連線] 伺服器不支援 Range")
+        return stream_to(probe, dest, limit, mp4=True)
+    try:
+        match = re.fullmatch(r"bytes 0-0/(\d+)", probe.headers.get("Content-Range", ""))
+        if probe.status_code != 206 or not match:
+            raise ZjuError(f"錄播 Range 探測失敗 HTTP {probe.status_code}")
+        total = int(match[1])
+        if total < 12:
+            raise ZjuError("錄播檔案過小")
+        if limit and total > limit:
+            raise TooBig(f"{total / 2**20:.1f}MB")
+        if probe.headers.get("Content-Encoding", "identity") != "identity":
+            raise ZjuError("Range 回應不應使用壓縮編碼")
+        if len(probe.content) != 1:
+            raise ZjuError("Range 探測長度錯誤")
+        etag = probe.headers.get("ETag", "")
+        validator = etag if etag and not etag.startswith("W/") else probe.headers.get("Last-Modified")
+    finally:
+        probe.close()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.truncate(total)
+
+        def grab(start):
+            end = min(start + chunk_size, total) - 1
+            h = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+            if validator:
+                h["If-Range"] = validator
+            for attempt in range(3):
+                try:
+                    r = z.get(url, headers=h, stream=True)
+                    try:
+                        expected_range = f"bytes {start}-{end}/{total}"
+                        if r.status_code != 206 or r.headers.get("Content-Range") != expected_range:
+                            raise ZjuError(f"分片 {start}-{end} 範圍不符 HTTP {r.status_code}")
+                        if r.headers.get("Content-Encoding", "identity") != "identity":
+                            raise ZjuError("分片回應使用壓縮編碼")
+                        written = 0
+                        with open(tmp, "r+b") as f:
+                            f.seek(start)
+                            for block in r.iter_content(1 << 20):
+                                if written + len(block) > end - start + 1:
+                                    raise ZjuError("分片長度超出範圍")
+                                f.write(block)
+                                written += len(block)
+                        if written != end - start + 1:
+                            raise ZjuError(f"分片下載不完整：{written}/{end - start + 1}")
+                        return written
+                    finally:
+                        r.close()
+                except (requests.RequestException, ZjuError):
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.5 * 2**attempt)
+
+        completed = 0
+        next_report = 0
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(grab, start) for start in range(0, total, chunk_size)]
+            try:
+                for future in as_completed(futures):
+                    completed += future.result()
+                    percent = completed * 100 // total
+                    if percent >= next_report or completed == total:
+                        speed = completed / 2**20 / max(time.monotonic() - started, 0.001)
+                        log(f"[進度] {percent}%  {completed / 2**20:.1f}/{total / 2**20:.1f}MB  {speed:.1f}MB/s")
+                        next_report = percent + 10
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                raise
+        with open(tmp, "rb") as f:
+            if f.read(12)[4:8] != b"ftyp":
+                raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
+        os.replace(tmp, dest)
+        return dest
+    finally:
+        Path(tmp).unlink(missing_ok=True)
 
 
 def current_year(courses: list[dict]) -> list[dict]:
@@ -782,6 +886,40 @@ def render_transcript(items: list[dict], fmt: str, title: str) -> str:
         for c in items:
             lines.append(f"[{fmt_ts(c.get('BeginSec', 0), False)}] {c.get('Text', '')}")
     return "\n".join(lines) + "\n"
+
+
+def parse_video_catalogue(items: list[dict]) -> dict[int, list[str]]:
+    """依 sub_id 取回放網址；url 可能是字串或多段錄影的列表。"""
+    result: dict[int, list[str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ZjuError("錄播目錄項目不是物件")
+        try:
+            sid = int(item["sub_id"])
+            content = item.get("content") or {}
+            if isinstance(content, str):
+                content = json.loads(content)
+            if not isinstance(content, dict):
+                raise ValueError("content 不是物件")
+            playback = content.get("playback") or {}
+            raw = (playback.get("url") if isinstance(playback, dict) else None) or content.get("url") or []
+            urls = [raw] if isinstance(raw, str) else raw
+            if not isinstance(urls, list):
+                raise ValueError("url 不是字串或列表")
+            valid = []
+            for u in urls:
+                if not isinstance(u, str) or not u.strip():
+                    continue
+                u = secure_url(u.strip())
+                if urlparse(u).scheme not in ("http", "https") or not urlparse(u).hostname:
+                    raise ValueError("url 不是 HTTP(S) 網址")
+                if u not in valid:
+                    valid.append(u)
+            existing = result.setdefault(sid, [])
+            existing.extend(u for u in valid if u not in existing)
+        except (KeyError, TypeError, ValueError) as e:
+            raise ZjuError(f"錄播目錄項目解析失敗 sub_id={item.get('sub_id', '?')}：{e}") from e
+    return result
 
 
 def images_to_pdf(paths: list[Path], pdf: Path):
@@ -1259,6 +1397,74 @@ def cmd_transcript(a):
         sys.exit(2)
 
 
+def cmd_video(a):
+    z = Zju()
+    root = Path(a.out).expanduser()
+    subs = resolve_subs(z, a)
+    if not subs:
+        log("沒有課堂")
+        return
+    # 同一課程只讀一次目錄；完整下載成功後才記入清單。
+    catalogues = {}
+    man = Manifest(root)
+    failed = downloaded = skipped = unavailable = planned = 0
+    limit = a.max_size * 2**20 if a.max_size else None
+    for s in subs:
+        cid, sid = s["course_id"], s["sub_id"]
+        try:
+            if cid not in catalogues:
+                try:
+                    catalogues[cid] = z.video_catalogue(cid)
+                except ZjuError as e:
+                    catalogues[cid] = e
+            catalogue = catalogues[cid]
+            if isinstance(catalogue, Exception):
+                raise catalogue
+            if sid not in catalogue:
+                raise ZjuError(f"錄播目錄缺少堂次 {sid}")
+            urls = catalogue[sid]
+            if not urls:
+                unavailable += 1
+                log(f"[無回放] {s['course_name']} {s['sub_name']}")
+                continue
+        except ZjuError as e:
+            failed += 1
+            log(f"[失敗] {s['course_name']} {s['sub_name']}: {e}")
+            continue
+        cdir = root / safe_name(f"{s['course_name']} ({cid})") / "錄播"
+        for i, url in enumerate(urls, 1):
+            key = f"video:{cid}:{sid}:{i}"
+            part = f" - {i:02d}" if len(urls) > 1 else ""
+            dest = cdir / f"{safe_name(s['sub_name'])} ({sid}){part}.mp4"
+            rec = man.get(key)
+            if not a.force and rec and dest.is_file() and dest.stat().st_size == rec.get("size"):
+                skipped += 1
+                log(f"[略過] {dest.relative_to(root)}")
+                continue
+            if a.dry_run:
+                planned += 1
+                print(f"[會下載] {dest.relative_to(root)}")
+                continue
+            try:
+                log(f"[下載] {dest.relative_to(root)}")
+                download_video(z, url, dest, limit, a.jobs)
+                man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
+                              "course_id": cid, "sub_id": sid,
+                              "at": dt.datetime.now().isoformat(timespec="seconds")})
+                downloaded += 1
+                print(f"[錄播] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
+            except TooBig as e:
+                skipped += 1
+                log(f"[太大跳過] {dest.name}: {e}（--max-size 0 不限）")
+            except Exception as e:
+                failed += 1
+                log(f"[失敗] {dest.name}: {e}")
+    count = f"待下載 {planned}" if a.dry_run else f"下載 {downloaded}"
+    log(f"{'預覽' if a.dry_run else '完成'}：{count}、略過 {skipped}、無回放 {unavailable}、失敗 {failed}")
+    if failed:
+        sys.exit(2)
+
+
 def main():
     p = argparse.ArgumentParser(prog="zju.py", description="學在浙大 / 智雲課堂 CLI")
     try:
@@ -1348,8 +1554,9 @@ def main():
     x.add_argument("--days", type=int)
     x.set_defaults(fn=cmd_classroom)
 
-    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript)):
-        x = sp.add_parser(name, help="智雲 PPT → PDF" if name == "ppt" else "智雲課堂語音轉錄")
+    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("video", cmd_video)):
+        x = sp.add_parser(name, help={"ppt": "智雲 PPT → PDF", "transcript": "智雲課堂語音轉錄",
+                                      "video": "智雲錄播 → MP4"}[name])
         x.add_argument("--course", type=int, help="智雲課堂 course_id（classroom search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓這些 sub_id")
         x.add_argument("--days", type=int, help="不給 --course 時：最近 N 天的課（預設 1 = 今天）")
@@ -1358,11 +1565,19 @@ def main():
             x.add_argument("--keep-images", action="store_true")
             x.add_argument("--dedup", action="store_true",
                            help="刪掉重複截圖（動畫逐步出現、邊講邊寫、翻回前頁），每頁只留最完整的一張")
-        else:
+        elif name == "transcript":
             x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
+        else:
+            x.add_argument("--dry-run", action="store_true", help="只列出待下載錄播")
+            x.add_argument("--max-size", type=int, default=0, metavar="MB", help="單檔上限（預設 0 = 不限）")
+            x.add_argument("-j", "--jobs", type=int, default=4, help="每個影片的平行分片連線數（預設 4）")
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
+    if a.cmd == "video" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
+        p.error("--max-size 必須 >= 0，--jobs 和 --days 必須 >= 1")
+    if a.cmd == "video" and a.sub is not None and not a.course:
+        p.error("--sub 需要搭配 --course")
     try:
         a.fn(a)
     except ZjuError as e:

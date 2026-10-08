@@ -25,6 +25,7 @@
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
+| `./zju.py video --course <id> \| --days N [-j 4]` | 智云录播 → `<课程> (<id>)/錄播/<堂> (<sub_id>).mp4`，多连接分片下载 |
 
 ## 安装
 
@@ -68,6 +69,28 @@ zju transcript --days 1 --format md
 退出码：`0` 成功；`1` 设置、登录或 API 错误；`2` 部分文件或堂次失败（其余照常完成）。
 
 ## 跟 ZLA 的差异
+
+### 智云录播下载
+
+可以直接运行 `./zju.py`，无需创建软链接。使用智云课程 ID（与学在浙大不同）：
+
+```bash
+./zju.py classroom search 人工智能
+./zju.py classroom subs 89418
+./zju.py video --course 89418 --dry-run       # 只列待下载视频，不下载、不写文件
+./zju.py video --course 89418 --sub 2019095   # 下载指定堂次
+./zju.py video --course 89418 -j 8           # 整门课；每个视频最多 8 个连接
+./zju.py video --days 7                     # 最近 7 天自己的课堂
+./zju.py video --course 89418 --max-size 4096 # 单个视频限制 4096MB；默认 0 = 不限
+```
+
+默认每个视频使用 4 个连接，按 32MiB 分片并行下载，显示进度和平均速度。逐个下载视频，分片失败最多尝试 3 次；服务器不支持 Range 时自动回退到单连接。检查每片的响应范围、总大小、实际字节数及最终 MP4 文件头，全部成功才替换目标文件并写入下载清单。若服务器提供 ETag 或 Last-Modified，使用 If-Range 防止混合不同版本。
+
+已下载且大小符合清单的文件会跳过，`--force` 可重新下载；暂无回放的堂次会跳过，下次运行重新查询。多段回放地址分别保存为带编号的 MP4。录播目录和文件名包含课程、堂次 ID，避免同名覆盖。当前支持直接 MP4，不支持 HLS 播放列表或跨次运行的断点续传；中断后临时文件清除，下次从头下载。`--out` 放在子命令前，例如 `./zju.py --out ~/ZJU-Courses video --course 89418`。
+
+目录接口及视频地址提取参考了 Cold_Ink 的 [智云课堂批量下载](https://greasyfork.org/scripts/514465)（MIT）；本项目按实际接口兼容字符串和列表地址，并使用 Python 流式分片下载。
+
+### 其他改进
 
 - **增量同步**：以 `.zju_manifest.json` 记录 upload id，而不是比对文件名和大小；老师换了新版（新 id）才会重抓。
 - **下载完整性**：先写 `.part-*`，核对 `Content-Length` 后才 rename；空文件、截断、服务器回的 HTML 错误页都不会被记成已下载。

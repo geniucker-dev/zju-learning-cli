@@ -214,6 +214,136 @@ class Offline(unittest.TestCase):
             out = zju.stream_to(resp(b"%PDF-1.4 ok", 11), d / "e.pptx")
             self.assertEqual(out.name, "e.pptx.pdf")
 
+    def test_video_catalogue_formats(self):
+        import json
+        items = [
+            {"sub_id": "1", "content": json.dumps({"playback": {"url": [
+                "http://resource.cmc.zju.edu.cn/a.mp4", "http://resource.cmc.zju.edu.cn/a.mp4",
+                "https://resource.cmc.zju.edu.cn/b.mp4"]}})},
+            {"sub_id": 2, "content": {"url": "https://example.com/c.mp4"}},
+            {"sub_id": 3, "content": "{}"},
+        ]
+        self.assertEqual(zju.parse_video_catalogue(items), {
+            1: ["https://resource.cmc.zju.edu.cn/a.mp4", "https://resource.cmc.zju.edu.cn/b.mp4"],
+            2: ["https://example.com/c.mp4"], 3: []})
+        for content in ("invalid json", {"url": "file:///etc/passwd"}, {"url": 42}):
+            with self.assertRaises(zju.ZjuError):
+                zju.parse_video_catalogue([{"sub_id": 1, "content": content}])
+
+    def test_video_download_ranges(self):
+        """真實本地 HTTP：分片並行、順序、重試、回退和損壞檔保護。"""
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from unittest.mock import patch
+
+        body = b"\x00\x00\x00\x20ftypisom" + bytes(range(256)) * 4
+        state = {"mode": "range", "active": 0, "max_active": 0, "retried": False}
+        lock = threading.Lock()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                start, end = map(int, self.headers["Range"][6:].split("-"))
+                if state["mode"] == "fallback":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                with lock:
+                    state["active"] += 1
+                    state["max_active"] = max(state["max_active"], state["active"])
+                    retry_once = start == 128 and not state["retried"]
+                    if retry_once:
+                        state["retried"] = True
+                try:
+                    time.sleep(0.02)
+                    self.send_response(206)
+                    bad_range = (state["mode"] == "bad" or retry_once) and end != 0
+                    self.send_header("Content-Range", f"bytes {start + int(bad_range)}-{end}/{len(body)}")
+                    self.send_header("Content-Length", str(end - start + 1))
+                    self.send_header("ETag", '"test-video"')
+                    self.end_headers()
+                    try:
+                        stop = end if state["mode"] == "truncated" and end != 0 else end + 1
+                        self.wfile.write(body[start:stop])
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                finally:
+                    with lock:
+                        state["active"] -= 1
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with tempfile.TemporaryDirectory() as d, patch.object(zju.Zju, "_load_cookies"):
+                client = zju.Zju()
+                url = f"http://127.0.0.1:{server.server_port}/video.mp4"
+                dest = Path(d) / "video.mp4"
+                zju.download_video(client, url, dest, None, 4, chunk_size=128)
+                self.assertEqual(dest.read_bytes(), body)
+                self.assertGreater(state["max_active"], 1)
+                self.assertTrue(state["retried"])
+                with self.assertRaises(zju.TooBig):
+                    zju.download_video(client, url, dest, 10, 4)
+                for mode in ("bad", "truncated"):
+                    state["mode"] = mode
+                    with self.assertRaises((zju.ZjuError, zju.requests.RequestException)):
+                        zju.download_video(client, url, dest, None, 4, chunk_size=128)
+                    self.assertEqual(dest.read_bytes(), body)  # 失敗不能覆蓋原檔
+                    self.assertEqual(list(Path(d).glob(".part-*")), [])
+                state["mode"] = "fallback"
+                zju.download_video(client, url, dest, None, 4)
+                self.assertEqual(dest.read_bytes(), body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
+
+    def test_video_command_manifest_and_dry_run(self):
+        from argparse import Namespace
+        from unittest.mock import patch, MagicMock
+
+        subs = [{"course_id": 1, "sub_id": 2, "course_name": "課程", "sub_name": "第一堂"},
+                {"course_id": 1, "sub_id": 3, "course_name": "課程", "sub_name": "第二堂"}]
+        client = MagicMock()
+        client.video_catalogue.return_value = {2: ["https://example.com/a.mp4"], 3: []}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "output"
+            args = Namespace(out=str(root), dry_run=True, force=False, max_size=0, jobs=4)
+            with patch.object(zju, "Zju", return_value=client), patch.object(zju, "resolve_subs", return_value=subs), \
+                    patch.object(zju, "download_video") as download:
+                zju.cmd_video(args)
+                download.assert_not_called()
+                self.assertFalse(root.exists())
+                self.assertEqual(client.video_catalogue.call_count, 1)
+                args.dry_run = False
+                def save(z, u, dest, limit, jobs):
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(b"mp4")
+                download.side_effect = save
+                zju.cmd_video(args)
+                zju.cmd_video(args)
+                self.assertEqual(download.call_count, 1)
+                args.force = True
+                zju.cmd_video(args)
+                self.assertEqual(download.call_count, 2)
+
+    def test_video_rejects_non_mp4(self):
+        import io
+        import requests
+        with tempfile.TemporaryDirectory() as d:
+            r = requests.Response()
+            r.status_code = 200
+            r.raw = io.BytesIO(b"#EXTM3U\nhttps://example.com/segment.ts")
+            with self.assertRaises(zju.ZjuError):
+                zju.stream_to(r, Path(d) / "video.mp4", mp4=True)
+            self.assertEqual(list(Path(d).iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()
