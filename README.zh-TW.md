@@ -20,6 +20,8 @@
 | `zju forum post <討論id> --title … --body …` / `forum reply <topic> --body …` | 發帖／回帖，可 `--body-file`、`--attach` 附件 |
 | `zju upload 檔案…` | 上傳檔案到學在浙大，印出 upload id |
 | `zju submit <作業id> --file … [--body …] [--draft] [-y]` | 交作業；預設送出前確認，已截止會擋下 |
+| `./zju.py classroom courses [--has-tasks] [--json]` | 智雲個人課程，顯示課程 ID、學期、教師與任務數 |
+| `./zju.py classroom sync [課程...] [-j 4] [--recordings]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播 |
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
@@ -74,11 +76,30 @@ zju transcript --days 1 --format md
 
 ## 跟 ZLA 的差異
 
+### 智雲課程同步
+
+預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recordings` 同時下載錄播。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。
+
+沿用現有資料目錄與增量跳過規則，錄播繼續支援跨次執行的斷點續傳。`--force` 重新下載資料並丟棄錄播分片進度；`--format txt|srt|md` 選擇轉錄格式，`--dedup` 去除重複 PPT 截圖，`--keep-images` 保留全部截圖，`--max-size MB` 限制錄播單檔大小（0 為不限）。
+
+`--dry-run` 不下載、不寫檔：PPT 與轉錄依現有檔案及堂次預覽路徑，標記為待檢查的資料可能尚未發布；錄播讀取目錄後預覽。單項失敗仍繼續處理其他資料，最終退出碼為 2。
+
+```bash
+./zju.py classroom sync -j 8
+./zju.py classroom sync 89418 --recordings -j 8
+./zju.py classroom sync 人工智能 --dry-run --recordings
+```
+
 ### 智雲錄播下載
+
+預設列出智雲「我的課程」中的全部課程，包括任務數為 0 的課程；`--has-tasks` 只列任務數大於 0 的課程。任務數與網頁一致，不代表一定有可下載錄播。`--json` 輸出 `course_id`、`title`、`teacher`、`term`、`type` 與 `task_count`。這些課程 ID 可用於 `classroom subs`、`ppt`、`transcript` 與 `recording`；頂層 `courses` 列出的則是學在浙大的 ID。
 
 可直接執行 `./zju.py`，不必建立符號連結。使用智雲課程 ID（與學在浙大不同）：
 
 ```bash
+./zju.py classroom courses
+./zju.py classroom courses --has-tasks
+./zju.py classroom courses --json
 ./zju.py classroom search 人工智能
 ./zju.py classroom subs 89418
 ./zju.py recording --course 89418 --dry-run       # 只列待下載影片，不下載、不寫檔

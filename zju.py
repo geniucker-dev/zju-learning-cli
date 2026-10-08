@@ -20,6 +20,8 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py forum list|read|post|reply ... # 讨论区
   zju.py upload 文件...                 # 上传，印 upload id
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
+  zju.py classroom courses [--has-tasks] [--json]  # 智云个人课程与任务数
+  zju.py classroom sync [课程...] [-j 4] [--recordings]  # 同步 PPT、转写及可选录播
   zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]
@@ -43,7 +45,8 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -557,6 +560,39 @@ class Zju:
         return self.json(self.get("https://classroom.zju.edu.cn/userapi/v1/infosimple",
                                   headers=self.bearer()), "infosimple")["params"]
 
+    def classroom_courses(self) -> list[dict]:
+        """智云「我的课程」，任务数沿用网页的 progress.subjectNum。"""
+        self.ensure(need_classroom=True)
+        out, seen, page = [], set(), 1
+        while True:
+            j = self.json(self.get(
+                "https://education.cmc.zju.edu.cn/personal/courseapi/vlabpassportapi/v1/account-profile/course",
+                headers=self.bearer(), params={"nowpage": page, "per-page": 100,
+                                              "force_mycourse": 1, "type": "", "model": "", "search": ""}),
+                "classroom-courses")
+            result = (j.get("params") or {}).get("result")
+            if j.get("code") != 1000 or not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise ZjuError(j.get("message") or "智云个人课程接口返回异常")
+            rows = result["data"]
+            if not rows:
+                return out
+            added = 0
+            for c in rows:
+                cid = int(c["Id"])
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                out.append({"course_id": cid, "title": c.get("Title") or "",
+                            "teacher": c.get("Teacher") or "", "term": c.get("TermName") or "",
+                            "type": c.get("Type") or "",
+                            "task_count": int((c.get("progress") or {}).get("subjectNum") or 0)})
+                added += 1
+            if len(out) >= int(result["total"]):
+                return out
+            if not added:
+                raise ZjuError("智云个人课程分页重复，未能取得完整列表")
+            page += 1
+
     def classroom_search(self, title: str, teacher: str = "") -> list[dict]:
         info = self.infosimple()
         out, page = [], 1
@@ -711,7 +747,8 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
 
 
 def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
-                   *, chunk_size: int = 32 * 2**20, restart: bool = False) -> Path:
+                   *, chunk_size: int = 32 * 2**20, restart: bool = False,
+                   pool: ThreadPoolExecutor | None = None) -> Path:
     """保留已校验分片及 checkpoint，跨次执行只补缺片。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     # 锁档保留以避免删除后新旧 inode 被不同程序同时锁定。
@@ -731,11 +768,11 @@ def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
             raise ZjuError("另一个程序正在下载此录播") from e
-        return _download_video(z, url, dest, limit, jobs, chunk_size, restart)
+        return _download_video(z, url, dest, limit, jobs, chunk_size, restart, pool)
 
 
 def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
-                    chunk_size: int, restart: bool) -> Path:
+                    chunk_size: int, restart: bool, pool: ThreadPoolExecutor | None = None) -> Path:
     tmp = dest.with_name(f".{dest.name}.part")
     checkpoint = dest.with_name(f".{dest.name}.part.json")
 
@@ -871,7 +908,7 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
     next_report = completed * 100 // total
     started = time.monotonic()
     try:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
+        with (nullcontext(pool) if pool is not None else ThreadPoolExecutor(max_workers=jobs)) as pool:
             futures = [pool.submit(grab, start) for start in range(0, total, chunk_size)
                        if str(start) not in done]
             try:
@@ -886,6 +923,8 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                 stopped.set()
                 for future in futures:
                     future.cancel()
+                # 外部共享线程池不会在这里关闭，释放文件锁前仍须等本文件的 worker 停下。
+                wait(futures)
                 raise
     except BaseException:
         log("[保留分片] 下次执行相同下载指令即可续传")
@@ -1416,7 +1455,17 @@ def cmd_submit(a):
 
 def cmd_classroom(a):
     z = Zju()
-    if a.action == "search":
+    if a.action == "courses":
+        courses = z.classroom_courses()
+        if a.has_tasks:
+            courses = [c for c in courses if c["task_count"] > 0]
+        if a.json:
+            print(json.dumps(courses, ensure_ascii=False, indent=1))
+            return
+        print("课程ID\t学期\t课程名称\t教师\t任务数")
+        for c in courses:
+            print(f"{c['course_id']}\t{c['term']}\t{c['title']}\t{c['teacher']}\t{c['task_count']}")
+    elif a.action == "search":
         for c in z.classroom_search(a.arg or "", a.teacher or ""):
             print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}")
     elif a.action == "subs":
@@ -1430,6 +1479,68 @@ def cmd_classroom(a):
             d = start - dt.timedelta(days=i)
             for s in z.day_subs(d):
                 print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+
+
+def cmd_classroom_sync(a):
+    z = Zju()
+    courses = z.classroom_courses()
+    if a.course:
+        selected = []
+        for selector in a.course:
+            matched = [c for c in courses if (str(c["course_id"]) == selector if selector.isdigit()
+                                             else selector.casefold() in c["title"].casefold())]
+            if not matched:
+                raise ZjuError(f"没有符合的个人课程：{selector}（用 classroom courses 查看）")
+            selected.extend(matched)
+        courses = list({c["course_id"]: c for c in selected}.values())
+    root = Path(a.out).expanduser()
+    failed, subs, seen = 0, [], set()
+    for c in courses:
+        if c["type"] != "multi":
+            log(f"[跳过] {c['title']}：课程类型 {c['type']} 不支持课堂资料同步")
+            continue
+        try:
+            for s in z.course_subs(c["course_id"]):
+                key = (s["course_id"], s["sub_id"])
+                if key not in seen:
+                    seen.add(key)
+                    subs.append(s)
+        except Exception as e:
+            failed += 1
+            log(f"[失败] {c['title']}: {e}")
+    log(f"[同步] {len(courses)} 门课程、{len(subs)} 堂课，{a.jobs} 个 worker")
+    if a.dry_run:
+        for s in subs:
+            for kind, suffix in (("智云PPT", "pdf"), ("转录", a.format)):
+                dest = material_path(root / safe_name(s["course_name"]), kind,
+                                     f"{safe_name(s['sub_name'])}.{suffix}")
+                status = "跳过" if dest.exists() and not a.force else "待检查并下载"
+                print(f"[{status}] {dest.relative_to(root)}")
+        if a.recordings:
+            failed += recording_subs(z, a, root, subs)
+    else:
+        # 主线程负责组织材料，worker 只下载单个文件或录播分片；避免嵌套线程池与 -j 倍增。
+        # 转写、PPT、录播依次处理，整个同步复用同一线程池。
+        with ThreadPoolExecutor(max_workers=a.jobs) as pool:
+            futures = {pool.submit(transcript_one, z, a, root, s): s for s in subs}
+            for future in as_completed(futures):
+                s = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    failed += 1
+                    log(f"[失败] 转录 {s['course_name']} {s['sub_name']}: {e}")
+            for s in subs:
+                try:
+                    ppt_one(z, a, root, s, pool=pool)
+                except Exception as e:
+                    failed += 1
+                    log(f"[失败] PPT {s['course_name']} {s['sub_name']}: {e}")
+            if a.recordings:
+                failed += recording_subs(z, a, root, subs, pool=pool)
+    log(f"{'预览' if a.dry_run else '同步完成'}：{len(subs)} 堂课，{'有失败' if failed else '无失败'}")
+    if failed:
+        sys.exit(2)
 
 
 def cmd_ppt(a):
@@ -1450,7 +1561,7 @@ def cmd_ppt(a):
         sys.exit(2)
 
 
-def ppt_one(z: Zju, a, root: Path, s: dict):
+def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = None):
     pdf = material_path(root / safe_name(s["course_name"]), "智云PPT", f"{safe_name(s['sub_name'])}.pdf")
     cdir = pdf.parent
     if pdf.exists() and not a.force:
@@ -1473,8 +1584,13 @@ def ppt_one(z: Zju, a, root: Path, s: dict):
                 time.sleep(0.2 * 2 ** attempt)
             raise ZjuError(f"PPT 图下载失败：{u}")
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            paths = list(pool.map(grab, enumerate(urls)))  # map 保序 = 页序
+        with (nullcontext(pool) if pool is not None else ThreadPoolExecutor(max_workers=8)) as pool:
+            futures = [pool.submit(grab, iu) for iu in enumerate(urls)]
+            try:
+                paths = [future.result() for future in futures]  # 保序 = 页序
+            finally:
+                # 共享线程池仍在运行；删除临时目录前等所有截图任务结束。
+                wait(futures)
         pages = dedup_slides(paths) if a.dedup else paths
         cdir.mkdir(parents=True, exist_ok=True)
         images_to_pdf(pages, pdf)
@@ -1491,33 +1607,42 @@ def cmd_transcript(a):
     root = Path(a.out).expanduser()
     failed = 0
     for s in resolve_subs(z, a):
-        out = material_path(root / safe_name(s["course_name"]), "转录", f"{safe_name(s['sub_name'])}.{a.format}")
-        if out.exists() and not a.force:
-            log(f"[跳过] {out.relative_to(root)}")
-            continue
         try:
-            items = z.subtitle(s["sub_id"])
+            transcript_one(z, a, root, s)
         except Exception as e:
             failed += 1
             log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
             continue
-        if not items:
-            log(f"[无转录] {s['course_name']} {s['sub_name']}")
-            continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"))
-        print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
     if failed:
         sys.exit(2)
+
+
+def transcript_one(z: Zju, a, root: Path, s: dict):
+    out = material_path(root / safe_name(s["course_name"]), "转录", f"{safe_name(s['sub_name'])}.{a.format}")
+    if out.exists() and not a.force:
+        log(f"[跳过] {out.relative_to(root)}")
+        return
+    items = z.subtitle(s["sub_id"])
+    if not items:
+        log(f"[无转录] {s['course_name']} {s['sub_name']}")
+        return
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"), encoding="utf-8")
+    print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
 
 
 def cmd_recording(a):
     z = Zju()
     root = Path(a.out).expanduser()
     subs = resolve_subs(z, a)
+    if recording_subs(z, a, root, subs):
+        sys.exit(2)
+
+
+def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExecutor | None = None) -> int:
     if not subs:
         log("没有课堂")
-        return
+        return 0
     # 同一课程只读一次目录；完整下载成功后才记入清单。
     catalogues = {}
     man = Manifest(root)
@@ -1561,7 +1686,8 @@ def cmd_recording(a):
                 continue
             try:
                 log(f"[下载] {dest.relative_to(root)}")
-                download_video(z, url, dest, limit, a.jobs, restart=a.force)
+                kwargs = {"pool": pool} if pool is not None else {}
+                download_video(z, url, dest, limit, a.jobs, restart=a.force, **kwargs)
                 man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
                               "course_id": cid, "sub_id": sid,
                               "at": dt.datetime.now().isoformat(timespec="seconds")})
@@ -1575,8 +1701,7 @@ def cmd_recording(a):
                 log(f"[失败] {dest.name}: {e}")
     count = f"待下载 {planned}" if a.dry_run else f"下载 {downloaded}"
     log(f"{'预览' if a.dry_run else '完成'}：{count}、跳过 {skipped}、无回放 {unavailable}、失败 {failed}")
-    if failed:
-        sys.exit(2)
+    return failed
 
 
 def main():
@@ -1661,17 +1786,37 @@ def main():
     x.add_argument("-y", "--yes", action="store_true", help="不确认直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智云课堂：search / subs / day")
-    x.add_argument("action", choices=["search", "subs", "day"])
-    x.add_argument("arg", nargs="?")
-    x.add_argument("--teacher")
-    x.add_argument("--days", type=int)
+    x = sp.add_parser("classroom", help="智云课堂：courses / sync / search / subs / day")
     x.set_defaults(fn=cmd_classroom)
+    cp = x.add_subparsers(dest="action", required=True)
+    y = cp.add_parser("courses", help="列出全部个人课程及任务数")
+    y.add_argument("--has-tasks", action="store_true", help="只列任务数大于 0 的课程")
+    y.add_argument("--json", action="store_true", help="输出 JSON")
+    y = cp.add_parser("search", help="按关键词搜索智云课程")
+    y.add_argument("arg", nargs="?", help="课程名称关键词")
+    y.add_argument("--teacher", help="教师名称")
+    y = cp.add_parser("subs", help="列出课程堂次")
+    y.add_argument("arg", type=int, help="智云课程 ID")
+    y = cp.add_parser("day", help="列出某天或最近 N 天的个人课堂")
+    y.add_argument("arg", nargs="?", help="日期 YYYY-MM-DD，默认今天")
+    y.add_argument("--days", type=int)
+    y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播",
+                      description="所有文件及录播分片共享 -j 个 worker；默认下载 PPT 和 Markdown 转写。")
+    y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
+    y.add_argument("-j", "--jobs", type=int, default=4, help="下载 worker 总数（默认 4）")
+    y.add_argument("--recordings", action="store_true", help="同时下载录播 MP4（支持断点续传）")
+    y.add_argument("--dry-run", action="store_true", help="预览资料路径，不下载、不写文件")
+    y.add_argument("--force", action="store_true", help="重新下载已有资料，丢弃录播分片进度")
+    y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md）")
+    y.add_argument("--dedup", action="store_true", help="合并 PPT 时去除重复截图")
+    y.add_argument("--keep-images", action="store_true", help="保留全部 PPT 原始截图")
+    y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播单文件上限（默认 0 = 不限）")
+    y.set_defaults(fn=cmd_classroom_sync)
 
     for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording)):
         x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
                                       "recording": "智云录播 → MP4"}[name])
-        x.add_argument("--course", type=int, help="智云课堂 course_id（classroom search 查）")
+        x.add_argument("--course", type=int, help="智云课堂 course_id（classroom courses / search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
         x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
         x.add_argument("--force", action="store_true", help="已存在也重新下载")
@@ -1689,6 +1834,8 @@ def main():
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
+    if a.cmd == "classroom" and a.action == "sync" and (a.jobs < 1 or a.max_size < 0):
+        p.error("--jobs 必须 >= 1，--max-size 必须 >= 0")
     if a.cmd == "recording" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
         p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
     if a.cmd == "recording" and a.sub is not None and not a.course:

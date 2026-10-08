@@ -11,6 +11,152 @@ spec.loader.exec_module(zju)
 
 
 class Offline(unittest.TestCase):
+    def test_classroom_courses_pagination(self):
+        from unittest import mock
+        z = zju.Zju.__new__(zju.Zju)
+        rows = [{"Id": 10, "Title": "课程一", "Teacher": "教师", "TermName": "2026-20271",
+                 "Type": "multi", "progress": {"subjectNum": 8}},
+                {"Id": 11, "Title": "课程二", "progress": None}]
+        pages = [{"code": 1000, "params": {"result": {"total": 2, "data": [row]}}} for row in rows]
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "bearer", return_value={}), \
+                mock.patch.object(z, "get") as get, mock.patch.object(z, "json", side_effect=pages):
+            courses = z.classroom_courses()
+        self.assertEqual([c["task_count"] for c in courses], [8, 0])
+        self.assertEqual([c["course_id"] for c in courses], [10, 11])
+        self.assertEqual([call.kwargs["params"]["nowpage"] for call in get.call_args_list], [1, 2])
+        self.assertTrue(all(call.kwargs["params"]["force_mycourse"] == 1 for call in get.call_args_list))
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "bearer", return_value={}), \
+                mock.patch.object(z, "get"), mock.patch.object(z, "json", return_value=pages[0]):
+            with self.assertRaisesRegex(zju.ZjuError, "分页重复"):
+                z.classroom_courses()
+        with mock.patch.object(z, "ensure"), mock.patch.object(z, "bearer", return_value={}), \
+                mock.patch.object(z, "get"), mock.patch.object(z, "json", return_value={"code": 401}):
+            with self.assertRaises(zju.ZjuError):
+                z.classroom_courses()
+
+    def test_classroom_courses_filter_and_json(self):
+        import contextlib
+        import io
+        import json
+        from types import SimpleNamespace
+        from unittest import mock
+        rows = [{"course_id": 10, "title": "课程一", "teacher": "教师", "term": "学期", "task_count": 8},
+                {"course_id": 11, "title": "课程二", "teacher": "", "term": "", "task_count": 0}]
+        for has_tasks, want in ((False, rows), (True, rows[:1])):
+            output = io.StringIO()
+            with mock.patch.object(zju, "Zju") as client, contextlib.redirect_stdout(output):
+                client.return_value.classroom_courses.return_value = rows
+                zju.cmd_classroom(SimpleNamespace(action="courses", has_tasks=has_tasks, json=True))
+            self.assertEqual(json.loads(output.getvalue()), want)
+
+    def test_classroom_sync_workers_and_incremental(self):
+        import io
+        import threading
+        import time
+        from argparse import Namespace
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        from PIL import Image
+
+        image = io.BytesIO()
+        Image.new("RGB", (10, 10), "white").save(image, format="PNG")
+        client = MagicMock()
+        client.classroom_courses.return_value = [{"course_id": 1, "title": "课程", "type": "multi"}]
+        subs = [{"course_id": 1, "sub_id": i, "course_name": "课程", "sub_name": f"第{i}堂"}
+                for i in range(1, 4)]
+        client.course_subs.return_value = subs
+        client.ppt_urls.return_value = [f"https://example.com/{i}.png" for i in range(5)]
+        client.video_catalogue.return_value = {i: [f"https://example.com/{i}.mp4"] for i in range(1, 4)}
+        active = peak = 0
+        lock = threading.Lock()
+
+        def transfer(result):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.02)
+                return result
+            finally:
+                with lock:
+                    active -= 1
+
+        client.subtitle.side_effect = lambda sid: transfer([{"BeginSec": 0, "Text": "转写内容"}])
+        client.get.side_effect = lambda url: transfer(SimpleNamespace(ok=True, content=image.getvalue()))
+        pools = []
+
+        def create_pool(**kwargs):
+            pool = ThreadPoolExecutor(**kwargs)
+            pools.append(pool)
+            return pool
+
+        def save_video(z, url, dest, limit, jobs, *, restart=False, pool=None):
+            self.assertIs(pool, pools[-1])
+            futures = [pool.submit(transfer, b"fragment") for _ in range(5)]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"".join(f.result() for f in futures))
+
+        for jobs in (1, 3):
+            active = peak = 0
+            pools.clear()
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d) / "output"
+                args = Namespace(out=str(root), course=["1", "课程"], dry_run=False, force=False,
+                                 recordings=True, jobs=jobs, max_size=0, format="md", dedup=False,
+                                 keep_images=False)
+                with patch.object(zju, "Zju", return_value=client), \
+                        patch.object(zju, "ThreadPoolExecutor", side_effect=create_pool), \
+                        patch.object(zju, "download_video", side_effect=save_video) as download:
+                    zju.cmd_classroom_sync(args)
+                    self.assertEqual(len(pools), 1)
+                    self.assertEqual(peak, jobs)
+                    self.assertEqual(len(list(root.rglob("*.pdf"))), 3)
+                    self.assertEqual(len(list(root.rglob("*.md"))), 3)
+                    self.assertEqual(len(list(root.rglob("*.mp4"))), 3)
+                    self.assertEqual(download.call_count, 3)
+                    self.assertEqual((root / "课程/转录/第1堂.md").read_text(), "# 课程 第1堂\n\n**[00:00:00]** 转写内容  \n")
+                    client.subtitle.reset_mock()
+                    client.ppt_urls.reset_mock()
+                    zju.cmd_classroom_sync(args)
+                    client.subtitle.assert_not_called()
+                    client.ppt_urls.assert_not_called()
+                    self.assertEqual(download.call_count, 3)
+                # 默认不下载录播；预览也不创建目录或调用材料下载。
+                args.out = str(Path(d) / "preview")
+                args.dry_run, args.recordings = True, False
+                with patch.object(zju, "Zju", return_value=client), \
+                        patch.object(zju, "ppt_one") as ppt, patch.object(zju, "transcript_one") as transcript, \
+                        patch.object(zju, "recording_subs") as recording:
+                    zju.cmd_classroom_sync(args)
+                    ppt.assert_not_called()
+                    transcript.assert_not_called()
+                    recording.assert_not_called()
+                    self.assertFalse(Path(args.out).exists())
+                    args.dry_run = False
+                    zju.cmd_classroom_sync(args)
+                    recording.assert_not_called()
+
+    def test_classroom_sync_continues_after_failure(self):
+        from argparse import Namespace
+        from unittest.mock import MagicMock, patch
+        client = MagicMock()
+        client.classroom_courses.return_value = [{"course_id": 1, "title": "课程", "type": "multi"}]
+        client.course_subs.return_value = [dict(course_id=1, sub_id=1, course_name="课程", sub_name="第一堂")]
+        with tempfile.TemporaryDirectory() as d:
+            args = Namespace(out=d, course=[], dry_run=False, force=False, jobs=1, recordings=True,
+                             format="md", dedup=False, keep_images=False, max_size=0)
+            with patch.object(zju, "Zju", return_value=client), \
+                    patch.object(zju, "transcript_one", side_effect=zju.ZjuError("转写失败")), \
+                    patch.object(zju, "ppt_one") as ppt, \
+                    patch.object(zju, "recording_subs", return_value=0) as recording:
+                with self.assertRaises(SystemExit) as exc:
+                    zju.cmd_classroom_sync(args)
+                self.assertEqual(exc.exception.code, 2)
+                ppt.assert_called_once()
+                recording.assert_called_once()
+
     def test_rsa_no_padding_roundtrip(self):
         # 与 CAS 前端同一套 textbook RSA：m^e mod n，hex 输出
         p, q, e = 1000000007, 998244353, 65537
@@ -288,6 +434,19 @@ class Offline(unittest.TestCase):
                 self.assertEqual(dest.read_bytes(), body)
                 self.assertGreater(state["max_active"], 1)
                 self.assertTrue(state["retried"])
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=2) as pool, \
+                        patch.object(zju, "ThreadPoolExecutor", side_effect=AssertionError("不应创建嵌套线程池")):
+                    state["max_active"] = 0
+                    zju.download_video(client, url, dest, None, 99, chunk_size=128, pool=pool, restart=True)
+                    self.assertEqual(dest.read_bytes(), body)
+                    self.assertEqual(state["max_active"], 2)
+                    state["mode"] = "bad"
+                    with self.assertRaises(zju.ZjuError):
+                        zju.download_video(client, url, dest, None, 99, chunk_size=128, pool=pool, restart=True)
+                    self.assertEqual(state["active"], 0)
+                    self.assertEqual(pool.submit(lambda: "可复用").result(), "可复用")
+                    state["mode"] = "good"
                 with self.assertRaises(zju.TooBig):
                     zju.download_video(client, url, dest, 10, 4)
                 for mode in ("bad", "truncated"):
