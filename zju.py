@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import html
+import hashlib
 import json
 import os
 import random
@@ -698,13 +699,46 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
 
 
 def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
-                   *, chunk_size: int = 32 * 2**20) -> Path:
-    """Range 分片平行寫入同一暫存檔，全部校驗成功後原子替換。"""
+                   *, chunk_size: int = 32 * 2**20, restart: bool = False) -> Path:
+    """保留已校驗分片及 checkpoint，跨次執行只補缺片。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # 鎖檔保留以避免刪除後新舊 inode 被不同程序同時鎖定。
+    lock_path = dest.with_name(f".{dest.name}.download.lock")
+    with lock_path.open("a+b") as lock_file:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                lock_file.seek(0)
+                if not lock_file.read(1):
+                    lock_file.write(b"\0")
+                    lock_file.flush()
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise ZjuError("另一個程序正在下載此影片") from e
+        return _download_video(z, url, dest, limit, jobs, chunk_size, restart)
+
+
+def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
+                    chunk_size: int, restart: bool) -> Path:
+    tmp = dest.with_name(f".{dest.name}.part")
+    checkpoint = dest.with_name(f".{dest.name}.part.json")
+
+    def clear_partial():
+        tmp.unlink(missing_ok=True)
+        checkpoint.unlink(missing_ok=True)
+        checkpoint.with_suffix(".json.tmp").unlink(missing_ok=True)
+
     headers = {"Range": "bytes=0-0", "Accept-Encoding": "identity"}
     probe = z.get(url, headers=headers, stream=True)
     if probe.status_code == 200:
-        log("[單連線] 伺服器不支援 Range")
-        return stream_to(probe, dest, limit, mp4=True)
+        log("[單連線] 伺服器不支援 Range，這次從頭下載")
+        result = stream_to(probe, dest, limit, mp4=True)
+        clear_partial()
+        return result
     try:
         match = re.fullmatch(r"bytes 0-0/(\d+)", probe.headers.get("Content-Range", ""))
         if probe.status_code != 206 or not match:
@@ -719,71 +753,139 @@ def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
         if len(probe.content) != 1:
             raise ZjuError("Range 探測長度錯誤")
         etag = probe.headers.get("ETag", "")
-        validator = etag if etag and not etag.startswith("W/") else probe.headers.get("Last-Modified")
+        validator_type = "etag" if etag and not etag.startswith("W/") else "last_modified"
+        validator = etag if validator_type == "etag" else probe.headers.get("Last-Modified")
     finally:
         probe.close()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
+    # 去掉可能刷新的簽名參數；遠端版本仍須由 validator 及長度確認。
+    source = urlparse(url)._replace(query="", fragment="").geturl()
+    metadata = {"version": 1, "source": hashlib.sha256(source.encode()).hexdigest(),
+                "total": total, "chunk_size": chunk_size,
+                "validator_type": validator_type, "validator": validator}
+    saved = {}
     try:
-        with os.fdopen(fd, "wb") as f:
+        saved = json.loads(checkpoint.read_text())
+    except (OSError, ValueError):
+        pass
+    reusable = (not restart and bool(validator) and isinstance(saved, dict)
+                and all(saved.get(k) == v for k, v in metadata.items())
+                and tmp.is_file() and tmp.stat().st_size == total)
+    done = {}
+    if reusable and isinstance(saved.get("done"), dict):
+        with tmp.open("rb") as f:
+            for start in range(0, total, chunk_size):
+                digest = saved["done"].get(str(start))
+                if not isinstance(digest, str):
+                    continue
+                f.seek(start)
+                h = hashlib.sha256()
+                remaining = min(chunk_size, total - start)
+                while remaining:
+                    block = f.read(min(1 << 20, remaining))
+                    if not block:
+                        break
+                    h.update(block)
+                    remaining -= len(block)
+                if not remaining and h.hexdigest() == digest:
+                    done[str(start)] = digest
+    else:
+        if tmp.exists():
+            log("[重新下載] 本地狀態或遠端版本變更，無法沿用分片")
+        with tmp.open("wb") as f:
             f.truncate(total)
+    if not validator:
+        log("[提示] 伺服器未提供版本標記，跨次執行需重新下載")
+    state = dict(metadata, done=done)
+    state_lock = threading.Lock()
+    stopped = threading.Event()
 
-        def grab(start):
-            end = min(start + chunk_size, total) - 1
-            h = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-            if validator:
-                h["If-Range"] = validator
-            for attempt in range(3):
+    def save_state():
+        staging = checkpoint.with_suffix(".json.tmp")
+        with staging.open("w") as f:
+            json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staging, checkpoint)
+
+    save_state()
+    resumed = sum(min(chunk_size, total - int(start)) for start in done)
+    if resumed:
+        log(f"[續傳] 已有 {resumed / 2**20:.1f}/{total / 2**20:.1f}MB，補下載缺少分片")
+
+    def grab(start):
+        end = min(start + chunk_size, total) - 1
+        h = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+        if validator:
+            h["If-Range"] = validator
+        for attempt in range(3):
+            if stopped.is_set():
+                raise ZjuError("下載已中止")
+            try:
+                r = z.get(url, headers=h, stream=True)
                 try:
-                    r = z.get(url, headers=h, stream=True)
-                    try:
-                        expected_range = f"bytes {start}-{end}/{total}"
-                        if r.status_code != 206 or r.headers.get("Content-Range") != expected_range:
-                            raise ZjuError(f"分片 {start}-{end} 範圍不符 HTTP {r.status_code}")
-                        if r.headers.get("Content-Encoding", "identity") != "identity":
-                            raise ZjuError("分片回應使用壓縮編碼")
-                        written = 0
-                        with open(tmp, "r+b") as f:
-                            f.seek(start)
-                            for block in r.iter_content(1 << 20):
-                                if written + len(block) > end - start + 1:
-                                    raise ZjuError("分片長度超出範圍")
-                                f.write(block)
-                                written += len(block)
+                    expected_range = f"bytes {start}-{end}/{total}"
+                    if r.status_code != 206 or r.headers.get("Content-Range") != expected_range:
+                        raise ZjuError(f"分片 {start}-{end} 範圍不符 HTTP {r.status_code}")
+                    if r.headers.get("Content-Encoding", "identity") != "identity":
+                        raise ZjuError("分片回應使用壓縮編碼")
+                    written = 0
+                    digest = hashlib.sha256()
+                    with tmp.open("r+b") as f:
+                        f.seek(start)
+                        for block in r.iter_content(1 << 20):
+                            if stopped.is_set():
+                                raise ZjuError("下載已中止")
+                            if written + len(block) > end - start + 1:
+                                raise ZjuError("分片長度超出範圍")
+                            f.write(block)
+                            digest.update(block)
+                            written += len(block)
                         if written != end - start + 1:
                             raise ZjuError(f"分片下載不完整：{written}/{end - start + 1}")
-                        return written
-                    finally:
-                        r.close()
-                except (requests.RequestException, ZjuError):
-                    if attempt == 2:
-                        raise
-                    time.sleep(0.5 * 2**attempt)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    with state_lock:
+                        done[str(start)] = digest.hexdigest()
+                        save_state()
+                    return written
+                finally:
+                    r.close()
+            except (requests.RequestException, ZjuError):
+                if attempt == 2 or stopped.is_set():
+                    raise
+                time.sleep(0.5 * 2**attempt)
 
-        completed = 0
-        next_report = 0
-        started = time.monotonic()
+    completed = resumed
+    next_report = completed * 100 // total
+    started = time.monotonic()
+    try:
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [pool.submit(grab, start) for start in range(0, total, chunk_size)]
+            futures = [pool.submit(grab, start) for start in range(0, total, chunk_size)
+                       if str(start) not in done]
             try:
                 for future in as_completed(futures):
                     completed += future.result()
                     percent = completed * 100 // total
                     if percent >= next_report or completed == total:
-                        speed = completed / 2**20 / max(time.monotonic() - started, 0.001)
+                        speed = (completed - resumed) / 2**20 / max(time.monotonic() - started, 0.001)
                         log(f"[進度] {percent}%  {completed / 2**20:.1f}/{total / 2**20:.1f}MB  {speed:.1f}MB/s")
                         next_report = percent + 10
             except BaseException:
+                stopped.set()
                 for future in futures:
                     future.cancel()
                 raise
-        with open(tmp, "rb") as f:
-            if f.read(12)[4:8] != b"ftyp":
-                raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
-        os.replace(tmp, dest)
-        return dest
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+    except BaseException:
+        log("[保留分片] 下次執行相同下載指令即可續傳")
+        raise
+    with tmp.open("rb") as f:
+        valid_mp4 = f.read(12)[4:8] == b"ftyp"
+    if not valid_mp4:
+        clear_partial()
+        raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
+    os.replace(tmp, dest)
+    clear_partial()
+    return dest
 
 
 def current_year(courses: list[dict]) -> list[dict]:
@@ -1447,7 +1549,7 @@ def cmd_video(a):
                 continue
             try:
                 log(f"[下載] {dest.relative_to(root)}")
-                download_video(z, url, dest, limit, a.jobs)
+                download_video(z, url, dest, limit, a.jobs, restart=a.force)
                 man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
                               "course_id": cid, "sub_id": sid,
                               "at": dt.datetime.now().isoformat(timespec="seconds")})
@@ -1571,6 +1673,7 @@ def main():
             x.add_argument("--dry-run", action="store_true", help="只列出待下載錄播")
             x.add_argument("--max-size", type=int, default=0, metavar="MB", help="單檔上限（預設 0 = 不限）")
             x.add_argument("-j", "--jobs", type=int, default=4, help="每個影片的平行分片連線數（預設 4）")
+            x.description = "預設沿用已完成分片，重新執行即可續傳；--force 丟棄分片並從頭下載。"
         x.set_defaults(fn=fn)
 
     a = p.parse_args()

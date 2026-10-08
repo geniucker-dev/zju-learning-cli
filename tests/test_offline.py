@@ -295,10 +295,13 @@ class Offline(unittest.TestCase):
                     with self.assertRaises((zju.ZjuError, zju.requests.RequestException)):
                         zju.download_video(client, url, dest, None, 4, chunk_size=128)
                     self.assertEqual(dest.read_bytes(), body)  # 失敗不能覆蓋原檔
-                    self.assertEqual(list(Path(d).glob(".part-*")), [])
+                    self.assertTrue((Path(d) / ".video.mp4.part").exists())
+                    self.assertTrue((Path(d) / ".video.mp4.part.json").exists())
                 state["mode"] = "fallback"
                 zju.download_video(client, url, dest, None, 4)
                 self.assertEqual(dest.read_bytes(), body)
+                self.assertFalse((Path(d) / ".video.mp4.part").exists())
+                self.assertFalse((Path(d) / ".video.mp4.part.json").exists())
         finally:
             server.shutdown()
             server.server_close()
@@ -322,7 +325,7 @@ class Offline(unittest.TestCase):
                 self.assertFalse(root.exists())
                 self.assertEqual(client.video_catalogue.call_count, 1)
                 args.dry_run = False
-                def save(z, u, dest, limit, jobs):
+                def save(z, u, dest, limit, jobs, *, restart=False):
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(b"mp4")
                 download.side_effect = save
@@ -332,6 +335,113 @@ class Offline(unittest.TestCase):
                 args.force = True
                 zju.cmd_video(args)
                 self.assertEqual(download.call_count, 2)
+                self.assertTrue(download.call_args.kwargs["restart"])
+
+    def test_video_resume_across_processes(self):
+        import json
+        import os
+        import subprocess
+        import sys
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        import time
+
+        body = b"\x00\x00\x00\x20ftypisom" + bytes(range(256)) * 4
+        state = {"fail": True, "etag": '"v1"', "requests": []}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                start, end = map(int, self.headers["Range"][6:].split("-"))
+                state["requests"].append((start, end))
+                time.sleep(0.02)
+                self.send_response(206)
+                wrong = state["fail"] and start == 128
+                self.send_header("Content-Range", f"bytes {start + int(wrong)}-{end}/{len(body)}")
+                self.send_header("Content-Length", str(end - start + 1))
+                if state["etag"]:
+                    self.send_header("ETag", state["etag"])
+                self.end_headers()
+                try:
+                    self.wfile.write(body[start:end + 1])
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                dest = Path(d) / "video.mp4"
+                partial = dest.with_name(".video.mp4.part")
+                checkpoint = dest.with_name(".video.mp4.part.json")
+                script = "import sys, zju; from pathlib import Path; zju.download_video(zju.Zju(), sys.argv[1], Path(sys.argv[2]), None, 1, chunk_size=128, restart=sys.argv[3] == 'True')"
+                url = f"http://127.0.0.1:{server.server_port}/video.mp4"
+
+                def run(restart=False, query=""):
+                    return subprocess.run([sys.executable, "-c", script, url + query, str(dest), str(restart)],
+                                          cwd=ROOT, capture_output=True, text=True, timeout=20,
+                                          env=dict(os.environ, ZJU_STATE_DIR=str(Path(d) / "state")))
+
+                # 每輪在第一片完成後斷線，再用全新 Python 程序續傳。
+                for mode in ("interrupted", "resume", "refresh", "corrupt", "version", "force", "checkpoint", "no_validator"):
+                    state["fail"] = True
+                    state["etag"] = "" if mode == "no_validator" else '"v1"'
+                    if mode == "interrupted":
+                        process = subprocess.Popen([sys.executable, "-c", script, url, str(dest), "False"],
+                                                   cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                   env=dict(os.environ, ZJU_STATE_DIR=str(Path(d) / "state")))
+                        try:
+                            deadline = time.monotonic() + 5
+                            while time.monotonic() < deadline:
+                                try:
+                                    if "0" in json.loads(checkpoint.read_text())["done"]:
+                                        break
+                                except (OSError, ValueError, KeyError):
+                                    pass
+                                time.sleep(0.01)
+                            self.assertIn("0", json.loads(checkpoint.read_text())["done"])
+                            concurrent = run()
+                            self.assertNotEqual(concurrent.returncode, 0)
+                            self.assertIn("另一個程序", concurrent.stderr)
+                        finally:
+                            if process.poll() is None:
+                                process.terminate()
+                            process.communicate(timeout=10)
+                    else:
+                        self.assertNotEqual(run().returncode, 0)
+                    self.assertTrue(partial.exists())
+                    saved = json.loads(checkpoint.read_text())
+                    self.assertIn("0", saved["done"])
+                    self.assertFalse(dest.exists())
+                    if mode == "corrupt":
+                        with partial.open("r+b") as f:
+                            f.write(b"bad!")
+                    elif mode == "version":
+                        state["etag"] = '"v2"'
+                    elif mode == "checkpoint":
+                        checkpoint.write_text("broken json")
+                    state["requests"].clear()
+                    state["fail"] = False
+                    result = run(restart=mode == "force", query="?signature=renewed" if mode == "refresh" else "")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(dest.read_bytes(), body)
+                    self.assertFalse(partial.exists())
+                    self.assertFalse(checkpoint.exists())
+                    chunks = [start for start, end in state["requests"] if end != 0]
+                    if mode in ("resume", "interrupted", "refresh"):
+                        for start in saved["done"]:
+                            self.assertNotIn(int(start), chunks)
+                        self.assertIn("[續傳]", result.stderr)
+                    else:
+                        self.assertIn(0, chunks)
+                    dest.unlink()
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join()
 
     def test_video_rejects_non_mp4(self):
         import io
