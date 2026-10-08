@@ -25,7 +25,7 @@
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/转录/<堂>.txt\|srt\|md` |
-| `./zju.py video --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
+| `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
 
 ## 安裝
 
@@ -60,6 +60,8 @@ zju transcript --days 1 --format md
 
 輸出目錄的優先順序：`--out` > 環境變數 `ZJU_OUT` > `~/.config/zju-learning/config.json` 的 `"out"` > `~/ZJU-Courses`。
 
+`sync --videos` 下載學在浙大活動的影音附件；`./zju.py recording` 下載智雲課堂的課堂錄播，兩者來源不同。
+
 程式提示與說明改用簡體中文，新資料目錄為 `智云PPT`、`转录`、`录播`。已有繁體目錄中的檔案和影片續傳進度仍會辨識，繼續使用原路徑，不搬移或重複下載；課程名、檔名和轉錄內容保留平台原文。
 
 排程範例（cron，每天 22:00）：
@@ -79,16 +81,16 @@ zju transcript --days 1 --format md
 ```bash
 ./zju.py classroom search 人工智能
 ./zju.py classroom subs 89418
-./zju.py video --course 89418 --dry-run       # 只列待下載影片，不下載、不寫檔
-./zju.py video --course 89418 --sub 2019095   # 指定堂次
-./zju.py video --course 89418 -j 8           # 整門課；每個影片最多 8 個連線
-./zju.py video --days 7                     # 最近 7 天自己的課堂
-./zju.py video --course 89418 --max-size 4096 # 單檔上限 4096MB；預設 0 = 不限
+./zju.py recording --course 89418 --dry-run       # 只列待下載影片，不下載、不寫檔
+./zju.py recording --course 89418 --sub 2019095   # 指定堂次
+./zju.py recording --course 89418 -j 8           # 整門課；每個影片最多 8 個連線
+./zju.py recording --days 7                     # 最近 7 天自己的課堂
+./zju.py recording --course 89418 --max-size 4096 # 單檔上限 4096MB；預設 0 = 不限
 ```
 
 預設每個影片使用 4 個連線，以 32MiB 分片平行下載，顯示進度及平均速度。逐個下載影片，分片失敗最多嘗試 3 次；伺服器不支援 Range 時回退到單連線。檢查每片的回應範圍、總大小、實際位元組數及最終 MP4 檔頭，全部成功才替換目標檔並寫入下載清單。伺服器提供 ETag 或 Last-Modified 時，使用 If-Range 防止混合不同版本。
 
-已下載且大小符合清單的檔案會略過；暫無回放的堂次略過，下次重新查詢。多段回放網址分別存成帶編號的 MP4。目錄與檔名含課程、堂次 ID，避免同名覆蓋。目前支援直接 MP4，不支援 HLS。`--out` 放在子命令前，例如 `./zju.py --out ~/ZJU-Courses video --course 89418`。
+已下載且大小符合清單的檔案會略過；暫無回放的堂次略過，下次重新查詢。多段回放網址分別存成帶編號的 MP4。目錄與檔名含課程、堂次 ID，避免同名覆蓋。目前支援直接 MP4，不支援 HLS。`--out` 放在子命令前，例如 `./zju.py --out ~/ZJU-Courses recording --course 89418`。
 
 **影片預設支援跨次執行的斷點續傳。** 中斷或失敗時，在影片旁保留隱藏的 `.影片名.mp4.part` 資料檔與 `.影片名.mp4.part.json` 進度檔。重新執行相同命令（輸出目錄不變）即可繼續，`-j` 可調整；只補抓未完成或校驗損壞的分片，未完成的單片從頭下載。每片完成後將資料寫入磁碟，再原子儲存進度及 SHA-256；下次校驗已完成分片。全部完成才替換 MP4，並清除資料和進度檔。隱藏的 `.影片名.mp4.download.lock` 小鎖檔保留，以阻止多個程序同時下載同一影片。
 

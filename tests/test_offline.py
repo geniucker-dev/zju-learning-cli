@@ -307,7 +307,7 @@ class Offline(unittest.TestCase):
             server.server_close()
             worker.join()
 
-    def test_video_command_manifest_and_dry_run(self):
+    def test_recording_command_manifest_and_dry_run(self):
         from argparse import Namespace
         from unittest.mock import patch, MagicMock
 
@@ -320,7 +320,7 @@ class Offline(unittest.TestCase):
             args = Namespace(out=str(root), dry_run=True, force=False, max_size=0, jobs=4)
             with patch.object(zju, "Zju", return_value=client), patch.object(zju, "resolve_subs", return_value=subs), \
                     patch.object(zju, "download_video") as download:
-                zju.cmd_video(args)
+                zju.cmd_recording(args)
                 download.assert_not_called()
                 self.assertFalse(root.exists())
                 self.assertEqual(client.video_catalogue.call_count, 1)
@@ -329,11 +329,11 @@ class Offline(unittest.TestCase):
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes(b"mp4")
                 download.side_effect = save
-                zju.cmd_video(args)
-                zju.cmd_video(args)
+                zju.cmd_recording(args)
+                zju.cmd_recording(args)
                 self.assertEqual(download.call_count, 1)
                 args.force = True
-                zju.cmd_video(args)
+                zju.cmd_recording(args)
                 self.assertEqual(download.call_count, 2)
                 self.assertTrue(download.call_args.kwargs["restart"])
 

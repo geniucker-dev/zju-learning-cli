@@ -25,7 +25,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom day [日期] [--days N]
   zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
-  zju.py video --course <cid> | --days N [--dry-run]  # 智云录播 MP4
+  zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
 """
 from __future__ import annotations
 
@@ -730,7 +730,7 @@ def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                 import fcntl
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            raise ZjuError("另一个程序正在下载此视频") from e
+            raise ZjuError("另一个程序正在下载此录播") from e
         return _download_video(z, url, dest, limit, jobs, chunk_size, restart)
 
 
@@ -1511,7 +1511,7 @@ def cmd_transcript(a):
         sys.exit(2)
 
 
-def cmd_video(a):
+def cmd_recording(a):
     z = Zju()
     root = Path(a.out).expanduser()
     subs = resolve_subs(z, a)
@@ -1603,7 +1603,7 @@ def main():
     x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
     x.add_argument("--all", action="store_true", help="没指定课程时抓全部学年")
     x.add_argument("--dry-run", action="store_true")
-    x.add_argument("--videos", action="store_true", help="连影音档也抓（默认跳过）")
+    x.add_argument("--videos", action="store_true", help="包括学在浙大的音视频附件（默认跳过）")
     x.add_argument("-j", "--jobs", type=int, default=4, help="并行下载数（默认 4）")
     x.add_argument("--max-size", type=int, default=200, metavar="MB", help="单文件上限，超过只列出（默认 200，0 = 不限）")
     x.set_defaults(fn=cmd_sync)
@@ -1668,9 +1668,9 @@ def main():
     x.add_argument("--days", type=int)
     x.set_defaults(fn=cmd_classroom)
 
-    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("video", cmd_video)):
+    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording)):
         x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
-                                      "video": "智云录播 → MP4"}[name])
+                                      "recording": "智云录播 → MP4"}[name])
         x.add_argument("--course", type=int, help="智云课堂 course_id（classroom search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
         x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
@@ -1684,14 +1684,14 @@ def main():
         else:
             x.add_argument("--dry-run", action="store_true", help="只列出待下载录播")
             x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")
-            x.add_argument("-j", "--jobs", type=int, default=4, help="每个视频的平行分片连接数（默认 4）")
+            x.add_argument("-j", "--jobs", type=int, default=4, help="每堂录播的并行分片连接数（默认 4）")
             x.description = "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。"
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
-    if a.cmd == "video" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
+    if a.cmd == "recording" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
         p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
-    if a.cmd == "video" and a.sub is not None and not a.course:
+    if a.cmd == "recording" and a.sub is not None and not a.course:
         p.error("--sub 需要搭配 --course")
     try:
         a.fn(a)
