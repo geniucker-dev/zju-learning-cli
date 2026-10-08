@@ -23,9 +23,9 @@
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
-| `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智雲PPT/<堂>.pdf` |
-| `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/轉錄/<堂>.txt\|srt\|md` |
-| `./zju.py video --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/錄播/<堂> (<sub_id>).mp4`，多連線分片下載 |
+| `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智云PPT/<堂>.pdf` |
+| `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/转录/<堂>.txt\|srt\|md` |
+| `./zju.py video --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
 
 ## 安裝
 
@@ -59,6 +59,8 @@ zju transcript --days 1 --format md
 ```
 
 輸出目錄的優先順序：`--out` > 環境變數 `ZJU_OUT` > `~/.config/zju-learning/config.json` 的 `"out"` > `~/ZJU-Courses`。
+
+程式提示與說明改用簡體中文，新資料目錄為 `智云PPT`、`转录`、`录播`。已有繁體目錄中的檔案和影片續傳進度仍會辨識，繼續使用原路徑，不搬移或重複下載；課程名、檔名和轉錄內容保留平台原文。
 
 排程範例（cron，每天 22:00）：
 

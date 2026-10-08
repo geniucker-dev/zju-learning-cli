@@ -6,26 +6,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 8eoyw
 # Portions ported from PeiPei233/zju-learning-assistant, Copyright (c) 2023 PeiPei233 (MIT).
-"""學在浙大 / 智雲課堂 命令列工具。
+"""学在浙大 / 智云课堂 命令列工具。
 
-API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju_assist.rs，
-改成可腳本化、可排程、可被 AI agent 直接呼叫的單檔 CLI。
+API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju_assist.rs，
+改成可脚本化、可排程、可被 AI agent 直接呼叫的单文件 CLI。
 
-  zju.py login                         # 首次：存學號，密碼進 macOS Keychain
-  zju.py courses [--all]               # 學在浙大課程列表
-  zju.py sync [課程...] [--dry-run]     # 增量同步課程附件（含排程中的活動）
-  zju.py todo                          # 待辦
-  zju.py activities [課程...] [--type forum homework ...]  # 所有活動（含測驗）
-  zju.py show <活動id>                  # 活動詳情；作業顯示自己的提交狀態
-  zju.py forum list|read|post|reply ... # 討論區
-  zju.py upload 檔案...                 # 上傳，印 upload id
-  zju.py submit <作業id> --file ... [--body ...] [--draft] [-y]  # 交作業
-  zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
-  zju.py classroom subs <cid>          # 列出每堂課
+  zju.py login                         # 首次：存学号，密码进 macOS Keychain
+  zju.py courses [--all]               # 学在浙大课程列表
+  zju.py sync [课程...] [--dry-run]     # 增量同步课程附件（含排程中的活动）
+  zju.py todo                          # 待办
+  zju.py activities [课程...] [--type forum homework ...]  # 所有活动（含测验）
+  zju.py show <活动id>                  # 活动详情；作业显示自己的提交状态
+  zju.py forum list|read|post|reply ... # 讨论区
+  zju.py upload 文件...                 # 上传，印 upload id
+  zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
+  zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
+  zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]
-  zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
+  zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
-  zju.py video --course <cid> | --days N [--dry-run]  # 智雲錄播 MP4
+  zju.py video --course <cid> | --days N [--dry-run]  # 智云录播 MP4
 """
 from __future__ import annotations
 
@@ -56,14 +56,14 @@ KEYCHAIN_SERVICE = "zju-learning"
 STATE_DIR = Path(os.environ.get("ZJU_STATE_DIR") or (Path.home() / ".config" / "zju-learning"))
 CONFIG_FILE = STATE_DIR / "config.json"
 COOKIE_FILE = STATE_DIR / "cookies.json"
-# 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
+# 这两台只支持 1024-bit DHE / 静态 RSA，OpenSSL 3 默认拒绝；降级只套用在它们身上
 LEGACY_TLS_HOSTS = ("courses.zju.edu.cn", "identity.zju.edu.cn")
-CST = dt.timezone(dt.timedelta(hours=8))  # 學校 API 沒帶時區時視為北京時間
+CST = dt.timezone(dt.timedelta(hours=8))  # 学校 API 没带时区时视为北京时间
 LMS = "https://courses.zju.edu.cn"
-DEFAULT_OUT = Path.home() / "ZJU-Courses"  # 可用 config.json 的 "out" 或環境變數 ZJU_OUT 覆寫
+DEFAULT_OUT = Path.home() / "ZJU-Courses"  # 可用 config.json 的 "out" 或环境变数 ZJU_OUT 覆盖
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/88.0"
 MEDIA_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".m4v", ".wmv", ".webm", ".mp3", ".m4a", ".wav"}
-TIMEOUT = (6, 60)  # connect, read — 排程時別卡在單一 hop 上
+TIMEOUT = (6, 60)  # connect, read — 排程时别卡在单一 hop 上
 
 COURSE_FIELDS = (
     "id,name,course_code,department(id,name),start_date,end_date,is_started,is_closed,"
@@ -85,9 +85,21 @@ WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), 
 def safe_name(s: str) -> str:
     s = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", str(s)).strip(" .")
     s = s[:150].rstrip(" .") or "_"
-    if s.split(".")[0].upper() in WIN_RESERVED:  # Windows 保留裝置名
+    if s.split(".")[0].upper() in WIN_RESERVED:  # Windows 保留装置名
         s = "_" + s
     return s
+
+
+def material_path(course_dir: Path, kind: str, filename: str) -> Path:
+    """新资料使用简体目录，旧文件和续传分片继续使用原路径。"""
+    legacy_names = {"智云PPT": "智雲PPT", "转录": "轉錄", "录播": "錄播"}
+    target = course_dir / kind / filename
+    legacy = course_dir / legacy_names[kind] / filename
+    for candidate in (target, legacy):
+        if (candidate.exists() or candidate.with_name(f".{filename}.part").exists()
+                or candidate.with_name(f".{filename}.part.json").exists()):
+            return candidate
+    return target
 
 
 # ---------------- config / credentials ----------------
@@ -104,7 +116,7 @@ def load_config() -> dict:
     try:
         return json.loads(CONFIG_FILE.read_text())
     except ValueError as e:
-        raise ZjuError(f"{CONFIG_FILE} 格式錯誤：{e}")
+        raise ZjuError(f"{CONFIG_FILE} 格式错误：{e}")
 
 
 def save_config(cfg: dict):
@@ -127,36 +139,36 @@ def keychain_get(user: str) -> str | None:
 
 
 def keychain_set_interactive(user: str):
-    if sys.platform != "darwin":  # Windows 憑證管理員 / Linux Secret Service
+    if sys.platform != "darwin":  # Windows 凭证管理员 / Linux Secret Service
         import getpass
         import keyring
         try:
-            keyring.set_password(KEYCHAIN_SERVICE, user, getpass.getpass("密碼："))
+            keyring.set_password(KEYCHAIN_SERVICE, user, getpass.getpass("密码："))
         except Exception as e:
-            raise ZjuError(f"系統憑證庫不可用（{e}）；改用環境變數 ZJU_USER / ZJU_PASS")
+            raise ZjuError(f"系统凭据库不可用（{e}）；改用环境变数 ZJU_USER / ZJU_PASS")
         return
-    # macOS 走系統 security CLI（排程讀取不會跳授權視窗）；-w 放最後 = security 自己在 tty 上問密碼，密碼不進 argv / shell history
+    # macOS 走系统 security CLI（排程读取不会跳授权视窗）；-w 放最后 = security 自己在 tty 上问密码，密码不进 argv / shell history
     r = subprocess.run(
         ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", user, "-w"]
     )
     if r.returncode != 0:
-        raise ZjuError("寫入 Keychain 失敗")
+        raise ZjuError("写入 Keychain 失败")
 
 
 def get_credentials() -> tuple[str, str]:
     user = os.environ.get("ZJU_USER") or load_config().get("username")
     if not user:
-        raise ZjuError("尚未設定帳號，先跑：zju.py login")
+        raise ZjuError("尚未设置帐号，先跑：zju.py login")
     pwd = os.environ.get("ZJU_PASS") or keychain_get(user)
     if not pwd:
-        raise ZjuError("Keychain 找不到密碼，先跑：zju.py login")
+        raise ZjuError("Keychain 找不到密码，先跑：zju.py login")
     return user, pwd
 
 
 # ---------------- client ----------------
 
 class LegacyTLS(HTTPAdapter):
-    """只掛在 LEGACY_TLS_HOSTS：它們只給 1024-bit DHE，OpenSSL 3 報 DH_KEY_TOO_SMALL。"""
+    """只挂在 LEGACY_TLS_HOSTS：它们只给 1024-bit DHE，OpenSSL 3 报 DH_KEY_TOO_SMALL。"""
 
     def init_poolmanager(self, *a, **kw):
         ctx = ssl.create_default_context()
@@ -172,9 +184,9 @@ class LegacyTLS(HTTPAdapter):
 
 
 class NoCookieHTTP(HTTPAdapter):
-    """明文 http:// 一律不帶 cookie / Authorization。
-    .zju.edu.cn 的 SSO cookie（iPlanetDirectoryPro 等）沒設 Secure，瀏覽器和 requests
-    都會照送給 http 網址 —— 智雲 PPT 圖片就是 http，等於把登入憑證明文送出。"""
+    """明文 http:// 一律不带 cookie / Authorization。
+    .zju.edu.cn 的 SSO cookie（iPlanetDirectoryPro 等）没设 Secure，浏览器和 requests
+    都会照送给 http 网址 —— 智云 PPT 图片就是 http，等于把登录凭证明文送出。"""
 
     def send(self, request, **kw):
         request.headers.pop("Cookie", None)
@@ -193,7 +205,7 @@ class TooBig(ZjuError):
 
 
 def secure_url(u: str) -> str:
-    """學校主機的 http 網址升級成 https（實測 video.cmc 等都支援）。"""
+    """学校主机的 http 网址升级成 https（实测 video.cmc 等都支持）。"""
     p = urlparse(u)
     if p.scheme == "http" and (p.hostname or "").endswith(".zju.edu.cn"):
         return "https" + u[4:]
@@ -201,9 +213,9 @@ def secure_url(u: str) -> str:
 
 
 def refer_params(activity: dict | None) -> dict | None:
-    """組 /uploads/{id}/blob 的 reference 參數，與官方網頁前端下載鈕送出的相同：
-    classroom→classroom_activity、exam 不帶、其餘→learning_activity；
-    伺服器只認 snake_case 參數名。"""
+    """组 /uploads/{id}/blob 的 reference 参数，与官方网页前端下载钮送出的相同：
+    classroom→classroom_activity、exam 不带、其余→learning_activity；
+    服务器只认 snake_case 参数名。"""
     if not activity or not activity.get("id"):
         return None
     t = activity.get("type")
@@ -215,24 +227,24 @@ def refer_params(activity: dict | None) -> dict | None:
 
 class Zju:
     def __init__(self):
-        self.jar = requests.cookies.RequestsCookieJar()  # 各執行緒 session 共用（CookieJar 自帶鎖）
+        self.jar = requests.cookies.RequestsCookieJar()  # 各执行绪 session 共用（CookieJar 自带锁）
         self._tl = threading.local()
         self.logged_in = False
         self._load_cookies()
 
     def _load_cookies(self):
-        (STATE_DIR / "cookies.pkl").unlink(missing_ok=True)  # 舊版 pickle 快取：不再讀取
+        (STATE_DIR / "cookies.pkl").unlink(missing_ok=True)  # 旧版 pickle 快取：不再读取
         if not COOKIE_FILE.exists():
             return
         try:
             for d in json.loads(COOKIE_FILE.read_text()):
                 self.jar.set_cookie(requests.cookies.create_cookie(**d))
         except (ValueError, TypeError, KeyError):
-            COOKIE_FILE.unlink(missing_ok=True)  # 壞了就重登
+            COOKIE_FILE.unlink(missing_ok=True)  # 坏了就重登
 
     @property
     def s(self) -> requests.Session:
-        """每個執行緒一個 session：連線池不互搶，trust_env 切換也不會互相干擾。"""
+        """每个执行绪一个 session：连接池不互抢，trust_env 切换也不会互相干扰。"""
         if not hasattr(self._tl, "s"):
             s = requests.Session()
             s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8))
@@ -245,9 +257,9 @@ class Zju:
         return self._tl.s
 
     def req(self, method: str, url: str, retry: bool | None = None, **kw) -> requests.Response:
-        """預設直連，連不上才退環境 proxy。
-        重試只給冪等請求（GET 或明確 retry=True）；非冪等只在「確定沒送出」（連線逾時／proxy 錯）時重試，
-        免得登入 POST 被重送、觸發 CAS 驗證碼。TLS 錯誤不重試：跟斷線要分得出來。"""
+        """默认直连，连不上才退环境 proxy。
+        重试只给幂等请求（GET 或明确 retry=True）；非幂等只在「确定没送出」（连接逾时／proxy 错）时重试，
+        免得登录 POST 被重送、触发 CAS 验证码。TLS 错误不重试：跟断线要分得出来。"""
         kw.setdefault("timeout", TIMEOUT)
         idempotent = method in ("GET", "HEAD") if retry is None else retry
         last = None
@@ -256,22 +268,22 @@ class Zju:
             try:
                 r = self.s.request(method, url, **kw)
             except requests.exceptions.SSLError as e:
-                raise ZjuError(f"TLS 驗證失敗（網路可能被攔截，或學校憑證有問題）：{url}\n{e}")
+                raise ZjuError(f"TLS 验证失败（网路可能被拦截，或学校凭证有问题）：{url}\n{e}")
             except (requests.exceptions.ConnectTimeout, requests.exceptions.ProxyError) as e:
                 last = e
             except (requests.ConnectionError, requests.Timeout) as e:
                 if not idempotent:
-                    raise ZjuError(f"連線中斷（請求可能已送出，不自動重送）：{url}\n{e}")
+                    raise ZjuError(f"连接中断（请求可能已送出，不自动重送）：{url}\n{e}")
                 last = e
             else:
-                if r.status_code in (429, 503) and attempt < 3:  # 被限流：照 Retry-After 退讓
+                if r.status_code in (429, 503) and attempt < 3:  # 被限流：照 Retry-After 退让
                     wait = r.headers.get("Retry-After", "")
                     r.close()
                     time.sleep(min(int(wait), 60) if wait.isdigit() else 2 * 2 ** attempt)
                     continue
                 return r
             time.sleep(0.3 * 2 ** attempt)
-        raise ZjuError(f"連線失敗：{url}\n{last}")
+        raise ZjuError(f"连接失败：{url}\n{last}")
 
     def get(self, url, **kw):
         return self.req("GET", url, **kw)
@@ -280,7 +292,7 @@ class Zju:
         return self.req("POST", url, **kw)
 
     def save_cookies(self):
-        """JSON 不是 pickle：快取檔被別人改了也只是讀到壞 cookie，不會執行程式碼。"""
+        """JSON 不是 pickle：快取档被别人改了也只是读到坏 cookie，不会执行程式码。"""
         state_dir()
         data = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
                  "secure": c.secure, "expires": c.expires, "rest": c._rest} for c in self.jar]
@@ -298,7 +310,7 @@ class Zju:
         text = self.get("https://zjuam.zju.edu.cn/cas/login").text
         m = re.search(r'name="execution" value="(.*?)"', text)
         if not m:
-            raise ZjuError("CAS 頁面找不到 execution 欄位（登入頁改版？）")
+            raise ZjuError("CAS 页面找不到 execution 栏位（登录页改版？）")
         key = self.get("https://zjuam.zju.edu.cn/cas/v2/getPubKey").json()
         n, e = int(key["modulus"], 16), int(key["exponent"], 16)
         enc = format(pow(int.from_bytes(pwd.encode(), "big"), e, n), "x")
@@ -309,14 +321,14 @@ class Zju:
             "_eventId": "submit", "authcode": "",
         })
         if "统一身份认证平台" in r.text:
-            raise ZjuError("登入失敗：學號或密碼錯誤（或需要驗證碼，先在瀏覽器登入一次）")
-        # 讓各子系統吃到 SSO
+            raise ZjuError("登录失败：学号或密码错误（或需要验证码，先在浏览器登录一次）")
+        # 让各子系统吃到 SSO
         self.get("https://courses.zju.edu.cn/user/courses")
         try:
             self.get("https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc&tenant_code=112"
                      "&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F")
         except ZjuError as e:
-            log(f"警告：智雲 SSO 連不上（只影響 classroom/ppt/transcript）：{str(e).splitlines()[0]}")
+            log(f"警告：智云 SSO 连不上（只影响 classroom/ppt/transcript）：{str(e).splitlines()[0]}")
         self.logged_in = True
         self.save_cookies()
 
@@ -344,7 +356,7 @@ class Zju:
                 return m.group(1)
         if silent:
             return None
-        raise ZjuError("智雲課堂 token 解析失敗：classroom cookie 格式可能改了，檢查 _token 正則")
+        raise ZjuError("智云课堂 token 解析失败：classroom cookie 格式可能改了，检查 _token 正则")
 
     def bearer(self) -> dict:
         return {"Authorization": f"Bearer {self._token()}"}
@@ -353,9 +365,9 @@ class Zju:
         try:
             return r.json()
         except ValueError:
-            raise ZjuError(f"{what}：回應不是 JSON（HTTP {r.status_code}），session 可能失效，重跑即可")
+            raise ZjuError(f"{what}：回应不是 JSON（HTTP {r.status_code}），session 可能失效，重跑即可")
 
-    # ---- 學在浙大 ----
+    # ---- 学在浙大 ----
 
     def courses(self) -> list[dict]:
         self.ensure()
@@ -378,7 +390,7 @@ class Zju:
         return {x["id"]: x.get("name") or x.get("real_name") or str(x["id"]) for x in j.get("semesters", [])}
 
     def uploads(self, course_id: int) -> list[tuple[dict, dict]]:
-        """回傳 (活動, upload) — 含一般活動與作業附件。"""
+        """返回 (活动, upload) — 含一般活动与作业附件。"""
         res = []
         j = self.json(self.get(f"https://courses.zju.edu.cn/api/courses/{course_id}/activities"), "activities")
         for a in j.get("activities", []):
@@ -398,20 +410,20 @@ class Zju:
             page += 1
 
     def upload_response(self, uid: int, rid: int, activity: dict | None = None) -> tuple[requests.Response, str]:
-        """附件下載來源，依優先序嘗試、採用第一個能回檔的，回 (response, 來源)：
-        1. reference blob — 常規下載
-        2. upload blob — 原始檔
-        3. upload blob + reference 參數 — 參數與官方網頁前端相同，部分活動的附件由此提供
-        4. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}
-        全部來源都不可用時丟 DownloadError（codes 為各來源的 HTTP 碼）。"""
+        """附件下载来源，依优先序尝试、采用第一个能回档的，回 (response, 来源)：
+        1. reference blob — 常规下载
+        2. upload blob — 原始档
+        3. upload blob + reference 参数 — 参数与官方网页前端相同，部分活动的附件由此提供
+        4. 预览器的转档 PDF — document/{rid}/url?preview=true 回 {url}
+        全部来源都不可用时丢 DownloadError（codes 为各来源的 HTTP 码）。"""
         base = "https://courses.zju.edu.cn/api/uploads"
         sources = [
-            (f"{base}/reference/{rid}/blob", None, "下載"),
-            (f"{base}/{uid}/blob", None, "原檔"),
+            (f"{base}/reference/{rid}/blob", None, "下载"),
+            (f"{base}/{uid}/blob", None, "原档"),
         ]
         refer = refer_params(activity)
         if refer:
-            sources.append((f"{base}/{uid}/blob", refer, "排程原檔"))
+            sources.append((f"{base}/{uid}/blob", refer, "排程原档"))
         codes = []
         for url, params, src in sources:
             r = self.get(url, params=params, stream=True)
@@ -429,16 +441,16 @@ class Zju:
             if url:
                 r = self.get(secure_url(urljoin(base, url)), stream=True)
                 if r.ok:
-                    return r, "預覽PDF"
+                    return r, "预览PDF"
                 codes.append(r.status_code)
                 r.close()
-        raise DownloadError(f"下載失敗 HTTP {'/'.join(map(str, codes))}", codes)
+        raise DownloadError(f"下载失败 HTTP {'/'.join(map(str, codes))}", codes)
 
     def todos(self) -> list[dict]:
         self.ensure()
         return self.json(self.get("https://courses.zju.edu.cn/api/todos?no-intercept=true"), "todos").get("todo_list", [])
 
-    # ---- 活動 / 討論 / 作業提交（端點取自官方前端 JS）----
+    # ---- 活动 / 讨论 / 作业提交（端点取自官方前端 JS）----
 
     def user_id(self) -> int:
         if not hasattr(self, "_uid"):
@@ -450,7 +462,7 @@ class Zju:
         return self._uid
 
     def activities(self, course_id: int) -> list[dict]:
-        """課程所有活動（課件、影片、作業、討論、網頁、連結…）加上測驗。"""
+        """课程所有活动（课件、视频、作业、讨论、网页、连结…）加上测验。"""
         self.ensure()
         acts = self.json(self.get(f"{LMS}/api/courses/{course_id}/activities"), "activities").get("activities", [])
         r = self.get(f"{LMS}/api/courses/{course_id}/exams")
@@ -462,17 +474,17 @@ class Zju:
         self.ensure()
         r = self.get(f"{LMS}/api/activities/{aid}")
         if r.status_code == 404:
-            raise ZjuError(f"找不到活動 {aid}（測驗請用課程的 activities 看）")
+            raise ZjuError(f"找不到活动 {aid}（测验请用课程的 activities 看）")
         return self.json(r, "activity")
 
     def forum_category(self, aid: int) -> int:
-        """討論活動 id → 討論區分類 id（發帖、列帖都用分類 id）。"""
+        """讨论活动 id → 讨论区分类 id（发帖、列帖都用分类 id）。"""
         cid = self.activity(aid)["course_id"]
         j = self.json(self.get(f"{LMS}/api/courses/{cid}/topic-categories"), "topic-categories")
         for cat in j.get("topic_categories", []):
             if cat.get("activity_id") == aid:
                 return cat["id"]
-        raise ZjuError(f"活動 {aid} 不是討論（或沒有討論區分類）")
+        raise ZjuError(f"活动 {aid} 不是讨论（或没有讨论区分类）")
 
     def topics(self, category_id: int) -> list[dict]:
         out, page = [], 1
@@ -489,7 +501,7 @@ class Zju:
         return self.json(self.get(f"{LMS}/api/topics/{tid}"), "topic")
 
     def upload_file(self, path: Path) -> dict:
-        """兩段式：先登記取得 upload_url，再依 storage_type 送檔（學校目前是本地儲存 multipart PUT）。"""
+        """两段式：先登记取得 upload_url，再依 storage_type 送档（学校目前是本地储存 multipart PUT）。"""
         self.ensure()
         pre = self.json(self.post(f"{LMS}/api/uploads", json={
             "name": path.name, "size": path.stat().st_size, "parent_type": None, "parent_id": 0,
@@ -497,28 +509,28 @@ class Zju:
             "embed_material_type": "",
         }), "uploads")
         if "upload_url" not in pre:
-            raise ZjuError(f"上傳登記失敗：{pre}")
+            raise ZjuError(f"上传登记失败：{pre}")
         if pre.get("storage_type") in ("S3", "QINIU"):
-            raise ZjuError(f"儲存後端 {pre['storage_type']} 尚未支援（學校改了上傳方式）")
+            raise ZjuError(f"储存后端 {pre['storage_type']} 尚未支持（学校改了上传方式）")
         with path.open("rb") as f:
             r = self.req("PUT", pre["upload_url"], files={"file": (path.name, f)}, retry=False,
                          timeout=(6, 600))
         if not r.ok:
-            raise ZjuError(f"上傳 {path.name} 失敗 HTTP {r.status_code}：{r.text[:200]}")
+            raise ZjuError(f"上传 {path.name} 失败 HTTP {r.status_code}：{r.text[:200]}")
         return pre
 
     def create_topic(self, category_id: int, title: str, content: str, uploads: list[int]) -> dict:
         r = self.post(f"{LMS}/api/topics", json={"title": title, "content": content,
                                                   "category_id": category_id, "uploads": uploads})
         if not r.ok:
-            raise ZjuError(f"發帖失敗 HTTP {r.status_code}：{r.text[:200]}")
+            raise ZjuError(f"发帖失败 HTTP {r.status_code}：{r.text[:200]}")
         return self.json(r, "topic")
 
     def reply_topic(self, tid: int, content: str, uploads: list[int]) -> dict:
         self.ensure()
         r = self.post(f"{LMS}/api/topics/{tid}/replies", json={"content": content, "uploads": uploads})
         if not r.ok:
-            raise ZjuError(f"回帖失敗 HTTP {r.status_code}：{r.text[:200]}")
+            raise ZjuError(f"回帖失败 HTTP {r.status_code}：{r.text[:200]}")
         return self.json(r, "reply")
 
     def my_submission(self, aid: int) -> dict:
@@ -527,7 +539,7 @@ class Zju:
 
     def submit(self, aid: int, comment: str, uploads: list[int], draft: bool, mode: str,
                draft_id: int | None) -> dict:
-        """與網頁「提交」相同的 payload；已有草稿時用 PUT 蓋掉草稿。"""
+        """与网页「提交」相同的 payload；已有草稿时用 PUT 盖掉草稿。"""
         body = {"comment": comment, "uploads": uploads, "slides": [], "is_draft": draft, "mode": mode,
                 "other_resources": [], "uploads_in_rich_text": []}
         method = "POST"
@@ -535,10 +547,10 @@ class Zju:
             method, body["submission_id"] = "PUT", draft_id
         r = self.req(method, f"{LMS}/api/course/activities/{aid}/submissions", json=body)
         if not r.ok:
-            raise ZjuError(f"提交失敗 HTTP {r.status_code}：{r.text[:300]}")
+            raise ZjuError(f"提交失败 HTTP {r.status_code}：{r.text[:300]}")
         return self.json(r, "submission")
 
-    # ---- 智雲課堂 ----
+    # ---- 智云课堂 ----
 
     def infosimple(self) -> dict:
         self.ensure(need_classroom=True)
@@ -554,7 +566,7 @@ class Zju:
                 "per_page": 16, "title": title, "realname": teacher, "trans": "", "tenant_code": 112,
                 "randomKey": random.random()}), "searchlist")
             if j.get("code") != 0:
-                raise ZjuError(j.get("msg", "searchlist 失敗"))
+                raise ZjuError(j.get("msg", "searchlist 失败"))
             lst = j["total"]["list"]
             out += lst
             if not lst or len(out) >= int(j["total"]["total"]):
@@ -591,8 +603,8 @@ class Zju:
         return subs
 
     def ppt_urls(self, course_id: int, sub_id: int) -> list[str]:
-        """智雲 PPT 截圖。API 不守 per_page：常一頁就回全部、下一頁再重複一次
-        （ZLA 假設每頁 ≤100 會在 >100 張時卡死重試）→ 按序去重，湊滿 total 或遇到沒新東西就停。"""
+        """智云 PPT 截图。API 不守 per_page：常一页就回全部、下一页再重复一次
+        （ZLA 假设每页 ≤100 会在 >100 张时卡死重试）→ 按序去重，凑满 total 或遇到没新东西就停。"""
         self.ensure(need_classroom=True)
         urls: list[str] = []
         seen: set[str] = set()
@@ -611,7 +623,7 @@ class Zju:
                     added += 1
             if len(urls) >= total or added == 0 or page >= 50:
                 if len(urls) < total:
-                    log(f"[注意] PPT 只拿到 {len(urls)}/{total} 張 course={course_id} sub={sub_id}")
+                    log(f"[注意] PPT 只拿到 {len(urls)}/{total} 张 course={course_id} sub={sub_id}")
                 return urls
             page += 1
 
@@ -619,10 +631,10 @@ class Zju:
         self.ensure(need_classroom=True)
         j = self.json(self.get("https://yjapi.cmc.zju.edu.cn/courseapi/v3/web-socket/search-trans-result",
                                params={"sub_id": sub_id, "format": "json"}), "trans-result")
-        if j.get("code") == 10002:  # 未查询到语音数据：當天課程通常還沒轉完
+        if j.get("code") == 10002:  # 未查询到语音数据：当天课程通常还没转完
             return []
         if j.get("code") != 0:
-            raise ZjuError(f"取轉錄失敗 code={j.get('code')} {j.get('msg', '')}")
+            raise ZjuError(f"取转录失败 code={j.get('code')} {j.get('msg', '')}")
         lst = j.get("list") or []
         return lst[0].get("all_content", []) if lst else []
 
@@ -632,17 +644,17 @@ class Zju:
                      params={"course_id": course_id}, headers=self.bearer())
         j = self.json(r, "catalogue")
         if not r.ok or not j.get("success"):
-            raise ZjuError(f"錄播目錄讀取失敗 HTTP {r.status_code}")
+            raise ZjuError(f"录播目录读取失败 HTTP {r.status_code}")
         items = (j.get("result") or {}).get("data")
         if not isinstance(items, list):
-            raise ZjuError("錄播目錄格式錯誤：缺少 result.data 列表")
+            raise ZjuError("录播目录格式错误：缺少 result.data 列表")
         return parse_video_catalogue(items)
 
 
 # ---------------- helpers ----------------
 
 class Manifest:
-    """out/.zju_manifest.json：記錄 upload id → 本地路徑，換版（新 id）就重抓。"""
+    """out/.zju_manifest.json：记录 upload id → 本地路径，换版（新 id）就重新下载。"""
 
     def __init__(self, root: Path):
         self.path = root / ".zju_manifest.json"
@@ -659,7 +671,7 @@ class Manifest:
 
 
 def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4: bool = False) -> Path:
-    """寫暫存檔再 rename；驗證長度、拒收空檔和錯誤頁，免得壞檔被記進 manifest 後永遠不再重抓。"""
+    """写暂存档再 rename；验证长度、拒收空档和错误页，免得坏档被记进 manifest 后永远不再重新下载。"""
     expected = r.headers.get("Content-Length")
     expected = int(expected) if expected and expected.isdigit() and not r.headers.get("Content-Encoding") else None
     if limit and expected and expected > limit:
@@ -667,7 +679,7 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
         raise TooBig(f"{expected / 2**20:.0f}MB")
     if "text/html" in r.headers.get("Content-Type", "") and dest.suffix.lower() not in (".html", ".htm"):
         r.close()
-        raise ZjuError("伺服器回傳 HTML（錯誤頁或登入頁），不存檔")
+        raise ZjuError("服务器返回 HTML（错误页或登录页），不存档")
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
     try:
@@ -679,14 +691,14 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
                 if limit and written > limit:
                     raise TooBig(f">{limit / 2**20:.0f}MB")
         if written == 0:
-            raise ZjuError("伺服器回傳空檔")
+            raise ZjuError("服务器返回空档")
         if expected is not None and written != expected:
-            raise ZjuError(f"下載不完整：{written}/{expected} bytes")
+            raise ZjuError(f"下载不完整：{written}/{expected} bytes")
         with open(tmp, "rb") as f:
             head = f.read(12)
         if mp4 and head[4:8] != b"ftyp":
-            raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
-        # preview 版常是 PDF，但檔名還是 .pptx/.docx — 補副檔名免得打不開
+            raise ZjuError("回应不是 MP4（可能是错误页或 HLS 播放列表），不存档")
+        # preview 版常是 PDF，但档名还是 .pptx/.docx — 补副档名免得打不开
         if head[:5] == b"%PDF-" and dest.suffix.lower() != ".pdf":
             dest = dest.with_name(dest.name + ".pdf")
         os.replace(tmp, dest)
@@ -700,9 +712,9 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
 
 def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                    *, chunk_size: int = 32 * 2**20, restart: bool = False) -> Path:
-    """保留已校驗分片及 checkpoint，跨次執行只補缺片。"""
+    """保留已校验分片及 checkpoint，跨次执行只补缺片。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # 鎖檔保留以避免刪除後新舊 inode 被不同程序同時鎖定。
+    # 锁档保留以避免删除后新旧 inode 被不同程序同时锁定。
     lock_path = dest.with_name(f".{dest.name}.download.lock")
     with lock_path.open("a+b") as lock_file:
         try:
@@ -718,7 +730,7 @@ def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                 import fcntl
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            raise ZjuError("另一個程序正在下載此影片") from e
+            raise ZjuError("另一个程序正在下载此视频") from e
         return _download_video(z, url, dest, limit, jobs, chunk_size, restart)
 
 
@@ -735,29 +747,29 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
     headers = {"Range": "bytes=0-0", "Accept-Encoding": "identity"}
     probe = z.get(url, headers=headers, stream=True)
     if probe.status_code == 200:
-        log("[單連線] 伺服器不支援 Range，這次從頭下載")
+        log("[单连接] 服务器不支持 Range，这次从头下载")
         result = stream_to(probe, dest, limit, mp4=True)
         clear_partial()
         return result
     try:
         match = re.fullmatch(r"bytes 0-0/(\d+)", probe.headers.get("Content-Range", ""))
         if probe.status_code != 206 or not match:
-            raise ZjuError(f"錄播 Range 探測失敗 HTTP {probe.status_code}")
+            raise ZjuError(f"录播 Range 探测失败 HTTP {probe.status_code}")
         total = int(match[1])
         if total < 12:
-            raise ZjuError("錄播檔案過小")
+            raise ZjuError("录播文件过小")
         if limit and total > limit:
             raise TooBig(f"{total / 2**20:.1f}MB")
         if probe.headers.get("Content-Encoding", "identity") != "identity":
-            raise ZjuError("Range 回應不應使用壓縮編碼")
+            raise ZjuError("Range 回应不应使用压缩编码")
         if len(probe.content) != 1:
-            raise ZjuError("Range 探測長度錯誤")
+            raise ZjuError("Range 探测长度错误")
         etag = probe.headers.get("ETag", "")
         validator_type = "etag" if etag and not etag.startswith("W/") else "last_modified"
         validator = etag if validator_type == "etag" else probe.headers.get("Last-Modified")
     finally:
         probe.close()
-    # 去掉可能刷新的簽名參數；遠端版本仍須由 validator 及長度確認。
+    # 去掉可能刷新的签名参数；远端版本仍须由 validator 及长度确认。
     source = urlparse(url)._replace(query="", fragment="").geturl()
     metadata = {"version": 1, "source": hashlib.sha256(source.encode()).hexdigest(),
                 "total": total, "chunk_size": chunk_size,
@@ -790,11 +802,11 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                     done[str(start)] = digest
     else:
         if tmp.exists():
-            log("[重新下載] 本地狀態或遠端版本變更，無法沿用分片")
+            log("[重新下载] 本地状态或远端版本变更，无法沿用分片")
         with tmp.open("wb") as f:
             f.truncate(total)
     if not validator:
-        log("[提示] 伺服器未提供版本標記，跨次執行需重新下載")
+        log("[提示] 服务器未提供版本标记，跨次执行需重新下载")
     state = dict(metadata, done=done)
     state_lock = threading.Lock()
     stopped = threading.Event()
@@ -810,7 +822,7 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
     save_state()
     resumed = sum(min(chunk_size, total - int(start)) for start in done)
     if resumed:
-        log(f"[續傳] 已有 {resumed / 2**20:.1f}/{total / 2**20:.1f}MB，補下載缺少分片")
+        log(f"[续传] 已有 {resumed / 2**20:.1f}/{total / 2**20:.1f}MB，补下载缺少分片")
 
     def grab(start):
         end = min(start + chunk_size, total) - 1
@@ -819,29 +831,29 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
             h["If-Range"] = validator
         for attempt in range(3):
             if stopped.is_set():
-                raise ZjuError("下載已中止")
+                raise ZjuError("下载已中止")
             try:
                 r = z.get(url, headers=h, stream=True)
                 try:
                     expected_range = f"bytes {start}-{end}/{total}"
                     if r.status_code != 206 or r.headers.get("Content-Range") != expected_range:
-                        raise ZjuError(f"分片 {start}-{end} 範圍不符 HTTP {r.status_code}")
+                        raise ZjuError(f"分片 {start}-{end} 范围不符 HTTP {r.status_code}")
                     if r.headers.get("Content-Encoding", "identity") != "identity":
-                        raise ZjuError("分片回應使用壓縮編碼")
+                        raise ZjuError("分片回应使用压缩编码")
                     written = 0
                     digest = hashlib.sha256()
                     with tmp.open("r+b") as f:
                         f.seek(start)
                         for block in r.iter_content(1 << 20):
                             if stopped.is_set():
-                                raise ZjuError("下載已中止")
+                                raise ZjuError("下载已中止")
                             if written + len(block) > end - start + 1:
-                                raise ZjuError("分片長度超出範圍")
+                                raise ZjuError("分片长度超出范围")
                             f.write(block)
                             digest.update(block)
                             written += len(block)
                         if written != end - start + 1:
-                            raise ZjuError(f"分片下載不完整：{written}/{end - start + 1}")
+                            raise ZjuError(f"分片下载不完整：{written}/{end - start + 1}")
                         f.flush()
                         os.fsync(f.fileno())
                     with state_lock:
@@ -868,7 +880,7 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                     percent = completed * 100 // total
                     if percent >= next_report or completed == total:
                         speed = (completed - resumed) / 2**20 / max(time.monotonic() - started, 0.001)
-                        log(f"[進度] {percent}%  {completed / 2**20:.1f}/{total / 2**20:.1f}MB  {speed:.1f}MB/s")
+                        log(f"[进度] {percent}%  {completed / 2**20:.1f}/{total / 2**20:.1f}MB  {speed:.1f}MB/s")
                         next_report = percent + 10
             except BaseException:
                 stopped.set()
@@ -876,27 +888,27 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                     future.cancel()
                 raise
     except BaseException:
-        log("[保留分片] 下次執行相同下載指令即可續傳")
+        log("[保留分片] 下次执行相同下载指令即可续传")
         raise
     with tmp.open("rb") as f:
         valid_mp4 = f.read(12)[4:8] == b"ftyp"
     if not valid_mp4:
         clear_partial()
-        raise ZjuError("回應不是 MP4（可能是錯誤頁或 HLS 播放列表），不存檔")
+        raise ZjuError("回应不是 MP4（可能是错误页或 HLS 播放列表），不存档")
     os.replace(tmp, dest)
     clear_partial()
     return dest
 
 
 def current_year(courses: list[dict]) -> list[dict]:
-    """is_closed 學校常不關，靠 academic_year_id 取最新學年。"""
+    """is_closed 学校常不关，靠 academic_year_id 取最新学年。"""
     latest = max((c.get("academic_year_id") or 0 for c in courses), default=0)
     return [c for c in courses if (c.get("academic_year_id") or 0) == latest and not c.get("is_closed")]
 
 
 def local_time(iso: str | None, fmt: str = "%m-%d %H:%M") -> str:
     if not iso:
-        return "時間未定"
+        return "时间未定"
     try:
         d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except ValueError:
@@ -919,9 +931,9 @@ def match_courses(courses: list[dict], keys: list[str], include_all: bool) -> li
 
 
 ACT_TYPES = {
-    "material": "課件", "online_video": "影片", "homework": "作業", "forum": "討論", "exam": "測驗",
-    "page": "網頁", "web_link": "連結", "questionnaire": "問卷", "classroom": "課堂互動",
-    "lesson": "直播", "vocabulary": "單字", "survey": "調查", "chatroom": "聊天室",
+    "material": "课件", "online_video": "视频", "homework": "作业", "forum": "讨论", "exam": "测验",
+    "page": "网页", "web_link": "连结", "questionnaire": "问卷", "classroom": "课堂互动",
+    "lesson": "直播", "vocabulary": "单字", "survey": "调查", "chatroom": "聊天室",
 }
 
 
@@ -932,24 +944,24 @@ def html_to_text(s: str | None) -> str:
 
 
 def text_to_html(s: str) -> str:
-    """純文字 → 段落 HTML（空行分段、單換行 <br>），網頁編輯器存的也是這種格式。"""
+    """纯文字 → 段落 HTML（空行分段、单换行 <br>），网页编辑器存的也是这种格式。"""
     paras = [p for p in re.split(r"\n\s*\n", s.strip()) if p.strip()]
     return "".join("<p>" + html.escape(p.strip()).replace("\n", "<br>") + "</p>" for p in paras)
 
 
 def act_status(a: dict) -> str:
     if a.get("is_closed"):
-        return "已關閉"
+        return "已关闭"
     if a.get("is_started") is False:
-        return "未開始"
+        return "未开始"
     end = a.get("end_time")
     if end and dt.datetime.fromisoformat(end.replace("Z", "+00:00")) < dt.datetime.now(dt.timezone.utc):
         return "已截止"
-    return "進行中"
+    return "进行中"
 
 
 def read_body(a) -> str:
-    """--body 文字或 --body-file 檔案（- = stdin）。"""
+    """--body 文字或 --body-file 文件（- = stdin）。"""
     if a.body_file:
         return sys.stdin.read() if a.body_file == "-" else Path(a.body_file).read_text(encoding="utf-8")
     return a.body or ""
@@ -960,9 +972,9 @@ def upload_all(z: "Zju", files: list[str] | None) -> list[int]:
     for f in files or []:
         p = Path(f).expanduser()
         if not p.is_file():
-            raise ZjuError(f"找不到檔案：{p}")
+            raise ZjuError(f"找不到文件：{p}")
         u = z.upload_file(p)
-        log(f"[上傳] {p.name} → upload {u['id']}")
+        log(f"[上传] {p.name} → upload {u['id']}")
         ids.append(u["id"])
     return ids
 
@@ -991,11 +1003,11 @@ def render_transcript(items: list[dict], fmt: str, title: str) -> str:
 
 
 def parse_video_catalogue(items: list[dict]) -> dict[int, list[str]]:
-    """依 sub_id 取回放網址；url 可能是字串或多段錄影的列表。"""
+    """依 sub_id 取回放网址；url 可能是字串或多段录影的列表。"""
     result: dict[int, list[str]] = {}
     for item in items:
         if not isinstance(item, dict):
-            raise ZjuError("錄播目錄項目不是物件")
+            raise ZjuError("录播目录项目不是物件")
         try:
             sid = int(item["sub_id"])
             content = item.get("content") or {}
@@ -1014,13 +1026,13 @@ def parse_video_catalogue(items: list[dict]) -> dict[int, list[str]]:
                     continue
                 u = secure_url(u.strip())
                 if urlparse(u).scheme not in ("http", "https") or not urlparse(u).hostname:
-                    raise ValueError("url 不是 HTTP(S) 網址")
+                    raise ValueError("url 不是 HTTP(S) 网址")
                 if u not in valid:
                     valid.append(u)
             existing = result.setdefault(sid, [])
             existing.extend(u for u in valid if u not in existing)
         except (KeyError, TypeError, ValueError) as e:
-            raise ZjuError(f"錄播目錄項目解析失敗 sub_id={item.get('sub_id', '?')}：{e}") from e
+            raise ZjuError(f"录播目录项目解析失败 sub_id={item.get('sub_id', '?')}：{e}") from e
     return result
 
 
@@ -1031,14 +1043,14 @@ def images_to_pdf(paths: list[Path], pdf: Path):
     tmp = pdf.with_name(".part-" + pdf.name)
 
     def write(srcs):
-        with open(tmp, "wb") as f:  # 直接串流進檔案，不在記憶體組整份 PDF
+        with open(tmp, "wb") as f:  # 直接串流进文件，不在记忆体组整份 PDF
             img2pdf.convert([str(x) for x in srcs], outputstream=f)
 
     try:
         try:
-            write(paths)  # 智雲截圖幾乎都是 JPEG：直接嵌入，不重新編碼
+            write(paths)  # 智云截图几乎都是 JPEG：直接嵌入，不重新编码
         except Exception:
-            fixed = []  # 有 alpha / 特殊格式的才轉 JPEG
+            fixed = []  # 有 alpha / 特殊格式的才转 JPEG
             for p in paths:
                 with Image.open(p) as im:
                     if im.format == "JPEG" and im.mode in ("RGB", "L", "CMYK"):
@@ -1054,20 +1066,20 @@ def images_to_pdf(paths: list[Path], pdf: Path):
 
 
 def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
-    """智雲截圖去重。智雲是對投影畫面定時截圖，同一頁會因動畫逐步出現、老師邊講邊寫、
-    翻回前面而被截很多次。規則只有一條：一頁的筆畫若全都還在後面那頁（或之前留下的某頁）裡，
-    它就是多餘的——所以連續的一串只留最後、最完整的一張，註記不會丟。
+    """智云截图去重。智云是对投影画面定时截图，同一页会因动画逐步出现、老师边讲边写、
+    翻回前面而被截很多次。规则只有一条：一页的笔画若全都还在后面那页（或之前留下的某页）里，
+    它就是多余的——所以连续的一串只留最后、最完整的一张，注记不会丢。
 
-    「筆畫」= 跟 15×15 鄰域中位數差很多的像素，大片純色（白底、黑底、影片畫面）不算；
-    八成以上的頁都有的（底圖紋理、黑邊、頁腳）也不算。「全都還在」= 消失的筆畫沒有聚成塊：
-    有 4 個以上筆畫像素消失的 8×8 格不超過 max_lost_cells 個（JPEG 雜訊零星，真的少了東西會成塊；
-    再高就抓不到影片裡又細又淡的線）。
-    在三堂課（白底英文、底圖＋手寫、黑底教學影片混檔案總管）逐頁核對過，沒有誤刪。
+    「笔画」= 跟 15×15 邻域中位数差很多的像素，大片纯色（白底、黑底、视频画面）不算；
+    八成以上的页都有的（底图纹理、黑边、页脚）也不算。「全都还在」= 消失的笔画没有聚成块：
+    有 4 个以上笔画像素消失的 8×8 格不超过 max_lost_cells 个（JPEG 杂讯零星，真的少了东西会成块；
+    再高就抓不到视频里又细又淡的线）。
+    在三堂课（白底英文、底图＋手写、黑底教学视频混文件总管）逐页核对过，没有误删。
     """
     import numpy as np
     from PIL import Image, ImageFilter
 
-    T, W, H = 40, 512, 288  # 灰階門檻；解析度再低，細的手寫筆跡就糊掉看不見了
+    T, W, H = 40, 512, 288  # 灰阶门槛；解析度再低，细的手写笔迹就糊掉看不见了
     if len(paths) < 2:
         return list(paths)
 
@@ -1084,22 +1096,22 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
     frames, raw = zip(*map(prep, paths))
     frames = np.stack(frames)
     med = np.median(frames, axis=0).astype(np.int16)
-    # 版面 = 八成以上的頁在那裡都一樣的筆畫；只看中位數的話，一張講了半堂課的投影片會被當成版面
+    # 版面 = 八成以上的页在那里都一样的笔画；只看中位数的话，一张讲了半堂课的投视频会被当成版面
     layout = strokes(med) & ((np.abs(frames - med) <= T).sum(axis=0) >= 0.8 * len(frames))
     masks = [m & ~(layout & (np.abs(f - med) <= T)) for f, m in zip(frames, raw)]
 
-    def lost(i, js):  # i 的筆畫在 js 各頁消失成塊的格數
+    def lost(i, js):  # i 的笔画在 js 各页消失成块的格数
         gone = masks[i] & (np.abs(frames[i] - frames[js]) > T)
         return (gone.reshape(len(js), H // 8, 8, W // 8, 8).sum(axis=(2, 4)) >= 4).sum(axis=(1, 2))
 
     keep: list[int] = []
     for j in range(len(frames)):
-        if frames[j].std() < 3:  # 全黑 / 全白過場
+        if frames[j].std() < 3:  # 全黑 / 全白过场
             continue
         if keep and lost(keep[-1], [j])[0] <= max_lost_cells:
-            keep[-1] = j  # 前一張是這張的子集（動畫沒跑完、還沒寫完）→ 換成較完整的這張
+            keep[-1] = j  # 前一张是这张的子集（动画没跑完、还没写完）→ 换成较完整的这张
             continue
-        # 翻回講過的頁、擦掉註記的乾淨版；近乎空白的頁什麼都「包含得住」，不拿來比
+        # 翻回讲过的页、擦掉注记的干净版；近乎空白的页什么都「包含得住」，不拿来比
         if keep and masks[j].sum() >= 400 and (lost(j, keep) <= max_lost_cells).any():
             continue
         keep.append(j)
@@ -1124,18 +1136,18 @@ def resolve_subs(z: Zju, a) -> list[dict]:
 
 def cmd_login(a):
     cfg = load_config()
-    user = a.username or input(f"學號 [{cfg.get('username', '')}]: ").strip() or cfg.get("username")
+    user = a.username or input(f"学号 [{cfg.get('username', '')}]: ").strip() or cfg.get("username")
     if not user:
-        raise ZjuError("沒有學號")
+        raise ZjuError("没有学号")
     if not keychain_get(user) or a.reset:
-        print("輸入統一身份認證密碼（存進系統憑證庫）：")
+        print("输入统一身份认证密码（存进系统凭据库）：")
         keychain_set_interactive(user)
     cfg["username"] = user
     save_config(cfg)
     z = Zju()
     z.login(*get_credentials())
     ok = z._token(silent=True) is not None
-    print(f"登入成功：{user}；智雲課堂 token {'OK' if ok else '缺（classroom 指令可能失敗）'}")
+    print(f"登录成功：{user}；智云课堂 token {'OK' if ok else '缺（classroom 指令可能失败）'}")
 
 
 def cmd_courses(a):
@@ -1154,7 +1166,7 @@ def cmd_sync(a):
     z = Zju()
     courses = match_courses(z.courses(), a.course, a.all)
     if not courses:
-        raise ZjuError("沒有符合的課程（用 courses --all 看 id）")
+        raise ZjuError("没有符合的课程（用 courses --all 看 id）")
     root = Path(a.out).expanduser()
     root.mkdir(parents=True, exist_ok=True)
     man = Manifest(root)
@@ -1164,11 +1176,11 @@ def cmd_sync(a):
     pending: list[str] = []
     dup = {n for n in (c["name"] for c in courses) if [x["name"] for x in courses].count(n) > 1}
     for c in courses:
-        # 同名課程（不同班）分開放，免得同名檔互蓋
+        # 同名课程（不同班）分开放，免得同名档互盖
         cdir = root / safe_name(f"{c['name']} ({c['id']})" if c["name"] in dup else c["name"])
         items = z.uploads(c["id"])
-        log(f"== {c['name']}（{len(items)} 個檔）")
-        # 同名不同檔：全部加 id，命名不依 API 回傳順序（順序變了也不會重抓、不會互換）
+        log(f"== {c['name']}（{len(items)} 个档）")
+        # 同名不同档：全部加 id，命名不依 API 返回顺序（顺序变了也不会重新下载、不会互换）
         uids_by_name: dict[str, set] = {}
         for _, u in items:
             uids_by_name.setdefault(safe_name(u.get("name") or str(u["id"])), set()).add(u["id"])
@@ -1177,7 +1189,7 @@ def cmd_sync(a):
             act = a_.get("title", "")
             uid, rid = u["id"], u.get("reference_id") or u["id"]
             key = f"{c['id']}:{uid}"
-            if key in seen_keys:  # 同一檔同時掛在活動和作業
+            if key in seen_keys:  # 同一档同时挂在活动和作业
                 continue
             seen_keys.add(key)
             name = safe_name(u.get("name") or str(uid))
@@ -1196,7 +1208,7 @@ def cmd_sync(a):
                 big.append(f"{c['name']}/{name}  {size / 2**20:.0f}MB")
                 continue
             if a.dry_run:
-                print(f"[會下載] {c['name']}/{name}  {size / 2**20:.1f}MB  ({act})")
+                print(f"[会下载] {c['name']}/{name}  {size / 2**20:.1f}MB  ({act})")
                 new += 1
                 total += size
                 continue
@@ -1207,9 +1219,9 @@ def cmd_sync(a):
     def fetch(job):
         key, uid, rid, dest, a_ = job
         r, src = z.upload_response(uid, rid, a_)
-        return stream_to(r, dest, limit), src  # API 沒給 size 的檔，靠 Content-Length 把關
+        return stream_to(r, dest, limit), src  # API 没给 size 的档，靠 Content-Length 把关
 
-    # 多檔並行：單條連線常被伺服器限速，並行吃滿頻寬；manifest 只在主執行緒寫
+    # 多档并行：单条连接常被服务器限速，并行吃满频宽；manifest 只在主执行绪写
     with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
         futs = {pool.submit(fetch, j): j for j in jobs}
         for f in as_completed(futs):
@@ -1225,21 +1237,21 @@ def cmd_sync(a):
                 big.append(f"{dest0.parent.name}/{dest0.name}  {e}")
             except Exception as e:
                 if a_.get("is_started") is False and 403 in getattr(e, "codes", ()):
-                    # 排程未開放且所有來源皆回 403：開放後下次 sync 自動抓
-                    pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 開放）")
+                    # 排程未开放且所有来源皆回 403：开放后下次 sync 自动抓
+                    pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 开放）")
                     continue
                 failed += 1
-                log(f"[失敗] {dest0.name}: {e}")
+                log(f"[失败] {dest0.name}: {e}")
     for p_ in pending:
-        log(f"[未開放] {p_}")
+        log(f"[未开放] {p_}")
     for b in big:
-        log(f"[太大跳過] {b}")
+        log(f"[太大跳过] {b}")
     if big:
-        log(f"  → {len(big)} 個檔超過 {a.max_size}MB，要抓就指定課程加 --max-size 0")
-    extra = f"、未開放 {len(pending)}" if pending else ""
-    extra += f"、影音跳過 {media}（加 --videos 才抓）" if media else ""
-    size_s = f"（約 {total / 2**20:.0f}MB）" if a.dry_run else ""
-    log(f"{'預覽' if a.dry_run else '完成'}：{'待下載' if a.dry_run else '新增'} {new}{size_s}、已有 {skipped}、失敗 {failed}{extra} → {root}")
+        log(f"  → {len(big)} 个档超过 {a.max_size}MB，要抓就指定课程加 --max-size 0")
+    extra = f"、未开放 {len(pending)}" if pending else ""
+    extra += f"、影音跳过 {media}（加 --videos 才抓）" if media else ""
+    size_s = f"（约 {total / 2**20:.0f}MB）" if a.dry_run else ""
+    log(f"{'预览' if a.dry_run else '完成'}：{'待下载' if a.dry_run else '新增'} {new}{size_s}、已有 {skipped}、失败 {failed}{extra} → {root}")
     if failed:
         sys.exit(2)
 
@@ -1251,7 +1263,7 @@ def cmd_todo(a):
         print(json.dumps(ts, ensure_ascii=False, indent=1))
         return
     for t in sorted(ts, key=lambda t: t.get("end_time") or ""):
-        end = local_time(t.get("end_time"), "%Y-%m-%d %H:%M")  # API 給 UTC
+        end = local_time(t.get("end_time"), "%Y-%m-%d %H:%M")  # API 给 UTC
         print(f"{end}\t{t.get('course_name', '')}\t{t.get('title', '')}\t{t.get('type', '')}")
 
 
@@ -1259,7 +1271,7 @@ def cmd_activities(a):
     z = Zju()
     courses = match_courses(z.courses(), a.course, a.all)
     if not courses:
-        raise ZjuError("沒有符合的課程（用 courses --all 看 id）")
+        raise ZjuError("没有符合的课程（用 courses --all 看 id）")
     rows = []
     for c in courses:
         for x in z.activities(c["id"]):
@@ -1280,24 +1292,24 @@ def cmd_show(a):
     x = z.activity(a.activity)
     t = x.get("type", "")
     d = x.get("data") or {}
-    print(f"[{ACT_TYPES.get(t, t)}] {x.get('title')}  (id {x['id']}, 課程 {x.get('course_id')})")
-    print(f"狀態：{act_status(x)}　開始 {local_time(x.get('start_time'), '%Y-%m-%d %H:%M')}"
-          f"　截止 {local_time(x.get('end_time'), '%Y-%m-%d %H:%M') if x.get('end_time') else '無'}")
+    print(f"[{ACT_TYPES.get(t, t)}] {x.get('title')}  (id {x['id']}, 课程 {x.get('course_id')})")
+    print(f"状态：{act_status(x)}　开始 {local_time(x.get('start_time'), '%Y-%m-%d %H:%M')}"
+          f"　截止 {local_time(x.get('end_time'), '%Y-%m-%d %H:%M') if x.get('end_time') else '无'}")
     if x.get("completion_criterion"):
-        print(f"完成條件：{x['completion_criterion']}")
+        print(f"完成条件：{x['completion_criterion']}")
     desc = html_to_text(d.get("description") or x.get("description"))
     if desc:
         print(f"\n{desc}\n")
     for u in x.get("uploads") or []:
         print(f"附件：{u.get('name')}  (upload {u.get('id')})")
     if t == "web_link" and d.get("link"):
-        print(f"連結：{d['link']}")
+        print(f"连结：{d['link']}")
     if t == "homework":
         s = z.my_submission(x["id"])
         if s.get("created_at"):
             kind = "草稿" if s.get("is_draft") else "已提交"
             print(f"我的提交：{kind} {local_time(s.get('created_at'), '%Y-%m-%d %H:%M')}"
-                  f"　分數 {s.get('score') if s.get('score') is not None else '未評'}")
+                  f"　分数 {s.get('score') if s.get('score') is not None else '未评'}")
             for u in s.get("uploads") or []:
                 print(f"  - {u.get('name')}")
             if s.get("comment"):
@@ -1306,7 +1318,7 @@ def cmd_show(a):
             print("我的提交：尚未提交")
     elif t == "forum":
         ts = z.topics(z.forum_category(x["id"]))
-        print(f"討論帖 {len(ts)} 則（forum list {x['id']} 看全部）")
+        print(f"讨论帖 {len(ts)} 则（forum list {x['id']} 看全部）")
 
 
 def cmd_forum(a):
@@ -1318,7 +1330,7 @@ def cmd_forum(a):
             if uid and by.get("id") != uid:
                 continue
             print(f"{t['id']}\t{local_time(t.get('created_at'))}\t{by.get('name', '')}\t"
-                  f"回覆 {t.get('reply_count', 0)}\t{t.get('title', '')}")
+                  f"回复 {t.get('reply_count', 0)}\t{t.get('title', '')}")
             if a.full:
                 print("  " + html_to_text(t.get("content")).replace("\n", "\n  "))
     elif a.action == "read":
@@ -1340,15 +1352,15 @@ def cmd_forum(a):
     else:
         body = read_body(a)
         if not body.strip():
-            raise ZjuError("內容是空的：用 --body 或 --body-file")
+            raise ZjuError("内容是空的：用 --body 或 --body-file")
         content = body if a.html else text_to_html(body)
         if a.action == "post":
             if not a.title:
-                raise ZjuError("發帖要 --title")
+                raise ZjuError("发帖要 --title")
             cat = z.forum_category(a.id)
             ids = upload_all(z, a.attach)
             t = z.create_topic(cat, a.title, content, ids)
-            print(f"[已發帖] topic {t['id']}：{t.get('title')}")
+            print(f"[已发帖] topic {t['id']}：{t.get('title')}")
         else:
             ids = upload_all(z, a.attach)
             r = z.reply_topic(a.id, content, ids)
@@ -1360,7 +1372,7 @@ def cmd_upload(a):
     for f in a.files:
         p = Path(f).expanduser()
         if not p.is_file():
-            raise ZjuError(f"找不到檔案：{p}")
+            raise ZjuError(f"找不到文件：{p}")
         u = z.upload_file(p)
         print(f"{u['id']}\t{p.name}")
 
@@ -1369,32 +1381,32 @@ def cmd_submit(a):
     z = Zju()
     x = z.activity(a.activity)
     if x.get("type") != "homework":
-        raise ZjuError(f"活動 {a.activity} 是 {x.get('type')}，不是作業")
+        raise ZjuError(f"活动 {a.activity} 是 {x.get('type')}，不是作业")
     status = act_status(x)
-    if status != "進行中" and not x.get("is_resubmit_open"):
-        raise ZjuError(f"作業「{x.get('title')}」{status}，網頁上也交不了")
+    if status != "进行中" and not x.get("is_resubmit_open"):
+        raise ZjuError(f"作业「{x.get('title')}」{status}，网页上也交不了")
     comment = read_body(a)
     if not comment.strip() and not a.file and not a.upload_id:
-        raise ZjuError("沒有東西可交：給 --file、--upload-id 或 --body")
+        raise ZjuError("没有东西可交：给 --file、--upload-id 或 --body")
     prev = z.my_submission(x["id"])
     draft_id = prev.get("id") if prev.get("is_draft") else None
     kind = "存草稿" if a.draft else "正式提交"
     print(f"{kind}「{x.get('title')}」（截止 {local_time(x.get('end_time'), '%Y-%m-%d %H:%M')}）")
     for f in a.file or []:
-        print(f"  檔案：{f}")
+        print(f"  文件：{f}")
     if comment.strip():
         print(f"  文字：{comment.strip()[:80]}{'…' if len(comment.strip()) > 80 else ''}")
     if prev.get("created_at") and not prev.get("is_draft"):
-        print("  注意：已經交過一次，這次會新增一份提交")
+        print("  注意：已经交过一次，这次会新增一份提交")
     if not a.yes:
         if not sys.stdin.isatty():
-            raise ZjuError("非互動環境要加 --yes 才會真的送出")
+            raise ZjuError("非互动环境要加 --yes 才会真的送出")
         try:
-            ok = input("確定送出？[y/N] ").strip().lower() == "y"
-        except EOFError:  # Windows 的 NUL 也算 tty，讀不到就當取消
+            ok = input("确定送出？[y/N] ").strip().lower() == "y"
+        except EOFError:  # Windows 的 NUL 也算 tty，读不到就当取消
             ok = False
         if not ok:
-            log("已取消（非互動環境加 --yes）")
+            log("已取消（非互动环境加 --yes）")
             return
     ids = upload_all(z, a.file) + (a.upload_id or [])
     content = comment if a.html else text_to_html(comment) if comment.strip() else ""
@@ -1425,28 +1437,28 @@ def cmd_ppt(a):
     root = Path(a.out).expanduser()
     subs = resolve_subs(z, a)
     if not subs:
-        log("沒有課堂")
+        log("没有课堂")
         return
     failed = 0
     for s in subs:
         try:
             ppt_one(z, a, root, s)
-        except Exception as e:  # 一堂壞掉不拖垮其他堂
+        except Exception as e:  # 一堂坏掉不拖垮其他堂
             failed += 1
-            log(f"[失敗] {s['course_name']} {s['sub_name']}: {e}")
+            log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
     if failed:
         sys.exit(2)
 
 
 def ppt_one(z: Zju, a, root: Path, s: dict):
-    cdir = root / safe_name(s["course_name"]) / "智雲PPT"
-    pdf = cdir / f"{safe_name(s['sub_name'])}.pdf"
+    pdf = material_path(root / safe_name(s["course_name"]), "智云PPT", f"{safe_name(s['sub_name'])}.pdf")
+    cdir = pdf.parent
     if pdf.exists() and not a.force:
-        log(f"[略過] {pdf.relative_to(root)}")
+        log(f"[跳过] {pdf.relative_to(root)}")
         return
     urls = z.ppt_urls(s["course_id"], s["sub_id"])
     if not urls:
-        log(f"[無PPT] {s['course_name']} {s['sub_name']}")
+        log(f"[无PPT] {s['course_name']} {s['sub_name']}")
         return
     tmpdir = Path(tempfile.mkdtemp(prefix="zju-ppt-"))
     try:
@@ -1459,17 +1471,17 @@ def ppt_one(z: Zju, a, root: Path, s: dict):
                     p.write_bytes(r.content)
                     return p
                 time.sleep(0.2 * 2 ** attempt)
-            raise ZjuError(f"PPT 圖下載失敗：{u}")
+            raise ZjuError(f"PPT 图下载失败：{u}")
 
         with ThreadPoolExecutor(max_workers=8) as pool:
-            paths = list(pool.map(grab, enumerate(urls)))  # map 保序 = 頁序
+            paths = list(pool.map(grab, enumerate(urls)))  # map 保序 = 页序
         pages = dedup_slides(paths) if a.dedup else paths
         cdir.mkdir(parents=True, exist_ok=True)
         images_to_pdf(pages, pdf)
-        if a.keep_images:  # 留全部原圖，去重只影響 PDF
+        if a.keep_images:  # 留全部原图，去重只影响 PDF
             shutil.copytree(tmpdir, cdir / safe_name(s["sub_name"]), dirs_exist_ok=True)
         note = f"，去重前 {len(paths)}" if len(pages) != len(paths) else ""
-        print(f"[PDF] {pdf.relative_to(root)}（{len(pages)} 頁{note}）")
+        print(f"[PDF] {pdf.relative_to(root)}（{len(pages)} 页{note}）")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1479,22 +1491,22 @@ def cmd_transcript(a):
     root = Path(a.out).expanduser()
     failed = 0
     for s in resolve_subs(z, a):
-        out = root / safe_name(s["course_name"]) / "轉錄" / f"{safe_name(s['sub_name'])}.{a.format}"
+        out = material_path(root / safe_name(s["course_name"]), "转录", f"{safe_name(s['sub_name'])}.{a.format}")
         if out.exists() and not a.force:
-            log(f"[略過] {out.relative_to(root)}")
+            log(f"[跳过] {out.relative_to(root)}")
             continue
         try:
             items = z.subtitle(s["sub_id"])
         except Exception as e:
             failed += 1
-            log(f"[失敗] {s['course_name']} {s['sub_name']}: {e}")
+            log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
             continue
         if not items:
-            log(f"[無轉錄] {s['course_name']} {s['sub_name']}")
+            log(f"[无转录] {s['course_name']} {s['sub_name']}")
             continue
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"))
-        print(f"[轉錄] {out.relative_to(root)}（{len(items)} 段）")
+        print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
     if failed:
         sys.exit(2)
 
@@ -1504,9 +1516,9 @@ def cmd_video(a):
     root = Path(a.out).expanduser()
     subs = resolve_subs(z, a)
     if not subs:
-        log("沒有課堂")
+        log("没有课堂")
         return
-    # 同一課程只讀一次目錄；完整下載成功後才記入清單。
+    # 同一课程只读一次目录；完整下载成功后才记入清单。
     catalogues = {}
     man = Manifest(root)
     failed = downloaded = skipped = unavailable = planned = 0
@@ -1523,110 +1535,110 @@ def cmd_video(a):
             if isinstance(catalogue, Exception):
                 raise catalogue
             if sid not in catalogue:
-                raise ZjuError(f"錄播目錄缺少堂次 {sid}")
+                raise ZjuError(f"录播目录缺少堂次 {sid}")
             urls = catalogue[sid]
             if not urls:
                 unavailable += 1
-                log(f"[無回放] {s['course_name']} {s['sub_name']}")
+                log(f"[无回放] {s['course_name']} {s['sub_name']}")
                 continue
         except ZjuError as e:
             failed += 1
-            log(f"[失敗] {s['course_name']} {s['sub_name']}: {e}")
+            log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
             continue
-        cdir = root / safe_name(f"{s['course_name']} ({cid})") / "錄播"
+        course_dir = root / safe_name(f"{s['course_name']} ({cid})")
         for i, url in enumerate(urls, 1):
             key = f"video:{cid}:{sid}:{i}"
             part = f" - {i:02d}" if len(urls) > 1 else ""
-            dest = cdir / f"{safe_name(s['sub_name'])} ({sid}){part}.mp4"
+            dest = material_path(course_dir, "录播", f"{safe_name(s['sub_name'])} ({sid}){part}.mp4")
             rec = man.get(key)
             if not a.force and rec and dest.is_file() and dest.stat().st_size == rec.get("size"):
                 skipped += 1
-                log(f"[略過] {dest.relative_to(root)}")
+                log(f"[跳过] {dest.relative_to(root)}")
                 continue
             if a.dry_run:
                 planned += 1
-                print(f"[會下載] {dest.relative_to(root)}")
+                print(f"[会下载] {dest.relative_to(root)}")
                 continue
             try:
-                log(f"[下載] {dest.relative_to(root)}")
+                log(f"[下载] {dest.relative_to(root)}")
                 download_video(z, url, dest, limit, a.jobs, restart=a.force)
                 man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
                               "course_id": cid, "sub_id": sid,
                               "at": dt.datetime.now().isoformat(timespec="seconds")})
                 downloaded += 1
-                print(f"[錄播] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
+                print(f"[录播] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
             except TooBig as e:
                 skipped += 1
-                log(f"[太大跳過] {dest.name}: {e}（--max-size 0 不限）")
+                log(f"[太大跳过] {dest.name}: {e}（--max-size 0 不限）")
             except Exception as e:
                 failed += 1
-                log(f"[失敗] {dest.name}: {e}")
-    count = f"待下載 {planned}" if a.dry_run else f"下載 {downloaded}"
-    log(f"{'預覽' if a.dry_run else '完成'}：{count}、略過 {skipped}、無回放 {unavailable}、失敗 {failed}")
+                log(f"[失败] {dest.name}: {e}")
+    count = f"待下载 {planned}" if a.dry_run else f"下载 {downloaded}"
+    log(f"{'预览' if a.dry_run else '完成'}：{count}、跳过 {skipped}、无回放 {unavailable}、失败 {failed}")
     if failed:
         sys.exit(2)
 
 
 def main():
-    p = argparse.ArgumentParser(prog="zju.py", description="學在浙大 / 智雲課堂 CLI")
+    p = argparse.ArgumentParser(prog="zju.py", description="学在浙大 / 智云课堂 CLI")
     try:
         default_out = os.environ.get("ZJU_OUT") or load_config().get("out") or str(DEFAULT_OUT)
     except ZjuError as e:
-        log(f"錯誤：{e}")
+        log(f"错误：{e}")
         sys.exit(1)
-    p.add_argument("--out", default=default_out, help=f"輸出根目錄（目前 {default_out}；config.json 的 out 或 ZJU_OUT 可改）")
+    p.add_argument("--out", default=default_out, help=f"输出根目录（目前 {default_out}；config.json 的 out 或 ZJU_OUT 可改）")
     sp = p.add_subparsers(dest="cmd", required=True)
 
-    x = sp.add_parser("login", help="設定學號並把密碼存進 Keychain")
+    x = sp.add_parser("login", help="设置学号并把密码存进 Keychain")
     x.add_argument("username", nargs="?")
-    x.add_argument("--reset", action="store_true", help="重設 Keychain 密碼")
+    x.add_argument("--reset", action="store_true", help="重设 Keychain 密码")
     x.set_defaults(fn=cmd_login)
 
-    x = sp.add_parser("courses", help="列出學在浙大課程")
-    x.add_argument("--all", action="store_true", help="含往年課程（預設只列最新學年）")
+    x = sp.add_parser("courses", help="列出学在浙大课程")
+    x.add_argument("--all", action="store_true", help="含往年课程（默认只列最新学年）")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_courses)
 
-    x = sp.add_parser("sync", help="增量同步課件")
-    x.add_argument("course", nargs="*", help="課程 id 或名稱片段；省略 = 最新學年所有課程")
-    x.add_argument("--all", action="store_true", help="沒指定課程時抓全部學年")
+    x = sp.add_parser("sync", help="增量同步课件")
+    x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
+    x.add_argument("--all", action="store_true", help="没指定课程时抓全部学年")
     x.add_argument("--dry-run", action="store_true")
-    x.add_argument("--videos", action="store_true", help="連影音檔也抓（預設跳過）")
-    x.add_argument("-j", "--jobs", type=int, default=4, help="並行下載數（預設 4）")
-    x.add_argument("--max-size", type=int, default=200, metavar="MB", help="單檔上限，超過只列出（預設 200，0 = 不限）")
+    x.add_argument("--videos", action="store_true", help="连影音档也抓（默认跳过）")
+    x.add_argument("-j", "--jobs", type=int, default=4, help="并行下载数（默认 4）")
+    x.add_argument("--max-size", type=int, default=200, metavar="MB", help="单文件上限，超过只列出（默认 200，0 = 不限）")
     x.set_defaults(fn=cmd_sync)
 
-    x = sp.add_parser("todo", help="待辦事項")
+    x = sp.add_parser("todo", help="待办事项")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_todo)
 
-    x = sp.add_parser("activities", help="列出課程活動（課件／影片／作業／討論／測驗…）")
-    x.add_argument("course", nargs="*", help="課程 id 或名稱片段；省略 = 最新學年所有課程")
-    x.add_argument("--all", action="store_true", help="沒指定課程時含往年課程")
-    x.add_argument("--type", nargs="*", metavar="T", help=f"只列這些類型：{', '.join(ACT_TYPES)}")
+    x = sp.add_parser("activities", help="列出课程活动（课件／视频／作业／讨论／测验…）")
+    x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
+    x.add_argument("--all", action="store_true", help="没指定课程时含往年课程")
+    x.add_argument("--type", nargs="*", metavar="T", help=f"只列这些类型：{', '.join(ACT_TYPES)}")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_activities)
 
-    x = sp.add_parser("show", help="單一活動詳情（說明、附件、作業提交狀態、討論帖數）")
+    x = sp.add_parser("show", help="单一活动详情（说明、附件、作业提交状态、讨论帖数）")
     x.add_argument("activity", type=int)
     x.set_defaults(fn=cmd_show)
 
     def body_args(x):
-        x.add_argument("--body", help="內容（純文字，空行分段）")
-        x.add_argument("--body-file", help="從檔案讀內容；- = stdin")
-        x.add_argument("--html", action="store_true", help="內容已經是 HTML，不轉換")
+        x.add_argument("--body", help="内容（纯文字，空行分段）")
+        x.add_argument("--body-file", help="从文件读内容；- = stdin")
+        x.add_argument("--html", action="store_true", help="内容已经是 HTML，不转换")
         x.add_argument("--attach", nargs="*", metavar="FILE", help="附件")
 
-    x = sp.add_parser("forum", help="討論區：list / read / post / reply")
+    x = sp.add_parser("forum", help="讨论区：list / read / post / reply")
     fp = x.add_subparsers(dest="action", required=True)
-    y = fp.add_parser("list", help="列出討論帖（給討論活動 id）")
-    y.add_argument("id", type=int, help="討論活動 id（activities --type forum 查）")
-    y.add_argument("--mine", action="store_true", help="只看自己發的")
-    y.add_argument("--full", action="store_true", help="連內文一起印")
-    y = fp.add_parser("read", help="讀一則帖子與回覆")
+    y = fp.add_parser("list", help="列出讨论帖（给讨论活动 id）")
+    y.add_argument("id", type=int, help="讨论活动 id（activities --type forum 查）")
+    y.add_argument("--mine", action="store_true", help="只看自己发的")
+    y.add_argument("--full", action="store_true", help="连内文一起印")
+    y = fp.add_parser("read", help="读一则帖子与回复")
     y.add_argument("id", type=int, help="topic id")
-    y = fp.add_parser("post", help="發新帖")
-    y.add_argument("id", type=int, help="討論活動 id")
+    y = fp.add_parser("post", help="发新帖")
+    y.add_argument("id", type=int, help="讨论活动 id")
     y.add_argument("--title", required=True)
     body_args(y)
     y = fp.add_parser("reply", help="回帖")
@@ -1634,22 +1646,22 @@ def main():
     body_args(y)
     x.set_defaults(fn=cmd_forum)
 
-    x = sp.add_parser("upload", help="上傳檔案到學在浙大，印出 upload id")
+    x = sp.add_parser("upload", help="上传文件到学在浙大，输出 upload id")
     x.add_argument("files", nargs="+")
     x.set_defaults(fn=cmd_upload)
 
-    x = sp.add_parser("submit", help="交作業（附檔＋文字），預設送出前確認")
-    x.add_argument("activity", type=int, help="作業活動 id（activities --type homework 查）")
-    x.add_argument("--file", nargs="*", metavar="FILE", help="要交的檔案")
-    x.add_argument("--upload-id", type=int, nargs="*", help="已用 upload 指令傳好的檔案 id")
-    x.add_argument("--body", help="作業文字內容")
-    x.add_argument("--body-file", help="從檔案讀作業文字；- = stdin")
-    x.add_argument("--html", action="store_true", help="文字已經是 HTML")
+    x = sp.add_parser("submit", help="交作业（附件＋文字），默认送出前确认")
+    x.add_argument("activity", type=int, help="作业活动 id（activities --type homework 查）")
+    x.add_argument("--file", nargs="*", metavar="FILE", help="要交的文件")
+    x.add_argument("--upload-id", type=int, nargs="*", help="已用 upload 指令传好的文件 id")
+    x.add_argument("--body", help="作业文字内容")
+    x.add_argument("--body-file", help="从文件读作业文字；- = stdin")
+    x.add_argument("--html", action="store_true", help="文字已经是 HTML")
     x.add_argument("--draft", action="store_true", help="只存草稿不正式提交")
-    x.add_argument("-y", "--yes", action="store_true", help="不確認直接送出")
+    x.add_argument("-y", "--yes", action="store_true", help="不确认直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智雲課堂：search / subs / day")
+    x = sp.add_parser("classroom", help="智云课堂：search / subs / day")
     x.add_argument("action", choices=["search", "subs", "day"])
     x.add_argument("arg", nargs="?")
     x.add_argument("--teacher")
@@ -1657,34 +1669,34 @@ def main():
     x.set_defaults(fn=cmd_classroom)
 
     for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("video", cmd_video)):
-        x = sp.add_parser(name, help={"ppt": "智雲 PPT → PDF", "transcript": "智雲課堂語音轉錄",
-                                      "video": "智雲錄播 → MP4"}[name])
-        x.add_argument("--course", type=int, help="智雲課堂 course_id（classroom search 查）")
-        x.add_argument("--sub", type=int, nargs="*", help="只抓這些 sub_id")
-        x.add_argument("--days", type=int, help="不給 --course 時：最近 N 天的課（預設 1 = 今天）")
-        x.add_argument("--force", action="store_true", help="已存在也重抓")
+        x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
+                                      "video": "智云录播 → MP4"}[name])
+        x.add_argument("--course", type=int, help="智云课堂 course_id（classroom search 查）")
+        x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
+        x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
+        x.add_argument("--force", action="store_true", help="已存在也重新下载")
         if name == "ppt":
             x.add_argument("--keep-images", action="store_true")
             x.add_argument("--dedup", action="store_true",
-                           help="刪掉重複截圖（動畫逐步出現、邊講邊寫、翻回前頁），每頁只留最完整的一張")
+                           help="删掉重复截图（动画逐步出现、边讲边写、翻回前页），每页只留最完整的一张")
         elif name == "transcript":
             x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
         else:
-            x.add_argument("--dry-run", action="store_true", help="只列出待下載錄播")
-            x.add_argument("--max-size", type=int, default=0, metavar="MB", help="單檔上限（預設 0 = 不限）")
-            x.add_argument("-j", "--jobs", type=int, default=4, help="每個影片的平行分片連線數（預設 4）")
-            x.description = "預設沿用已完成分片，重新執行即可續傳；--force 丟棄分片並從頭下載。"
+            x.add_argument("--dry-run", action="store_true", help="只列出待下载录播")
+            x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")
+            x.add_argument("-j", "--jobs", type=int, default=4, help="每个视频的平行分片连接数（默认 4）")
+            x.description = "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。"
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
     if a.cmd == "video" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
-        p.error("--max-size 必須 >= 0，--jobs 和 --days 必須 >= 1")
+        p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
     if a.cmd == "video" and a.sub is not None and not a.course:
         p.error("--sub 需要搭配 --course")
     try:
         a.fn(a)
     except ZjuError as e:
-        log(f"錯誤：{e}")
+        log(f"错误：{e}")
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

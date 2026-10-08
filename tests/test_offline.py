@@ -1,4 +1,4 @@
-"""不連網的單元測試：python -m unittest discover tests（需 requests / img2pdf / pillow / numpy）。"""
+"""不连网的单元测试：python -m unittest discover tests（需 requests / img2pdf / pillow / numpy）。"""
 import importlib.util
 import tempfile
 import unittest
@@ -12,7 +12,7 @@ spec.loader.exec_module(zju)
 
 class Offline(unittest.TestCase):
     def test_rsa_no_padding_roundtrip(self):
-        # 與 CAS 前端同一套 textbook RSA：m^e mod n，hex 輸出
+        # 与 CAS 前端同一套 textbook RSA：m^e mod n，hex 输出
         p, q, e = 1000000007, 998244353, 65537
         n = p * q
         d = pow(e, -1, (p - 1) * (q - 1))
@@ -30,9 +30,9 @@ class Offline(unittest.TestCase):
         def slide(lines, ink=None, bg=255):
             im = Image.new("RGB", (1280, 720), (bg,) * 3)
             d = ImageDraw.Draw(im)
-            for x, y, w in lines:  # 一行字 ≈ 一條細橫線
+            for x, y, w in lines:  # 一行字 ≈ 一条细横线
                 d.rectangle([x, y, x + w, y + 8], fill=(0, 0, 0))
-            if ink:  # 老師的紅筆註記
+            if ink:  # 老师的红笔注记
                 d.line(ink, fill=(220, 0, 0), width=5)
             return im
 
@@ -41,12 +41,12 @@ class Offline(unittest.TestCase):
         b = [(100, 60, 400), (150, 250, 500), (150, 450, 600), (300, 600, 300)]
         scribble = [(700, 300), (900, 420), (1100, 300), (900, 200)]
         pages = [
-            slide(a_title),           # 0 動畫第一步 → 被 1 包含
+            slide(a_title),           # 0 动画第一步 → 被 1 包含
             slide(a_full),            # 1 保留
-            slide(b),                 # 2 → 被 3（寫了註記）包含
-            slide([], bg=0),          # 3 全黑過場
+            slide(b),                 # 2 → 被 3（写了注记）包含
+            slide([], bg=0),          # 3 全黑过场
             slide(b, ink=scribble),   # 4 保留
-            slide(b),                 # 5 擦掉註記的乾淨版 → 被 4 包含
+            slide(b),                 # 5 擦掉注记的干净版 → 被 4 包含
             slide(a_full),            # 6 翻回前面 → 被 1 包含
         ]
         with tempfile.TemporaryDirectory() as d:
@@ -63,7 +63,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(out, "1\n00:01:01,500 --> 00:01:03,000\n你好\n\n")
 
     def test_local_time(self):
-        self.assertEqual(zju.local_time(None), "時間未定")
+        self.assertEqual(zju.local_time(None), "时间未定")
         self.assertRegex(zju.local_time("2026-09-27T15:59:00Z", "%Y-%m-%d"), r"2026-09-2[78]")
 
     def test_current_year(self):
@@ -76,7 +76,7 @@ class Offline(unittest.TestCase):
         from PIL import Image
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            Image.new("RGBA", (40, 30), (255, 0, 0, 128)).save(d / "a.png")  # alpha：走 Pillow 轉檔分支
+            Image.new("RGBA", (40, 30), (255, 0, 0, 128)).save(d / "a.png")  # alpha：走 Pillow 转档分支
             Image.new("RGB", (40, 30)).save(d / "b.jpg")
             zju.images_to_pdf([d / "a.png", d / "b.jpg"], d / "out.pdf")
             self.assertEqual((d / "out.pdf").read_bytes()[:5], b"%PDF-")
@@ -87,7 +87,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(zju.safe_name("x . "), "x")
 
     def test_local_time_naive_is_beijing(self):
-        # 沒帶時區 = 北京時間；換算成 UTC+8 顯示應不變
+        # 没带时区 = 北京时间；换算成 UTC+8 显示应不变
         import datetime as dt
         naive = zju.local_time("2026-09-27 23:59:00", "%Y-%m-%d %H:%M")
         want = dt.datetime(2026, 9, 27, 23, 59, tzinfo=zju.CST).astimezone().strftime("%Y-%m-%d %H:%M")
@@ -98,7 +98,7 @@ class Offline(unittest.TestCase):
         self.assertEqual(zju.secure_url("http://example.com/a.jpg"), "http://example.com/a.jpg")
 
     def test_http_never_carries_cookies(self):
-        """.zju.edu.cn 的 SSO cookie 沒設 Secure：http:// 請求必須被剝掉 Cookie。"""
+        """.zju.edu.cn 的 SSO cookie 没设 Secure：http:// 请求必须被剥掉 Cookie。"""
         from unittest import mock
         import requests
         seen = {}
@@ -124,7 +124,7 @@ class Offline(unittest.TestCase):
             self.assertIn("SECRET", seen["headers"].get("Cookie", ""))
 
     def test_refer_params(self):
-        # 與前端 getDownloadRefer 同規則：classroom→classroom_activity、exam 不帶、其餘→learning_activity
+        # 与前端 getDownloadRefer 同规则：classroom→classroom_activity、exam 不带、其余→learning_activity
         self.assertEqual(zju.refer_params({"id": 1164596, "type": "online_video"}),
                          {"refer_id": 1164596, "refer_type": "learning_activity"})
         self.assertEqual(zju.refer_params({"id": 1159399, "type": "material"}),
@@ -136,7 +136,7 @@ class Offline(unittest.TestCase):
         self.assertIsNone(zju.refer_params(None))
 
     def test_upload_response_refer_fallback(self):
-        """排程未開放：前兩層 403、第 3 層帶 snake_case refer 回原檔，不再落到 preview PDF。"""
+        """排程未开放：前两层 403、第 3 层带 snake_case refer 回原档，不再落到 preview PDF。"""
         import io
         import requests
         from unittest import mock
@@ -158,14 +158,14 @@ class Offline(unittest.TestCase):
         with mock.patch.object(zju.Zju, "get", fake_get):
             r, src = z.upload_response(2316787, 17939358, {"id": 1164596, "type": "online_video"})
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(src, "排程原檔")
+        self.assertEqual(src, "排程原档")
         self.assertEqual(len(calls), 3)  # refer 成功就不需要 preview PDF
         self.assertTrue(calls[0][0].endswith("/reference/17939358/blob"))
         self.assertEqual(calls[2], ("https://courses.zju.edu.cn/api/uploads/2316787/blob",
                                     {"refer_id": 1164596, "refer_type": "learning_activity"}))
 
     def test_upload_response_no_refer_for_exam(self):
-        """exam 活動不帶 refer：只走原三層，exam 未開放時照樣 403 拋錯。"""
+        """exam 活动不带 refer：只走原三层，exam 未开放时照样 403 抛错。"""
         import io
         import requests
         from unittest import mock
@@ -183,7 +183,7 @@ class Offline(unittest.TestCase):
         with mock.patch.object(zju.Zju, "get", fake_get):
             with self.assertRaises(zju.DownloadError) as cm:
                 z.upload_response(1, 2, {"id": 9, "type": "exam"})
-        self.assertEqual(len(calls), 3)  # reference blob、uid blob、preview url（沒有 refer 層）
+        self.assertEqual(len(calls), 3)  # reference blob、uid blob、preview url（没有 refer 层）
         self.assertTrue(all("refer_id" not in (p or {}) for _, p in calls))
         self.assertEqual(cm.exception.codes, [403, 403, 403])
 
@@ -210,7 +210,7 @@ class Offline(unittest.TestCase):
                 zju.stream_to(resp(b"<html>", ctype="text/html; charset=utf-8"), d / "c.pdf")
             with self.assertRaises(zju.TooBig):
                 zju.stream_to(resp(b"x" * 10, 10), d / "d.bin", limit=5)
-            self.assertEqual(sorted(p.name for p in d.iterdir()), [])  # 失敗不留任何檔
+            self.assertEqual(sorted(p.name for p in d.iterdir()), [])  # 失败不留任何档
             out = zju.stream_to(resp(b"%PDF-1.4 ok", 11), d / "e.pptx")
             self.assertEqual(out.name, "e.pptx.pdf")
 
@@ -231,7 +231,7 @@ class Offline(unittest.TestCase):
                 zju.parse_video_catalogue([{"sub_id": 1, "content": content}])
 
     def test_video_download_ranges(self):
-        """真實本地 HTTP：分片並行、順序、重試、回退和損壞檔保護。"""
+        """真实本地 HTTP：分片并行、顺序、重试、回退和损坏档保护。"""
         import threading
         import time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -294,7 +294,7 @@ class Offline(unittest.TestCase):
                     state["mode"] = mode
                     with self.assertRaises((zju.ZjuError, zju.requests.RequestException)):
                         zju.download_video(client, url, dest, None, 4, chunk_size=128)
-                    self.assertEqual(dest.read_bytes(), body)  # 失敗不能覆蓋原檔
+                    self.assertEqual(dest.read_bytes(), body)  # 失败不能覆盖原档
                     self.assertTrue((Path(d) / ".video.mp4.part").exists())
                     self.assertTrue((Path(d) / ".video.mp4.part.json").exists())
                 state["mode"] = "fallback"
@@ -311,8 +311,8 @@ class Offline(unittest.TestCase):
         from argparse import Namespace
         from unittest.mock import patch, MagicMock
 
-        subs = [{"course_id": 1, "sub_id": 2, "course_name": "課程", "sub_name": "第一堂"},
-                {"course_id": 1, "sub_id": 3, "course_name": "課程", "sub_name": "第二堂"}]
+        subs = [{"course_id": 1, "sub_id": 2, "course_name": "课程", "sub_name": "第一堂"},
+                {"course_id": 1, "sub_id": 3, "course_name": "课程", "sub_name": "第二堂"}]
         client = MagicMock()
         client.video_catalogue.return_value = {2: ["https://example.com/a.mp4"], 3: []}
         with tempfile.TemporaryDirectory() as d:
@@ -385,7 +385,7 @@ class Offline(unittest.TestCase):
                                           cwd=ROOT, capture_output=True, text=True, timeout=20,
                                           env=dict(os.environ, ZJU_STATE_DIR=str(Path(d) / "state")))
 
-                # 每輪在第一片完成後斷線，再用全新 Python 程序續傳。
+                # 每轮在第一片完成后断线，再用全新 Python 程序续传。
                 for mode in ("interrupted", "resume", "refresh", "corrupt", "version", "force", "checkpoint", "no_validator"):
                     state["fail"] = True
                     state["etag"] = "" if mode == "no_validator" else '"v1"'
@@ -405,7 +405,7 @@ class Offline(unittest.TestCase):
                             self.assertIn("0", json.loads(checkpoint.read_text())["done"])
                             concurrent = run()
                             self.assertNotEqual(concurrent.returncode, 0)
-                            self.assertIn("另一個程序", concurrent.stderr)
+                            self.assertIn("另一个程序", concurrent.stderr)
                         finally:
                             if process.poll() is None:
                                 process.terminate()
@@ -434,7 +434,7 @@ class Offline(unittest.TestCase):
                     if mode in ("resume", "interrupted", "refresh"):
                         for start in saved["done"]:
                             self.assertNotIn(int(start), chunks)
-                        self.assertIn("[續傳]", result.stderr)
+                        self.assertIn("[续传]", result.stderr)
                     else:
                         self.assertIn(0, chunks)
                     dest.unlink()
@@ -453,6 +453,27 @@ class Offline(unittest.TestCase):
             with self.assertRaises(zju.ZjuError):
                 zju.stream_to(r, Path(d) / "video.mp4", mp4=True)
             self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_simplified_paths_preserve_existing_materials(self):
+        with tempfile.TemporaryDirectory() as d:
+            course_dir = Path(d) / "课程"
+            for kind, legacy, name in (("智云PPT", "智雲PPT", "课堂.pdf"),
+                                       ("转录", "轉錄", "课堂.md"),
+                                       ("录播", "錄播", "课堂.mp4")):
+                self.assertEqual(zju.material_path(course_dir, kind, name), course_dir / kind / name)
+                old = course_dir / legacy / name
+                old.parent.mkdir(parents=True, exist_ok=True)
+                old.write_bytes(b"existing")
+                self.assertEqual(zju.material_path(course_dir, kind, name), old)
+                new = course_dir / kind / name
+                new.parent.mkdir(parents=True, exist_ok=True)
+                new.write_bytes(b"new")
+                self.assertEqual(zju.material_path(course_dir, kind, name), new)
+            old_video = course_dir / "錄播" / "未完成.mp4"
+            partial = old_video.with_name(f".{old_video.name}.part")
+            partial.write_bytes(b"partial")
+            self.assertEqual(zju.material_path(course_dir, "录播", old_video.name), old_video)
+            self.assertEqual(partial.read_bytes(), b"partial")
 
 
 if __name__ == "__main__":

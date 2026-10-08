@@ -1,9 +1,9 @@
 @echo off & chcp 65001 >nul & set "PYTHONUTF8=1" & title ZJU login & py -3.11 -x "%~f0" %* & echo. & pause & goto :eof
-"""雙擊執行的 `zju.py login`：每次都是全新的登入。
+"""双击执行的 `zju.py login`：每次都是全新的登录。
 
-第一行是 cmd 的批次指令，`py -x` 會跳過它，所以從這裡開始才是 Python。
-開始前先清掉上一次留下的學號（config.json）、密碼（系統憑證庫）和 session cookie，
-再交給 zju.py 的 login 重新問學號和密碼。zju.py 本身不改。
+第一行是 cmd 的批次指令，`py -x` 会跳过它，所以从这里开始才是 Python。
+开始前先清掉上一次留下的学号（config.json）、密码（系统凭据库）和 session cookie，
+再交给 zju.py 的 login 重新问学号和密码。zju.py 本身不改。
 """
 import importlib.util
 import shutil
@@ -22,7 +22,7 @@ if old_user:
         import keyring
         keyring.delete_password(zju.KEYCHAIN_SERVICE, old_user)
     except Exception:
-        pass  # 本來就沒存密碼
+        pass  # 本来就没存密码
 shutil.rmtree(zju.STATE_DIR, ignore_errors=True)
 
 sys.argv = ["zju.py", "login", *sys.argv[1:]]

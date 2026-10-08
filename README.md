@@ -1,6 +1,6 @@
 # zju-learning-cli
 
-简体中文 | [繁體中文](README.zh-TW.md)
+简体中文 | [繁体中文](README.zh-TW.md)
 
 学在浙大（courses.zju.edu.cn）与智云课堂（classroom.zju.edu.cn）的单文件命令行工具：同步课件、把智云课堂的 PPT 截图合并成 PDF（可去除重复截图）、导出课堂语音转录、查待办。
 
@@ -10,7 +10,7 @@
 
 | 指令 | 作用 |
 | --- | --- |
-| `zju login` | 设置学号，密码存进系统凭证库（macOS Keychain、Windows 凭据管理器；其他系统走 [keyring](https://pypi.org/project/keyring/)） |
+| `zju login` | 设置学号，密码存进系统凭据库（macOS Keychain、Windows 凭据管理器；其他系统走 [keyring](https://pypi.org/project/keyring/)） |
 | `zju courses [--all]` | 课程列表（默认只列最新学年） |
 | `zju sync [课程...]` | 增量同步课件到 `<输出目录>/<课程>/` |
 | `zju todo` | 待办事项，依截止时间排序（本地时区） |
@@ -25,7 +25,7 @@
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
-| `./zju.py video --course <id> \| --days N [-j 4]` | 智云录播 → `<课程> (<id>)/錄播/<堂> (<sub_id>).mp4`，多连接分片下载 |
+| `./zju.py video --course <id> \| --days N [-j 4]` | 智云录播 → `<课程> (<id>)/录播/<堂> (<sub_id>).mp4`，多连接分片下载 |
 
 ## 安装
 
@@ -60,6 +60,8 @@ zju transcript --days 1 --format md
 
 输出目录的优先级：`--out` > 环境变量 `ZJU_OUT` > `~/.config/zju-learning/config.json` 的 `"out"` > `~/ZJU-Courses`。
 
+程序提示与帮助使用简体中文，新资料目录为 `智云PPT`、`转录`、`录播`。已有繁体目录中的文件和视频续传进度仍会识别，继续使用原路径，不搬移或重复下载；课程名、文件名和转写内容保持平台原文。
+
 定时任务示例（cron，每天 22:00）：
 
 ```cron
@@ -88,7 +90,7 @@ zju transcript --days 1 --format md
 
 已下载且大小符合清单的文件会跳过；暂无回放的堂次会跳过，下次运行重新查询。多段回放地址分别保存为带编号的 MP4。录播目录和文件名包含课程、堂次 ID，避免同名覆盖。当前支持直接 MP4，不支持 HLS 播放列表。`--out` 放在子命令前，例如 `./zju.py --out ~/ZJU-Courses video --course 89418`。
 
-**视频支持跨次运行的断点续传，默认开启。** 中断或失败时，在视频旁保留隐藏的 `.影片名.mp4.part` 数据文件和 `.影片名.mp4.part.json` 进度文件。重新执行相同命令（输出目录不变）即可继续，`-j` 可以调整；只补下载未完成或校验损坏的分片，未完成的单片从头重下。每片完成后将数据写入磁盘，再原子保存进度及 SHA-256；再次运行时校验已完成分片。全部完成后才替换最终 MP4，并清理数据和进度文件。隐藏的 `.影片名.mp4.download.lock` 小锁文件保留，用于阻止多个程序同时下载同一视频。
+**视频支持跨次运行的断点续传，默认开启。** 中断或失败时，在视频旁保留隐藏的 `.视频名.mp4.part` 数据文件和 `.视频名.mp4.part.json` 进度文件。重新执行相同命令（输出目录不变）即可继续，`-j` 可以调整；只补下载未完成或校验损坏的分片，未完成的单片从头重下。每片完成后将数据写入磁盘，再原子保存进度及 SHA-256；再次运行时校验已完成分片。全部完成后才替换最终 MP4，并清理数据和进度文件。隐藏的 `.视频名.mp4.download.lock` 小锁文件保留，用于阻止多个程序同时下载同一视频。
 
 续传前核对远端 ETag（或 Last-Modified）、总长度及来源；远端版本变化、本地进度损坏、数据文件缺失时重新下载。地址的签名参数刷新不会影响续传，仍须通过远端版本核对。服务器不支持 Range 或没有可用版本标记时，从头下载。`--force` 明确丢弃已完成分片，从头重下；不加 `--force` 才会沿用进度。课件、PPT 和转写的下载行为不变。
 
@@ -96,7 +98,7 @@ zju transcript --days 1 --format md
 
 ### 其他改进
 
-- **增量同步**：以 `.zju_manifest.json` 记录 upload id，而不是比对文件名和大小；老师换了新版（新 id）才会重抓。
+- **增量同步**：以 `.zju_manifest.json` 记录 upload id，而不是比对文件名和大小；老师换了新版（新 id）才会重新下载。
 - **下载完整性**：先写 `.part-*`，核对 `Content-Length` 后才 rename；空文件、截断、服务器回的 HTML 错误页都不会被记成已下载。
 - **并行下载**：课件默认 4 个文件同时，PPT 截图 8 张同时；每条线程有自己的 session，共用 cookie jar。遇到 429/503 会照 `Retry-After` 退让。
 - **PPT 去重**（`--dedup`）：智云是对投影画面定时截图，同一页会因动画逐步出现、老师边讲边写、翻回前面而被截很多次。一页的笔画若全都还在后面那页（或之前留下的某页）里就删掉，所以动画只留跑完的那张、手写只留写完的那张，批注不会丢。用局部对比找笔画，白底、黑底、底图纹理、教学视频都适用；实测三堂课 73→68、81→48、176→99 页，逐页核对无误删。`--keep-images` 仍保留全部原图。
@@ -126,7 +128,7 @@ zju transcript --days 1 --format md
 
 ## 安全性
 
-- 密码只存在系统凭证库。macOS 由系统 `security`、Windows 由 Python `getpass` 在终端提示输入，不会出现在命令行参数或 shell 历史记录。也可以改用环境变量 `ZJU_USER` / `ZJU_PASS`。
+- 密码只存在系统凭据库。macOS 由系统 `security`、Windows 由 Python `getpass` 在终端提示输入，不会出现在命令行参数或 shell 历史记录。也可以改用环境变量 `ZJU_USER` / `ZJU_PASS`。
 - 登录时密码先用 CAS 提供的公钥加密再送出，跟网页登录的做法相同。
 - Session cookie 以 JSON（不是 pickle）缓存在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上文件权限是 `0600`，目录是 `0700`。缓存位置可用环境变量 `ZJU_STATE_DIR` 覆盖。
 - Cookie 只会通过 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 请求一律不带。没有任何遥测。
