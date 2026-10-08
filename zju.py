@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "img2pdf", "pillow", "keyring", "numpy"]
+# dependencies = ["requests", "httpx", "img2pdf", "pillow", "keyring", "numpy"]
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 8eoyw
@@ -21,17 +21,20 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py upload 文件...                 # 上传，印 upload id
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
   zju.py classroom courses [--has-tasks] [--json]  # 智云个人课程与任务数
-  zju.py classroom sync [课程...] [-j 4] [--recordings]  # 同步 PPT、转写及可选录播
+  zju.py classroom sync [课程...] [-j 4] [--recordings] [--audio]  # PPT、转写及可选录播和音频
   zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]
   zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
   zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
+  zju.py audio --course <cid> | --days N [-j 32]  # 本地录播提取或仅下载音轨
 """
 from __future__ import annotations
 
 import argparse
+import array
+import asyncio
 import datetime as dt
 import html
 import hashlib
@@ -46,13 +49,15 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import ssl
+import struct
 
 import requests
+import httpx
 from requests.adapters import HTTPAdapter
 
 KEYCHAIN_SERVICE = "zju-learning"
@@ -97,7 +102,7 @@ def material_path(course_dir: Path, kind: str, filename: str) -> Path:
     """新资料使用简体目录，旧文件和续传分片继续使用原路径。"""
     legacy_names = {"智云PPT": "智雲PPT", "转录": "轉錄", "录播": "錄播"}
     target = course_dir / kind / filename
-    legacy = course_dir / legacy_names[kind] / filename
+    legacy = course_dir / legacy_names.get(kind, kind) / filename
     for candidate in (target, legacy):
         if (candidate.exists() or candidate.with_name(f".{filename}.part").exists()
                 or candidate.with_name(f".{filename}.part.json").exists()):
@@ -746,10 +751,9 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
         r.close()
 
 
-def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
-                   *, chunk_size: int = 32 * 2**20, restart: bool = False,
-                   pool: ThreadPoolExecutor | None = None) -> Path:
-    """保留已校验分片及 checkpoint，跨次执行只补缺片。"""
+@contextmanager
+def download_lock(dest: Path, kind: str):
+    """同一输出文件只允许一个程序写入，锁文件保留以免 inode 更换。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     # 锁档保留以避免删除后新旧 inode 被不同程序同时锁定。
     lock_path = dest.with_name(f".{dest.name}.download.lock")
@@ -767,7 +771,15 @@ def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
                 import fcntl
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
-            raise ZjuError("另一个程序正在下载此录播") from e
+            raise ZjuError(f"另一个程序正在处理此{kind}") from e
+        yield
+
+
+def download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
+                   *, chunk_size: int = 32 * 2**20, restart: bool = False,
+                   pool: ThreadPoolExecutor | None = None) -> Path:
+    """保留已校验分片及 checkpoint，跨次执行只补缺片。"""
+    with download_lock(dest, "录播"):
         return _download_video(z, url, dest, limit, jobs, chunk_size, restart, pool)
 
 
@@ -937,6 +949,396 @@ def _download_video(z: Zju, url: str, dest: Path, limit: int | None, jobs: int,
     os.replace(tmp, dest)
     clear_partial()
     return dest
+
+
+# ---------------- audio-only MP4 ranges ----------------
+
+def mp4_boxes(data):
+    data = memoryview(data)
+    offset = 0
+    while offset < len(data):
+        if len(data) - offset < 8:
+            raise ZjuError("MP4 索引截断")
+        size, kind = struct.unpack_from(">I4s", data, offset)
+        header = 8
+        if size == 1:
+            if len(data) - offset < 16:
+                raise ZjuError("MP4 扩展索引截断")
+            size, = struct.unpack_from(">Q", data, offset + 8)
+            header = 16
+        elif size == 0:
+            size = len(data) - offset
+        if size < header or size > len(data) - offset:
+            raise ZjuError("MP4 索引长度错误")
+        yield kind, data[offset + header:offset + size]
+        offset += size
+
+
+def mp4_child(data, kind):
+    for name, payload in mp4_boxes(data):
+        if name == kind:
+            return payload
+    raise ZjuError(f"MP4 音轨索引缺少 {kind.decode('ascii', 'replace')}")
+
+
+def mp4_box(kind, data):
+    return struct.pack(">I4s", len(data) + 8, kind) + bytes(data)
+
+
+def mp4_ints(data, kind="I"):
+    result = array.array(kind)
+    if len(data) % result.itemsize:
+        raise ZjuError("MP4 音轨索引长度错误")
+    result.frombytes(data)
+    if sys.byteorder == "little":
+        result.byteswap()
+    return result
+
+
+class AudioIndex:
+    """紧凑数组保存音频偏移；保留第一条音轨，重建时移除视频索引。"""
+
+    def __init__(self, ftyp, moov, total):
+        self.ftyp = bytes(ftyp)
+        track = next((p for n, p in mp4_boxes(moov) if n == b"trak"
+                      and bytes(mp4_child(mp4_child(p, b"mdia"), b"hdlr")[8:12]) == b"soun"), None)
+        if track is None:
+            raise ZjuError("录播没有音轨")
+        self.moov = bytearray(mp4_box(b"mvhd", mp4_child(moov, b"mvhd")) + mp4_box(b"trak", track))
+        stbl = mp4_child(mp4_child(mp4_child(track, b"mdia"), b"minf"), b"stbl")
+        stsz = mp4_child(stbl, b"stsz")
+        if len(stsz) < 12:
+            raise ZjuError("MP4 音频样本索引截断")
+        constant, samples = struct.unpack_from(">II", stsz, 4)
+        sizes = mp4_ints(stsz[12:])
+        if (constant and len(sizes)) or (not constant and len(sizes) != samples):
+            raise ZjuError("MP4 音频样本数错误")
+        stsc = mp4_child(stbl, b"stsc")
+        offsets = next(((n, p) for n, p in mp4_boxes(stbl) if n in (b"stco", b"co64")), None)
+        if len(stsc) < 8 or offsets is None or len(offsets[1]) < 8:
+            raise ZjuError("MP4 音频分片索引缺失")
+        count, = struct.unpack_from(">I", stsc, 4)
+        sc = mp4_ints(stsc[8:])
+        name, co = offsets
+        self.starts = mp4_ints(co[8:], "I" if name == b"stco" else "Q")
+        if len(sc) != count * 3 or len(self.starts) != struct.unpack_from(">I", co, 4)[0]:
+            raise ZjuError("MP4 音频分片数错误")
+        if (not samples or not self.starts or not count or sc[0] != 1
+                or any(sc[i + 1] == 0 or sc[i + 2] == 0 or sc[i] > len(self.starts)
+                       or (i and sc[i] <= sc[i - 3]) for i in range(0, len(sc), 3))):
+            raise ZjuError("MP4 音轨索引无效（不支持分片 MP4）")
+        self.lengths, self.positions = array.array("Q"), array.array("Q")
+        self.size = sample = entry = 0
+        for i, offset in enumerate(self.starts, 1):
+            while entry + 3 < len(sc) and i >= sc[entry + 3]:
+                entry += 3
+            n = sc[entry + 1]
+            if sample + n > samples:
+                raise ZjuError("MP4 音频样本数不匹配")
+            length = constant * n if constant else sum(sizes[sample:sample + n])
+            if (not length or offset + length > total
+                    or (i > 1 and offset < self.starts[i - 2] + self.lengths[-1])):
+                raise ZjuError("MP4 音频范围越界或重叠")
+            self.positions.append(self.size)
+            self.lengths.append(length)
+            self.size += length
+            sample += n
+        if sample != samples:
+            raise ZjuError("MP4 音频样本未完整覆盖")
+
+    def groups(self):
+        # 每批最多 360 个音频分片；较长偏移自动缩小批次，避免 Range 头超过 8KiB。
+        first = count = 0
+        header_size = 6
+        for i, (start, length) in enumerate(zip(self.starts, self.lengths)):
+            size = len(f"{start}-{start + length - 1},")
+            if count and (count == 360 or header_size + size > 8000):
+                yield first, i
+                first, count, header_size = i, 0, 6
+            count += 1
+            header_size += size
+        if count:
+            yield first, len(self.starts)
+
+    def assemble(self, raw: Path, dest: Path):
+        start = len(self.ftyp) + len(self.moov) + 8 + 16
+
+        def rewrite(data):
+            for kind, payload in mp4_boxes(data):
+                if kind in (b"trak", b"mdia", b"minf", b"stbl"):
+                    rewrite(payload)
+                elif kind in (b"stco", b"co64"):
+                    width = "I" if kind == b"stco" else "Q"
+                    if width == "I" and start + self.positions[-1] >= 2**32:
+                        raise ZjuError("音轨过大，超出原 MP4 的 32 位索引范围")
+                    values = array.array(width, (start + p for p in self.positions))
+                    if sys.byteorder == "little":
+                        values.byteswap()
+                    payload[8:] = values.tobytes()
+
+        rewrite(self.moov)
+        with dest.open("wb") as out, raw.open("rb") as source:
+            out.write(self.ftyp)
+            out.write(mp4_box(b"moov", self.moov))
+            out.write(struct.pack(">I4sQ", 1, b"mdat", self.size + 16))
+            shutil.copyfileobj(source, out, 1 << 20)
+
+
+async def audio_parallel(items, jobs, fn):
+    """只创建 jobs 个协程，失败或中断时先停止所有请求再清理临时文件。"""
+    items = iter(items)
+
+    async def worker():
+        for item in items:
+            await fn(item)
+
+    tasks = [asyncio.create_task(worker()) for _ in range(jobs)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class AudioRanges:
+    def __init__(self, client, url):
+        self.client, self.url = client, url
+        self.total = None
+        self.validator = None
+        self.received = 0
+
+    async def get(self, ranges):
+        headers = {"Range": "bytes=" + ",".join(f"{a}-{b}" for a, b in ranges),
+                   "Accept-Encoding": "identity"}
+        if self.validator:
+            headers["If-Range"] = self.validator
+        for attempt in range(3):
+            try:
+                async with self.client.stream("GET", self.url, headers=headers) as r:
+                    if r.status_code != 206:
+                        raise ZjuError(f"音频范围请求失败 HTTP {r.status_code}（不下载整个视频）")
+                    if r.headers.get("Content-Encoding", "identity") != "identity":
+                        raise ZjuError("音频范围响应使用了压缩编码")
+                    if self.total is None:
+                        match = re.fullmatch(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range", ""))
+                        if not match:
+                            raise ZjuError("录播范围探测失败")
+                        self.total = int(match[1])
+                        etag = r.headers.get("ETag", "")
+                        self.validator = (etag if etag and not etag.startswith("W/")
+                                          else r.headers.get("Last-Modified"))
+                    elif self.validator:
+                        current = (r.headers.get("ETag") if self.validator.startswith('"')
+                                   else r.headers.get("Last-Modified"))
+                        if current and current != self.validator:
+                            raise ZjuError("录播在音频下载期间发生变化")
+                    maximum = sum(b - a + 1 for a, b in ranges) + len(ranges) * 1024 + 8192
+                    body = bytearray()
+                    async for block in r.aiter_bytes():
+                        self.received += len(block)
+                        if len(body) + len(block) > maximum:
+                            raise ZjuError("音频响应超过请求范围")
+                        body.extend(block)
+                    expected = dict(ranges)
+                    mime = r.headers.get("Content-Type", "")
+                    if len(ranges) == 1 and not mime.lower().startswith("multipart/byteranges"):
+                        a, b = ranges[0]
+                        if r.headers.get("Content-Range") != f"bytes {a}-{b}/{self.total}" or len(body) != b - a + 1:
+                            raise ZjuError("音频响应范围或长度错误")
+                        return bytes(body)
+                    match = re.search(r'boundary="?([^";\s]+)', mime, re.I)
+                    if not mime.lower().startswith("multipart/byteranges") or not match:
+                        raise ZjuError("服务器不支持音频多范围请求")
+                    boundary = match[1].encode()
+                    data = bytes(body)
+                    if data.startswith(b"\r\n"):
+                        data = data[2:]
+                    parts = data.split(b"\r\n--" + boundary)
+                    if not parts[0].startswith(b"--" + boundary + b"\r\n") or parts[-1].strip() != b"--":
+                        raise ZjuError("音频多范围响应边界错误")
+                    parts[0] = parts[0][len(boundary) + 4:]
+                    parsed = {}
+                    for part in parts[:-1]:
+                        if part.startswith(b"\r\n"):
+                            part = part[2:]
+                        head, separator, payload = part.partition(b"\r\n\r\n")
+                        match = re.search(br"Content-Range: bytes (\d+)-(\d+)/(\d+)\r?$", head, re.I | re.M)
+                        if not separator or not match:
+                            raise ZjuError("音频多范围响应头错误")
+                        a, b, total = map(int, match.groups())
+                        if a in parsed or expected.get(a) != b or total != self.total or len(payload) != b - a + 1:
+                            raise ZjuError("音频多范围响应不完整或越界")
+                        parsed[a] = payload
+                    if parsed.keys() != expected.keys():
+                        raise ZjuError("音频多范围响应缺少分片")
+                    return b"".join(parsed[a] for a, _ in ranges)
+            except (httpx.HTTPError, ZjuError) as e:
+                if attempt == 2:
+                    if isinstance(e, ZjuError):
+                        raise
+                    raise ZjuError(f"音频网络请求失败（{type(e).__name__}）") from e
+                await asyncio.sleep(0.5 * 2**attempt)
+
+
+async def download_audio_ranges(url: str, raw: Path, jobs: int, limit: int | None) -> AudioIndex:
+    # 不读取环境代理，也不回退；DNS 辅助线程最多两个，音频请求全部由协程处理。
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    async with httpx.AsyncClient(http2=False, trust_env=False, proxy=None, follow_redirects=True,
+                                 headers={"User-Agent": UA}, timeout=httpx.Timeout(60, connect=6),
+                                 limits=httpx.Limits(max_connections=jobs, max_keepalive_connections=jobs)) as client:
+        source = AudioRanges(client, url)
+        first = await source.get([(0, 15)])
+        offset, ftyp, moov = 0, None, None
+        for _ in range(128):
+            header = first if offset == 0 else await source.get([(offset, min(offset + 15, source.total - 1))])
+            if len(header) < 8:
+                raise ZjuError("录播文件头截断")
+            size, kind = struct.unpack_from(">I4s", header)
+            width = 8
+            if size == 1:
+                if len(header) < 16:
+                    raise ZjuError("录播扩展文件头截断")
+                size, = struct.unpack_from(">Q", header, 8)
+                width = 16
+            elif size == 0:
+                size = source.total - offset
+            if size < width or offset + size > source.total:
+                raise ZjuError("录播文件结构错误")
+            if kind == b"ftyp":
+                if size > 2**20:
+                    raise ZjuError("MP4 文件类型索引过大")
+                ftyp = await source.get([(offset, offset + size - 1)])
+            elif kind == b"moov":
+                if size > 128 * 2**20:
+                    raise ZjuError("MP4 索引超过 128MiB")
+                count = min(jobs, 8, max(1, size // 16))
+                step = (size + count - 1) // count
+                chunks = [None] * count
+
+                async def grab_index(i):
+                    chunks[i] = await source.get([(offset + i * step, min(offset + (i + 1) * step - 1, offset + size - 1))])
+
+                await audio_parallel(range(count), count, grab_index)
+                moov = b"".join(chunks)[width:]
+            if ftyp is not None and moov is not None:
+                break
+            offset += size
+            if offset >= source.total:
+                break
+        if ftyp is None or moov is None:
+            raise ZjuError("录播不是可索引的 MP4（不支持 HLS）")
+        index = AudioIndex(ftyp, moov, source.total)
+        del moov, chunks
+        if limit and index.size > limit:
+            raise TooBig(f"音频数据 {index.size / 2**20:.1f}MB")
+        completed = 0
+        started, next_report = time.monotonic(), 0
+        received_before = source.received
+        with raw.open("w+b") as f:
+            f.truncate(index.size)
+
+            async def grab_audio(group):
+                nonlocal completed, next_report
+                first, last = group
+                ranges = []
+                for i in range(first, last):
+                    a, b = index.starts[i], index.starts[i] + index.lengths[i] - 1
+                    if ranges and a == ranges[-1][1] + 1:
+                        ranges[-1] = ranges[-1][0], b
+                    else:
+                        ranges.append((a, b))
+                data = await source.get(ranges)
+                f.seek(index.positions[first])
+                f.write(data)
+                completed += len(data)
+                percent = completed * 100 // index.size
+                if percent >= next_report or completed == index.size:
+                    speed = (source.received - received_before) / 2**20 / max(time.monotonic() - started, 0.001)
+                    log(f"[音频进度] {percent}%  {completed / 2**20:.1f}/{index.size / 2**20:.1f}MB  {speed:.1f}MB/s")
+                    next_report = percent + 10
+
+            await audio_parallel(index.groups(), jobs, grab_audio)
+        return index
+
+
+def extract_audio(source: Path, dest: Path, raw: Path, limit: int | None = None):
+    """跳过本地视频轨，直接复制音频样本，不调用外部工具。"""
+    with source.open("rb") as video:
+        total = os.fstat(video.fileno()).st_size
+        offset, ftyp, moov = 0, None, None
+        for _ in range(128):
+            video.seek(offset)
+            header = video.read(16)
+            if len(header) < 8:
+                raise ZjuError("本地录播文件头截断")
+            size, kind = struct.unpack_from(">I4s", header)
+            width = 8
+            if size == 1:
+                if len(header) < 16:
+                    raise ZjuError("本地录播扩展文件头截断")
+                size, = struct.unpack_from(">Q", header, 8)
+                width = 16
+            elif size == 0:
+                size = total - offset
+            if size < width or offset + size > total:
+                raise ZjuError("本地录播文件结构错误")
+            if kind in (b"ftyp", b"moov"):
+                maximum = 2**20 if kind == b"ftyp" else 128 * 2**20
+                if size > maximum:
+                    raise ZjuError("本地 MP4 索引过大")
+                video.seek(offset)
+                data = video.read(size)
+                if len(data) != size:
+                    raise ZjuError("本地录播索引截断")
+                if kind == b"ftyp":
+                    ftyp = data
+                else:
+                    moov = data[width:]
+            if ftyp is not None and moov is not None:
+                break
+            offset += size
+            if offset >= total:
+                break
+        if ftyp is None or moov is None:
+            raise ZjuError("本地录播不是可索引的 MP4")
+        index = AudioIndex(ftyp, moov, total)
+        del moov, data
+        if limit and index.size > limit:
+            raise TooBig(f"音频数据 {index.size / 2**20:.1f}MB")
+        # 连续读小窗口，避免数十万次小 seek/read；内存不随视频大小增加。
+        window, window_start = memoryview(b""), 0
+        with raw.open("wb") as audio:
+            for start, length in zip(index.starts, index.lengths):
+                while length:
+                    if not (window_start <= start < window_start + len(window)):
+                        video.seek(start)
+                        window = memoryview(video.read(min(8 * 2**20, total - start)))
+                        window_start = start
+                        if not window:
+                            raise ZjuError("本地录播音频数据截断")
+                    count = min(length, window_start + len(window) - start)
+                    audio.write(window[start - window_start:start - window_start + count])
+                    start += count
+                    length -= count
+    index.assemble(raw, dest)
+
+
+def make_audio(url: str | None, video: Path | None, dest: Path, jobs: int = 32,
+               limit: int | None = None):
+    with download_lock(dest, "音频"), tempfile.TemporaryDirectory(prefix=".zju-audio-", dir=dest.parent) as temp:
+        temp = Path(temp)
+        raw, output = temp / "payload.bin", temp / "output.m4a"
+        if video is None:
+            if not url:
+                raise ZjuError("没有可下载的录播")
+            index = asyncio.run(download_audio_ranges(url, raw, jobs, limit))
+            index.assemble(raw, output)
+        else:
+            extract_audio(video, output, raw, limit)
+        if limit and output.stat().st_size > limit:
+            raise TooBig(f"音频 {output.stat().st_size / 2**20:.1f}MB")
+        os.replace(output, dest)
 
 
 def current_year(courses: list[dict]) -> list[dict]:
@@ -1518,6 +1920,8 @@ def cmd_classroom_sync(a):
                 print(f"[{status}] {dest.relative_to(root)}")
         if a.recordings:
             failed += recording_subs(z, a, root, subs)
+        if getattr(a, "audio", False):
+            failed += audio_subs(z, a, root, subs)
     else:
         # 主线程负责组织材料，worker 只下载单个文件或录播分片；避免嵌套线程池与 -j 倍增。
         # 转写、PPT、录播依次处理，整个同步复用同一线程池。
@@ -1538,6 +1942,8 @@ def cmd_classroom_sync(a):
                     log(f"[失败] PPT {s['course_name']} {s['sub_name']}: {e}")
             if a.recordings:
                 failed += recording_subs(z, a, root, subs, pool=pool)
+        if getattr(a, "audio", False):
+            failed += audio_subs(z, a, root, subs)
     log(f"{'预览' if a.dry_run else '同步完成'}：{len(subs)} 堂课，{'有失败' if failed else '无失败'}")
     if failed:
         sys.exit(2)
@@ -1629,6 +2035,95 @@ def transcript_one(z: Zju, a, root: Path, s: dict):
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"), encoding="utf-8")
     print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
+
+
+def cmd_audio(a):
+    z = Zju()
+    if audio_subs(z, a, Path(a.out).expanduser(), resolve_subs(z, a)):
+        sys.exit(2)
+
+
+def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
+    if not subs:
+        log("没有课堂")
+        return 0
+    man, catalogues = Manifest(root), {}
+    failed = completed = skipped = planned = unavailable = 0
+    limit = a.max_size * 2**20 if a.max_size else None
+
+    def complete(path, key):
+        rec = man.get(key)
+        return (path.is_file() and path.stat().st_size > 0
+                and (not rec or path.stat().st_size == rec.get("size")))
+
+    for s in subs:
+        cid, sid = s["course_id"], s["sub_id"]
+        course_dir = root / safe_name(f"{s['course_name']} ({cid})")
+        stem = f"{safe_name(s['sub_name'])} ({sid})"
+        video = material_path(course_dir, "录播", f"{stem}.mp4")
+        single = material_path(course_dir, "音频", f"{stem}.m4a")
+        if not a.force and complete(single, f"audio:{cid}:{sid}:1"):
+            skipped += 1
+            log(f"[跳过] {single.relative_to(root)}")
+            continue
+        if complete(video, f"video:{cid}:{sid}:1"):
+            sources = [(1, "", None, video)]
+        else:
+            try:
+                if cid not in catalogues:
+                    try:
+                        catalogues[cid] = z.video_catalogue(cid)
+                    except ZjuError as e:
+                        catalogues[cid] = e
+                catalogue = catalogues[cid]
+                if isinstance(catalogue, Exception):
+                    raise catalogue
+                if sid not in catalogue:
+                    raise ZjuError(f"录播目录缺少堂次 {sid}")
+                urls = catalogue[sid]
+                if not urls:
+                    unavailable += 1
+                    log(f"[无回放] {s['course_name']} {s['sub_name']}")
+                    continue
+                sources = []
+                for i, url in enumerate(urls, 1):
+                    suffix = f" - {i:02d}" if len(urls) > 1 else ""
+                    path = material_path(course_dir, "录播", f"{stem}{suffix}.mp4")
+                    sources.append((i, suffix, url, path if complete(path, f"video:{cid}:{sid}:{i}") else None))
+            except ZjuError as e:
+                failed += 1
+                log(f"[失败] 音频 {s['course_name']} {s['sub_name']}: {e}")
+                continue
+        for i, suffix, url, video in sources:
+            dest = material_path(course_dir, "音频", f"{stem}{suffix}.m4a")
+            key = f"audio:{cid}:{sid}:{i}"
+            if not a.force and complete(dest, key):
+                skipped += 1
+                log(f"[跳过] {dest.relative_to(root)}")
+                continue
+            action = "从录播提取" if video is not None else "下载音频"
+            if a.dry_run:
+                planned += 1
+                print(f"[会{action}] {dest.relative_to(root)}")
+                continue
+            try:
+                log(f"[{action}] {dest.relative_to(root)}")
+                make_audio(url, video, dest, a.jobs, limit)
+                man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
+                              "course_id": cid, "sub_id": sid,
+                              "source": "local" if video is not None else "remote",
+                              "at": dt.datetime.now().isoformat(timespec="seconds")})
+                completed += 1
+                print(f"[音频] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
+            except TooBig as e:
+                skipped += 1
+                log(f"[太大跳过] {dest.name}: {e}（--max-size 0 不限）")
+            except Exception as e:
+                failed += 1
+                log(f"[失败] {dest.name}: {e}")
+    count = f"待处理 {planned}" if a.dry_run else f"处理 {completed}"
+    log(f"{'预览' if a.dry_run else '音频完成'}：{count}、跳过 {skipped}、无回放 {unavailable}、失败 {failed}")
+    return failed
 
 
 def cmd_recording(a):
@@ -1800,22 +2295,23 @@ def main():
     y = cp.add_parser("day", help="列出某天或最近 N 天的个人课堂")
     y.add_argument("arg", nargs="?", help="日期 YYYY-MM-DD，默认今天")
     y.add_argument("--days", type=int)
-    y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播",
-                      description="所有文件及录播分片共享 -j 个 worker；默认下载 PPT 和 Markdown 转写。")
+    y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播、音频",
+                      description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写。")
     y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
     y.add_argument("-j", "--jobs", type=int, default=4, help="下载 worker 总数（默认 4）")
     y.add_argument("--recordings", action="store_true", help="同时下载录播 MP4（支持断点续传）")
+    y.add_argument("--audio", action="store_true", help="同时获取 M4A 音频；优先从已下载录播提取")
     y.add_argument("--dry-run", action="store_true", help="预览资料路径，不下载、不写文件")
     y.add_argument("--force", action="store_true", help="重新下载已有资料，丢弃录播分片进度")
     y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md）")
     y.add_argument("--dedup", action="store_true", help="合并 PPT 时去除重复截图")
     y.add_argument("--keep-images", action="store_true", help="保留全部 PPT 原始截图")
-    y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播单文件上限（默认 0 = 不限）")
+    y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播或音频单文件上限（默认 0 = 不限）")
     y.set_defaults(fn=cmd_classroom_sync)
 
-    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording)):
+    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording), ("audio", cmd_audio)):
         x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
-                                      "recording": "智云录播 → MP4"}[name])
+                                      "recording": "智云录播 → MP4", "audio": "智云录播音轨 → M4A"}[name])
         x.add_argument("--course", type=int, help="智云课堂 course_id（classroom courses / search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
         x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
@@ -1827,18 +2323,20 @@ def main():
         elif name == "transcript":
             x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
         else:
-            x.add_argument("--dry-run", action="store_true", help="只列出待下载录播")
+            x.add_argument("--dry-run", action="store_true", help="预览待处理音频" if name == "audio" else "只列出待下载录播")
             x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")
-            x.add_argument("-j", "--jobs", type=int, default=4, help="每堂录播的并行分片连接数（默认 4）")
-            x.description = "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。"
+            x.add_argument("-j", "--jobs", type=int, default=32 if name == "audio" else 4,
+                           help="音频并发请求数（默认 32 个协程）" if name == "audio" else "每堂录播的并行分片连接数（默认 4）")
+            x.description = ("优先从完整本地录播提取；否则只下载 MP4 音频范围。无需 ffmpeg，不重新编码。"
+                             if name == "audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
         x.set_defaults(fn=fn)
 
     a = p.parse_args()
     if a.cmd == "classroom" and a.action == "sync" and (a.jobs < 1 or a.max_size < 0):
         p.error("--jobs 必须 >= 1，--max-size 必须 >= 0")
-    if a.cmd == "recording" and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
+    if a.cmd in ("recording", "audio") and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
         p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
-    if a.cmd == "recording" and a.sub is not None and not a.course:
+    if a.cmd in ("recording", "audio") and a.sub is not None and not a.course:
         p.error("--sub 需要搭配 --course")
     try:
         a.fn(a)

@@ -21,13 +21,15 @@
 | `zju upload 檔案…` | 上傳檔案到學在浙大，印出 upload id |
 | `zju submit <作業id> --file … [--body …] [--draft] [-y]` | 交作業；預設送出前確認，已截止會擋下 |
 | `./zju.py classroom courses [--has-tasks] [--json]` | 智雲個人課程，顯示課程 ID、學期、教師與任務數 |
-| `./zju.py classroom sync [課程...] [-j 4] [--recordings]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播 |
+| `./zju.py classroom sync [課程...] [-j 4] [--recordings] [--audio]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播、音訊 |
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/转录/<堂>.txt\|srt\|md` |
 | `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
+| `./zju.py audio --course <id> \| --days N [-j 32]` | 優先從本地錄播提取音軌，否則只下載音訊 → `<課程> (<id>)/音频/<堂> (<sub_id>).m4a` |
+
 
 ## 安裝
 
@@ -39,7 +41,7 @@ ln -s "$PWD/zju-learning-cli/zju.py" ~/.local/bin/zju   # 或直接 ./zju.py
 zju login
 ```
 
-沒有 uv 的話：`pip install requests img2pdf pillow keyring numpy`，再用 `python zju.py ...` 執行。
+沒有 uv 的話：`pip install requests httpx img2pdf pillow keyring numpy`，再用 `python zju.py ...` 執行。
 
 也可以不開終端機，直接雙擊登入腳本（每次都會清掉上一次的學號、密碼和 cookie，重新登入）：
 
@@ -78,7 +80,7 @@ zju transcript --days 1 --format md
 
 ### 智雲課程同步
 
-預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recordings` 同時下載錄播。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。
+預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recordings` 同時下載錄播，`--audio` 同時取得音訊。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。音訊於這些步驟完成後處理，遠端音訊請求也遵循 `-j` 上限（同步預設 4）；單獨 `audio` 命令預設 32。搭配 `--recordings --audio` 時直接從剛下載的錄播提取音軌。
 
 沿用現有資料目錄與增量跳過規則，錄播繼續支援跨次執行的斷點續傳。`--force` 重新下載資料並丟棄錄播分片進度；`--format txt|srt|md` 選擇轉錄格式，`--dedup` 去除重複 PPT 截圖，`--keep-images` 保留全部截圖，`--max-size MB` 限制錄播單檔大小（0 為不限）。
 
@@ -92,7 +94,7 @@ zju transcript --days 1 --format md
 
 ### 智雲錄播下載
 
-預設列出智雲「我的課程」中的全部課程，包括任務數為 0 的課程；`--has-tasks` 只列任務數大於 0 的課程。任務數與網頁一致，不代表一定有可下載錄播。`--json` 輸出 `course_id`、`title`、`teacher`、`term`、`type` 與 `task_count`。這些課程 ID 可用於 `classroom subs`、`ppt`、`transcript` 與 `recording`；頂層 `courses` 列出的則是學在浙大的 ID。
+預設列出智雲「我的課程」中的全部課程，包括任務數為 0 的課程；`--has-tasks` 只列任務數大於 0 的課程。任務數與網頁一致，不代表一定有可下載錄播。`--json` 輸出 `course_id`、`title`、`teacher`、`term`、`type` 與 `task_count`。這些課程 ID 可用於 `classroom subs`、`ppt`、`transcript`、`recording` 與 `audio`；頂層 `courses` 列出的則是學在浙大的 ID。
 
 可直接執行 `./zju.py`，不必建立符號連結。使用智雲課程 ID（與學在浙大不同）：
 
@@ -118,6 +120,25 @@ zju transcript --days 1 --format md
 續傳前核對遠端 ETag（或 Last-Modified）、總長度與來源；遠端版本變更、本地進度損壞或資料檔缺失時重新下載。網址簽名參數更新不影響續傳，仍須通過遠端版本核對。伺服器不支援 Range 或無可用版本標記時，從頭下載。`--force` 明確丟棄已有分片並重抓；不加 `--force` 才沿用進度。課件、PPT 與轉錄下載行為不變。
 
 目錄接口及網址提取參考 Cold_Ink 的 [智云课堂批量下载](https://greasyfork.org/scripts/514465)（MIT）；本專案依實際接口相容字串與列表網址，使用 Python 串流分片下載。
+
+### 智雲音訊
+
+無需安裝 `ffmpeg` 或其他影音工具。程式直接讀取 MP4 索引、複製第一條音軌並重建 M4A，不重新編碼：
+
+```bash
+./zju.py audio --course 89418 --sub 2019095
+./zju.py audio --course 89418                  # 預設 32 個協程並行
+./zju.py audio --days 7 -j 8
+./zju.py audio --course 89418 --dry-run
+./zju.py classroom sync 89418 --audio -j 32
+./zju.py classroom sync 89418 --recordings --audio -j 8
+```
+
+優先使用輸出目錄中已完成的錄播，包含舊的 `錄播` 目錄；未完成的 `.part` 不算完整影片。沒有影片時，讀取遠端 MP4 索引並只下載音軌範圍。每批最多 360 個音訊分片，Range 請求頭接近 8KiB 時自動縮小批次。音軌範圍請求固定直連，不讀取環境代理，也不回退到代理。
+
+輸出為 `<輸出目錄>/<課程名稱> (<course_id>)/音频/<堂次名稱> (<sub_id>).m4a`，多段回放分別編號。已完成音訊會略過；`--force` 重新提取或下載，`--max-size MB` 限制最終音訊大小。成功後才原子替換輸出並更新清單，失敗或中斷會清理暫存資料，保留舊檔案；音訊暫不支援跨次執行的續傳。
+
+支援有完整音軌索引的直接 MP4；沒有音軌、HLS、分片 MP4或不支援多範圍請求的伺服器會報錯，不自動下載整個影片。本地提取不受遠端 Range 支援情況影響。
 
 ### 其他改進
 
