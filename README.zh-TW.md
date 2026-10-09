@@ -15,7 +15,7 @@
 | `zju sync [課程...]` | 增量同步課件到 `<輸出目錄>/<課程>/` |
 | `zju todo` | 待辦事項，依截止時間排序（本地時區） |
 | `zju activities [課程…] [--type forum homework …]` | 列出所有活動（課件、影片、作業、討論、網頁、連結、測驗），附狀態與截止時間 |
-| `zju show <活動id>` | 活動詳情：說明、附件、完成條件；作業顯示自己的提交狀態，討論顯示帖數 |
+| `zju show <活動id> [--read]` | 活動詳情：說明、附件、完成條件；作業顯示自己的提交狀態，討論顯示帖數；`--read` 下載附件並印出文字（docx/pptx/pdf/doc，貼圖標成 [图]） |
 | `zju forum list <討論id> [--mine] [--full]` / `forum read <topic>` | 列出討論帖／讀帖與回覆 |
 | `zju forum post <討論id> --title … --body …` / `forum reply <topic> --body …` | 發帖／回帖，可 `--body-file`、`--attach` 附件 |
 | `zju upload 檔案…` | 上傳檔案到學在浙大，印出 upload id |
@@ -24,7 +24,9 @@
 | `./zju.py classroom sync [課程...] [-j 4] [--recording] [--recording-audio]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播、音訊 |
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
-| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
+| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課，含追蹤中的課 |
+| `./zju.py classroom add\|rm <course_id>...` | 追蹤或移除課表外課程；`--days` 也包含追蹤課程，目錄為 `課名 老師 (課程ID)` |
+| `./zju.py classroom tracked` | 列出追蹤中的課程 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程> (<id>)/智云PPT/<堂> (<sub_id>).pdf` |
 | `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程> (<id>)/转录/<堂> (<sub_id>).txt\|srt\|md` |
 | `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |

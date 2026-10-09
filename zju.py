@@ -16,7 +16,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py sync [课程...] [--dry-run]     # 增量同步课程附件（含排程中的活动）
   zju.py todo                          # 待办
   zju.py activities [课程...] [--type forum homework ...]  # 所有活动（含测验）
-  zju.py show <活动id>                  # 活动详情；作业显示自己的提交状态
+  zju.py show <活动id> [--read]         # 活动详情；可读取附件文字
   zju.py forum list|read|post|reply ... # 讨论区
   zju.py upload 文件...                 # 上传，印 upload id
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
@@ -24,7 +24,9 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]  # PPT、转写及可选录播和音频
   zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
-  zju.py classroom day [日期] [--days N]
+  zju.py classroom day [日期] [--days N]  # 含追踪中的课
+  zju.py classroom add|rm <cid>...      # 追踪课表外的课
+  zju.py classroom tracked             # 列出追踪中的课
   zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
   zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
@@ -621,9 +623,11 @@ class Zju:
             for month in year.values():
                 for week in month.values():
                     for s in week:
+                        begin = int(s.get("class_begin") or 0)
                         subs.append({"course_id": course_id, "course_name": data["title"],
                                      "sub_id": int(s["id"]), "sub_name": s["sub_title"],
-                                     "lecturer": s.get("lecturer_name", ""), "show": s.get("show")})
+                                     "lecturer": s.get("lecturer_name", ""), "show": s.get("show"),
+                                     "day": dt.datetime.fromtimestamp(begin, CST).date() if begin else None})
         subs.sort(key=lambda s: s["sub_name"])
         return subs
 
@@ -1385,9 +1389,59 @@ ACT_TYPES = {
 
 
 def html_to_text(s: str | None) -> str:
-    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", s or "")
+    def link(m):  # 連結文字 ≠ 網址時兩個都留；網址前後補空白，免得黏在中文上
+        href, text = html.unescape(m.group(1)), re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        return f" {href} " if not text or html.unescape(text) == href else f"{text} ({href})"
+    s = re.sub(r"(?is)<a\b[^>]*?href=\"([^\"]+)\"[^>]*>(.*?)</a>", link, s or "")
+    s = re.sub(r"(?i)<img\b[^>]*?src=\"([^\"]+)\"[^>]*>", lambda m: f"[图 {urljoin(LMS, html.unescape(m.group(1)))}]", s)
+    s = re.sub(r"(?i)<li\b[^>]*>", "- ", s)
+    s = re.sub(r"(?i)</t[dh]>", "\t", s)
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h\d>", "\n", s)
     s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    s = re.sub(r"[ \t]+\n", "\n", re.sub(r"(?m)^- +", "- ", s))
     return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def doc_to_text(data: bytes) -> str | None:
+    """附件位元組 → 純文字；依檔頭判格式（預覽來源可能把 docx 換成 PDF）。不支援回 None。"""
+    if data[:4] == b"PK\x03\x04":
+        import zipfile, io
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = z.namelist()
+        if "word/document.xml" in names:
+            parts = ["word/document.xml"]
+            para, tag = r"</w:p>", r"<(?:w|m):t[^>]*>([^<]*)</(?:w|m):t>"  # m:t = 公式裡的字
+        else:
+            parts = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                           key=lambda n: int(re.search(r"\d+", n.rsplit("/", 1)[1]).group()))
+            para, tag = r"</a:p>", r"<a:t>([^<]*)</a:t>"
+        if not parts:
+            return None
+        out = []
+        for i, n in enumerate(parts):
+            xml = z.read(n).decode("utf-8", "replace")
+            lines = ["".join(re.findall(tag, p_)) + " [图]" * len(re.findall(r"<w:drawing>|<w:pict>", p_))
+                     for p_ in re.split(para, xml)]  # 公式常是貼圖，標出來免得以為漏字
+            txt = "\n".join(l for l in lines if l.strip())
+            out.append(f"--- 第 {i + 1} 页 ---\n{txt}" if len(parts) > 1 else txt)
+        return html.unescape("\n".join(out)).strip()
+    tool = None
+    if data[:5] == b"%PDF-" and shutil.which("pdftotext"):
+        tool = ["pdftotext", "-layout", "{f}", "-"]
+    elif data[:4] == b"\xd0\xcf\x11\xe0" and shutil.which("textutil"):  # 舊版 .doc，macOS 內建
+        tool = ["textutil", "-convert", "txt", "-stdout", "{f}"]
+    elif data[:5] == b"%PDF-" or data[:4] == b"\xd0\xcf\x11\xe0":
+        return None
+    else:
+        try:
+            return data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+        f.write(data)
+        f.flush()
+        r = subprocess.run([f.name if x == "{f}" else x for x in tool], capture_output=True)
+    return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else None
 
 
 def text_to_html(s: str) -> str:
@@ -1575,18 +1629,47 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> tuple[list[Path]
     return [paths[k] for k in keep], mapping
 
 
+def tracked_courses() -> dict[str, str]:
+    """config.json 的 tracked_courses：{智雲 course_id: 顯示名}。
+    申請聽課核准的課不在 get-my-course-day（只回課表），智雲也沒有「我的申請」清單 API，只能自己記。"""
+    return load_config().get("tracked_courses") or {}
+
+
+def range_subs(z: Zju, end: dt.date, days: int) -> list[tuple[dt.date, dict]]:
+    """end 往前 days 天：課表的課＋追蹤課程當天的堂次，依 sub_id 去重。"""
+    out, seen = [], set()
+    for i in range(days):
+        d = end - dt.timedelta(days=i)
+        for s in z.day_subs(d):
+            if s["sub_id"] not in seen:
+                seen.add(s["sub_id"])
+                out.append((d, s))
+    start = end - dt.timedelta(days=days - 1)
+    for cid, name in tracked_courses().items():
+        try:
+            subs = z.course_subs(int(cid))
+        except Exception as e:  # 一門壞掉不拖垮課表的課
+            log(f"[失败] 追踪课程 {cid} {name}: {e}")
+            continue
+        for s in subs:
+            if s["day"] and start <= s["day"] <= end and s["sub_id"] not in seen:
+                seen.add(s["sub_id"])
+                # 旁聽課常和自己那班同名同節次（別的老師開的同一門），不改名會寫進同一個資料夾而被當成已存在略過
+                out.append((s["day"], {**s, "course_name": name}))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
 def resolve_subs(z: Zju, a) -> list[dict]:
     if a.course:
         subs = z.course_subs(a.course)
+        name = tracked_courses().get(str(a.course))
+        if name:
+            subs = [{**s, "course_name": name} for s in subs]
         if a.sub:
             subs = [s for s in subs if s["sub_id"] in a.sub]
         return subs
-    days = a.days or 1
-    today = dt.date.today()
-    subs = []
-    for i in range(days):
-        subs += z.day_subs(today - dt.timedelta(days=i))
-    return subs
+    return [s for _, s in range_subs(z, dt.date.today(), a.days or 1)]
 
 
 # ---------------- commands ----------------
@@ -1759,6 +1842,15 @@ def cmd_show(a):
         print(f"\n{desc}\n")
     for u in x.get("uploads") or []:
         print(f"附件：{u.get('name')}  (upload {u.get('id')})")
+        if a.read:
+            try:
+                r, _ = z.upload_response(u["id"], u.get("reference_id") or u["id"], x)
+                txt = doc_to_text(r.content)
+            except ZjuError as e:
+                txt = f"（{e}）"
+            print(f"\n{txt or '（这种格式读不出文字，用 sync 下载后打开）'}\n")
+    if x.get("uploads") and not a.read and not desc:
+        print("（说明在附件里：加 --read 直接输出附件内容）")
     if t == "web_link" and d.get("link"):
         print(f"连结：{d['link']}")
     if t == "homework":
@@ -1885,7 +1977,7 @@ def cmd_classroom(a):
             print(f"{c['course_id']}\t{c['term']}\t{c['title']}\t{c['teacher']}\t{c['task_count']}")
     elif a.action == "search":
         for c in z.classroom_search(a.arg or "", a.teacher or ""):
-            print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}")
+            print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}\t{c.get('term_name', '')}")
     elif a.action == "subs":
         if not a.arg:
             raise ZjuError("用法：classroom subs <course_id>")
@@ -1893,10 +1985,27 @@ def cmd_classroom(a):
             print(f"{s['sub_id']}\t{s['sub_name']}\t{s['lecturer']}")
     elif a.action == "day":
         start = dt.date.fromisoformat(a.arg) if a.arg else dt.date.today()
-        for i in range(a.days or 1):
-            d = start - dt.timedelta(days=i)
-            for s in z.day_subs(d):
-                print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+        for d, s in range_subs(z, start, a.days or 1):
+            print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+    elif a.action in ("add", "rm"):
+        ids = [a.arg, *a.more] if a.arg else []
+        if not ids or not all(v.isdigit() for v in ids):
+            raise ZjuError(f"用法：classroom {a.action} <course_id>...（course_id 用 classroom search 查）")
+        cfg = load_config()
+        tracked = cfg.setdefault("tracked_courses", {})
+        for cid in ids:
+            if a.action == "rm":
+                name = tracked.pop(cid, None)
+                print(f"[移除] {cid} {name}" if name else f"[未追踪] {cid}")
+                continue
+            subs = z.course_subs(int(cid))  # 順便驗證 id 存在
+            name = f"{subs[0]['course_name']} {subs[0]['lecturer']}" if subs else cid
+            tracked[cid] = name
+            print(f"[追踪] {cid} {name}（{len(subs)} 堂）")
+        save_config(cfg)
+    elif a.action == "tracked":
+        for cid, name in tracked_courses().items():
+            print(f"{cid}\t{name}")
 
 
 def cmd_classroom_sync(a):
@@ -2299,6 +2408,7 @@ def main():
 
     x = sp.add_parser("show", help="单一活动详情（说明、附件、作业提交状态、讨论帖数）")
     x.add_argument("activity", type=int)
+    x.add_argument("--read", action="store_true", help="下载附件并输出文字（docx/pptx/pdf/doc/txt）")
     x.set_defaults(fn=cmd_show)
 
     def body_args(x):
@@ -2339,7 +2449,7 @@ def main():
     x.add_argument("-y", "--yes", action="store_true", help="不确认直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智云课堂：courses / sync / search / subs / day")
+    x = sp.add_parser("classroom", help="智云课堂：courses / sync / search / subs / day / add / rm / tracked")
     x.set_defaults(fn=cmd_classroom)
     cp = x.add_subparsers(dest="action", required=True)
     y = cp.add_parser("courses", help="列出全部个人课程及任务数")
@@ -2353,6 +2463,11 @@ def main():
     y = cp.add_parser("day", help="列出某天或最近 N 天的个人课堂")
     y.add_argument("arg", nargs="?", help="日期 YYYY-MM-DD，默认今天")
     y.add_argument("--days", type=int)
+    for action, help_text in (("add", "追踪课表外的课程"), ("rm", "移除追踪课程")):
+        y = cp.add_parser(action, help=help_text)
+        y.add_argument("arg", help="智云课程 ID（classroom search 查）")
+        y.add_argument("more", nargs="*", help="其他课程 ID")
+    cp.add_parser("tracked", help="列出追踪中的课程")
     y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播、音频",
                       description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写。")
     y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
@@ -2372,7 +2487,7 @@ def main():
                                       "recording": "智云录播 → MP4", "recording-audio": "智云录播音轨 → M4A"}[name])
         x.add_argument("--course", type=int, help="智云课堂 course_id（classroom courses / search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
-        x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天）")
+        x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天；含 classroom add 追踪的课）")
         x.add_argument("--force", action="store_true", help="已存在也重新下载")
         if name == "ppt":
             x.add_argument("--keep-images", action="store_true")
