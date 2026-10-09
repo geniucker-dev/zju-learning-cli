@@ -78,6 +78,14 @@ zju transcript --days 1 --format md
 
 ## 跟 ZLA 的差異
 
+### PPT 時間事件映射
+
+每堂 PPT 除 PDF 外也產生同名 `.json`，無論是否啟用 `--dedup` 都保留截圖事件。`events` 保存每張原始截圖的 `created_sec`、原始接口資料、圖片 SHA-256、對應 `pdf_page` 及代表它的 `representative_event_index`；`pages` 保存每頁的代表事件和全部關聯事件。事件編號從 0 開始，PDF 頁碼從 1 開始。
+
+動畫補全與翻回舊頁的事件仍保留，多個事件可對應同一 PDF 頁。`relationship: represented` 表示由保留頁面代表，不保證當時畫面完全相同；移除的空白過場標記為 `blank`，頁碼為 `null`。全部截圖為空白時沿用既有行為，全部輸出為 PDF 頁。缺少或無效時間為 `null`，不按頁碼或截圖間隔推算。時間是截圖觀測點，並非頁面顯示區間；與音軌起點的對齊尚未驗證（`audio_alignment: unverified`）。
+
+預設記錄原圖身份但不保存圖片；加 `--keep-images` 保留全部原圖，`image_file` 為相對 JSON 所在目錄的路徑。已有 PDF 缺少同名 JSON 時會重新產生該堂 PDF 並補建映射；兩者齊全才略過。`--force` 可重新產生 PDF 與映射。
+
 ### 智雲課程同步
 
 預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recording` 同時下載錄播，`--recording-audio` 同時取得音訊。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。音訊於這些步驟完成後處理，遠端音訊請求也遵循 `-j` 上限（同步預設 4）；單獨 `recording-audio` 命令預設 32。搭配 `--recording --recording-audio` 時直接從剛下載的錄播提取音軌。

@@ -66,7 +66,8 @@ class Offline(unittest.TestCase):
         subs = [{"course_id": 1, "sub_id": i, "course_name": "课程", "sub_name": f"第{i}堂"}
                 for i in range(1, 4)]
         client.course_subs.return_value = subs
-        client.ppt_urls.return_value = [f"https://example.com/{i}.png" for i in range(5)]
+        client.ppt_events.return_value = [dict(url=f"https://example.com/{i}.png", created_sec=i * 20,
+                                               source={"created_sec": i * 20}) for i in range(5)]
         client.video_catalogue.return_value = {i: [f"https://example.com/{i}.mp4"] for i in range(1, 4)}
         active = peak = 0
         lock = threading.Lock()
@@ -116,12 +117,16 @@ class Offline(unittest.TestCase):
                     self.assertEqual(len(list(root.rglob("*.md"))), 3)
                     self.assertEqual(len(list(root.rglob("*.mp4"))), 3)
                     self.assertEqual(download.call_count, 3)
+                    import json
+                    timeline = json.loads((root / "课程 (1)/智云PPT/第1堂 (1).json").read_text())
+                    self.assertEqual([e["pdf_page"] for e in timeline["events"]], [1, 2, 3, 4, 5])
+                    self.assertEqual([e["created_sec"] for e in timeline["events"]], [0, 20, 40, 60, 80])
                     self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00 → 00:00:02]** 转写内容  \n")
                     client.subtitle.reset_mock()
-                    client.ppt_urls.reset_mock()
+                    client.ppt_events.reset_mock()
                     zju.cmd_classroom_sync(args)
                     client.subtitle.assert_not_called()
-                    client.ppt_urls.assert_not_called()
+                    client.ppt_events.assert_not_called()
                     self.assertEqual(download.call_count, 3)
                 # 默认不下载录播；预览也不创建目录或调用材料下载。
                 args.out = str(Path(d) / "preview")
@@ -201,8 +206,9 @@ class Offline(unittest.TestCase):
                 p = Path(d) / f"{i:04d}.jpg"
                 im.save(p, quality=85)
                 paths.append(p)
-            kept = zju.dedup_slides(paths)
+            kept, mapping = zju.dedup_slides(paths)
         self.assertEqual([p.stem for p in kept], ["0001", "0004"])
+        self.assertEqual(mapping, [1, 1, 2, None, 2, 2, 1])
 
     def test_srt(self):
         out = zju.render_transcript([{"BeginSec": 61.5, "EndSec": 63, "Text": "你好"}], "srt", "t")

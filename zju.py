@@ -33,6 +33,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
 from __future__ import annotations
 
 import argparse
+import math
 import array
 import asyncio
 import datetime as dt
@@ -638,12 +639,10 @@ class Zju:
                              "sub_name": c["sub_title"], "lecturer": c.get("realname", "")})
         return subs
 
-    def ppt_urls(self, course_id: int, sub_id: int) -> list[str]:
-        """智云 PPT 截图。API 不守 per_page：常一页就回全部、下一页再重复一次
-        （ZLA 假设每页 ≤100 会在 >100 张时卡死重试）→ 按序去重，凑满 total 或遇到没新东西就停。"""
+    def ppt_events(self, course_id: int, sub_id: int) -> list[dict]:
+        """保留截图时间及原始元数据；只去除分页重复返回的同一事件。"""
         self.ensure(need_classroom=True)
-        urls: list[str] = []
-        seen: set[str] = set()
+        events, seen = [], set()
         page = 1
         while True:
             j = self.json(self.get("https://classroom.zju.edu.cn/pptnote/v1/schedule/search-ppt", params={
@@ -651,16 +650,28 @@ class Zju:
                 headers=self.bearer()), "search-ppt")
             total = int(j.get("total") or 0)
             added = 0
-            for p in j.get("list") or []:
-                u = json.loads(p["content"]).get("pptimgurl")
-                if u and u not in seen:
-                    seen.add(u)
-                    urls.append(u)
-                    added += 1
-            if len(urls) >= total or added == 0 or page >= 50:
-                if len(urls) < total:
-                    log(f"[注意] PPT 只拿到 {len(urls)}/{total} 张 course={course_id} sub={sub_id}")
-                return urls
+            for row in j.get("list") or []:
+                content = row["content"]
+                content = json.loads(content) if isinstance(content, str) else content
+                url = content.get("pptimgurl")
+                # 同一 URL 在不同时间出现仍是不同事件，不能按 URL 去重。
+                key = json.dumps(row, sort_keys=True, ensure_ascii=False)
+                if not url or key in seen:
+                    continue
+                seen.add(key)
+                sec = row.get("created_sec")
+                try:
+                    sec = float(sec) if sec is not None and sec != "" and not isinstance(sec, bool) else None
+                    if sec is not None and (not math.isfinite(sec) or sec < 0):
+                        sec = None
+                except (TypeError, ValueError):
+                    sec = None
+                events.append({"url": url, "created_sec": sec, "source": row})
+                added += 1
+            if len(events) >= total or added == 0 or page >= 50:
+                if len(events) < total:
+                    log(f"[注意] PPT 只拿到 {len(events)}/{total} 个截图事件 course={course_id} sub={sub_id}")
+                return events
             page += 1
 
     def subtitle(self, sub_id: int) -> list[dict]:
@@ -1502,7 +1513,7 @@ def images_to_pdf(paths: list[Path], pdf: Path):
         tmp.unlink(missing_ok=True)
 
 
-def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
+def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> tuple[list[Path], list[int | None]]:
     """智云截图去重。智云是对投影画面定时截图，同一页会因动画逐步出现、老师边讲边写、
     翻回前面而被截很多次。规则只有一条：一页的笔画若全都还在后面那页（或之前留下的某页）里，
     它就是多余的——所以连续的一串只留最后、最完整的一张，注记不会丢。
@@ -1518,7 +1529,7 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
 
     T, W, H = 40, 512, 288  # 灰阶门槛；解析度再低，细的手写笔迹就糊掉看不见了
     if len(paths) < 2:
-        return list(paths)
+        return list(paths), list(range(1, len(paths) + 1))
 
     def prep(p):
         with Image.open(p) as im:
@@ -1542,17 +1553,26 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
         return (gone.reshape(len(js), H // 8, 8, W // 8, 8).sum(axis=(2, 4)) >= 4).sum(axis=(1, 2))
 
     keep: list[int] = []
+    mapping: list[int | None] = [None] * len(paths)
     for j in range(len(frames)):
         if frames[j].std() < 3:  # 全黑 / 全白过场
             continue
         if keep and lost(keep[-1], [j])[0] <= max_lost_cells:
+            mapping[j] = len(keep)
             keep[-1] = j  # 前一张是这张的子集（动画没跑完、还没写完）→ 换成较完整的这张
             continue
         # 翻回讲过的页、擦掉注记的干净版；近乎空白的页什么都「包含得住」，不拿来比
-        if keep and masks[j].sum() >= 400 and (lost(j, keep) <= max_lost_cells).any():
-            continue
+        if keep and masks[j].sum() >= 400:
+            matches = np.flatnonzero(lost(j, keep) <= max_lost_cells)
+            if len(matches):
+                mapping[j] = int(matches[0]) + 1
+                continue
         keep.append(j)
-    return [paths[k] for k in keep] or list(paths)
+        mapping[j] = len(keep)
+    # 全为空白时沿用原有 PDF 行为：保留所有截图，因此它们仍有对应页面。
+    if not keep:
+        return list(paths), list(range(1, len(paths) + 1))
+    return [paths[k] for k in keep], mapping
 
 
 def resolve_subs(z: Zju, a) -> list[dict]:
@@ -1911,7 +1931,8 @@ def cmd_classroom_sync(a):
         for s in subs:
             for kind, suffix in (("智云PPT", "pdf"), ("转录", a.format)):
                 dest = classroom_material_path(root, s, kind, suffix)
-                status = "跳过" if dest.exists() and not a.force else "待检查并下载"
+                complete = dest.exists() and (kind != "智云PPT" or dest.with_suffix(".json").exists())
+                status = "跳过" if complete and not a.force else "待检查并下载"
                 print(f"[{status}] {dest.relative_to(root)}")
         if a.recording:
             failed += recording_subs(z, a, root, subs)
@@ -1965,11 +1986,14 @@ def cmd_ppt(a):
 def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = None):
     pdf = classroom_material_path(root, s, "智云PPT", "pdf")
     cdir = pdf.parent
-    if pdf.exists() and not a.force:
+    mapping_path = pdf.with_suffix(".json")
+    if pdf.exists() and mapping_path.exists() and not a.force:
         log(f"[跳过] {pdf.relative_to(root)}")
         return
-    urls = z.ppt_urls(s["course_id"], s["sub_id"])
-    if not urls:
+    if pdf.exists() and not mapping_path.exists():
+        log(f"[补建事件映射] {pdf.relative_to(root)}（重新生成 PDF 以保证页码对应）")
+    events = z.ppt_events(s["course_id"], s["sub_id"])
+    if not events:
         log(f"[无PPT] {s['course_name']} {s['sub_name']}")
         return
     tmpdir = Path(tempfile.mkdtemp(prefix="zju-ppt-"))
@@ -1986,19 +2010,53 @@ def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = No
             raise ZjuError(f"PPT 图下载失败：{u}")
 
         with (nullcontext(pool) if pool is not None else ThreadPoolExecutor(max_workers=8)) as pool:
-            futures = [pool.submit(grab, iu) for iu in enumerate(urls)]
+            futures = [pool.submit(grab, iu) for iu in enumerate(event["url"] for event in events)]
             try:
                 paths = [future.result() for future in futures]  # 保序 = 页序
             finally:
                 # 共享线程池仍在运行；删除临时目录前等所有截图任务结束。
                 wait(futures)
-        pages = dedup_slides(paths) if a.dedup else paths
+        pages, mapping = (dedup_slides(paths) if a.dedup
+                          else (paths, list(range(1, len(paths) + 1))))
+        indices = {path: i for i, path in enumerate(paths)}
+        representatives = [indices[path] for path in pages]
+        timeline = {
+            "schema_version": 1, "course_id": s["course_id"], "sub_id": s["sub_id"],
+            "pdf_file": pdf.name, "deduplicated": bool(a.dedup),
+            "time_field": "created_sec", "time_unit": "seconds",
+            "audio_alignment": "unverified", "timestamps_are": "observations",
+            "events": [], "pages": [],
+        }
+        for i, (event, path, page) in enumerate(zip(events, paths, mapping)):
+            representative = representatives[page - 1] if page is not None else None
+            timeline["events"].append({
+                "event_index": i, "created_sec": event["created_sec"], "source": event["source"],
+                "image_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "image_file": f"{pdf.stem}/{path.name}" if a.keep_images else None,
+                "pdf_page": page, "representative_event_index": representative,
+                "relationship": "blank" if page is None else "retained" if i == representative else "represented",
+            })
+        for page, representative in enumerate(representatives, 1):
+            timeline["pages"].append({"pdf_page": page, "representative_event_index": representative,
+                                      "event_indices": [i for i, p in enumerate(mapping) if p == page]})
         cdir.mkdir(parents=True, exist_ok=True)
+        # 移除旧映射，避免 PDF 更新后仍留下旧页码；失败时下次运行会重建。
+        mapping_path.unlink(missing_ok=True)
         images_to_pdf(pages, pdf)
         if a.keep_images:  # 留全部原图，去重只影响 PDF
             shutil.copytree(tmpdir, cdir / pdf.stem, dirs_exist_ok=True)
+        mapping_tmp = mapping_path.with_name(f".part-{mapping_path.name}")
+        try:
+            mapping_tmp.write_text(json.dumps(timeline, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(mapping_tmp, mapping_path)
+        finally:
+            mapping_tmp.unlink(missing_ok=True)
+        missing_times = sum(event["created_sec"] is None for event in events)
+        if missing_times:
+            log(f"[注意] {missing_times} 个截图事件无有效时间，映射中保留为 null")
         note = f"，去重前 {len(paths)}" if len(pages) != len(paths) else ""
         print(f"[PDF] {pdf.relative_to(root)}（{len(pages)} 页{note}）")
+        print(f"[PPT事件映射] {mapping_path.relative_to(root)}（{len(events)} 个事件）")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
