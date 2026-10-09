@@ -83,7 +83,7 @@ class Offline(unittest.TestCase):
                 with lock:
                     active -= 1
 
-        client.subtitle.side_effect = lambda sid: transfer([{"BeginSec": 0, "Text": "转写内容"}])
+        client.subtitle.side_effect = lambda sid: transfer([{"BeginSec": 0, "EndSec": 2, "Text": "转写内容"}])
         client.get.side_effect = lambda url: transfer(SimpleNamespace(ok=True, content=image.getvalue()))
         pools = []
 
@@ -116,7 +116,7 @@ class Offline(unittest.TestCase):
                     self.assertEqual(len(list(root.rglob("*.md"))), 3)
                     self.assertEqual(len(list(root.rglob("*.mp4"))), 3)
                     self.assertEqual(download.call_count, 3)
-                    self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00]** 转写内容  \n")
+                    self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00 → 00:00:02]** 转写内容  \n")
                     client.subtitle.reset_mock()
                     client.ppt_urls.reset_mock()
                     zju.cmd_classroom_sync(args)

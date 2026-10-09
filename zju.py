@@ -1431,7 +1431,8 @@ def render_transcript(items: list[dict], fmt: str, title: str) -> str:
     elif fmt == "md":
         lines.append(f"# {title}\n")
         for c in items:
-            lines.append(f"**[{fmt_ts(c.get('BeginSec', 0), False)}]** {c.get('Text', '')}  ")
+            lines.append(f"**[{fmt_ts(c.get('BeginSec', 0), False)} → "
+                         f"{fmt_ts(c.get('EndSec', 0), False)}]** {c.get('Text', '')}  ")
     else:
         for c in items:
             lines.append(f"[{fmt_ts(c.get('BeginSec', 0), False)}] {c.get('Text', '')}")
