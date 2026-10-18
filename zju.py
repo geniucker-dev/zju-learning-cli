@@ -16,7 +16,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py sync [课程...] [--dry-run]     # 增量同步课程附件（含排程中的活动）
   zju.py todo                          # 待办
   zju.py activities [课程...] [--type forum homework ...]  # 所有活动（含测验）
-  zju.py show <活动id> [--read]         # 活动详情；可读取附件文字
+  zju.py show <活动id> [--read]         # 活动详情；作业显示提交状态、讨论显示自己的发帖回帖；--read 印出附件文字
   zju.py forum list|read|post|reply ... # 讨论区
   zju.py upload 文件...                 # 上传，印 upload id
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
@@ -505,6 +505,25 @@ class Zju:
     def topic(self, tid: int) -> dict:
         self.ensure()
         return self.json(self.get(f"{LMS}/api/topics/{tid}"), "topic")
+
+    def my_forum_posts(self, aid: int) -> tuple[list[dict], list[tuple[dict, dict]]]:
+        """自己在某讨论活动的发帖与回帖（回帖附所属主帖）。回帖要逐帖抓详情，只抓有回复的帖。"""
+        uid = self.user_id()
+        ts = self.topics(self.forum_category(aid))
+        mine = [t for t in ts if (t.get("created_by") or {}).get("id") == uid]
+        replies = []
+
+        def walk(t, rs):
+            for r in rs or []:
+                if (r.get("created_by") or {}).get("id") == uid:
+                    replies.append((t, r))
+                walk(t, r.get("replies"))
+
+        with ThreadPoolExecutor(8) as ex:
+            for t in ex.map(lambda t: self.topic(t["id"]), [t for t in ts if t.get("reply_count")]):
+                walk(t, t.get("replies"))
+        replies.sort(key=lambda x: x[1].get("created_at") or "")
+        return mine, replies
 
     def upload_file(self, path: Path) -> dict:
         """两段式：先登记取得 upload_url，再依 storage_type 送档（学校目前是本地储存 multipart PUT）。"""
@@ -1868,20 +1887,36 @@ def cmd_show(a):
     elif t == "forum":
         ts = z.topics(z.forum_category(x["id"]))
         print(f"讨论帖 {len(ts)} 则（forum list {x['id']} 看全部）")
+        mine, replies = z.my_forum_posts(x["id"])
+        if not mine and not replies:
+            print("我的参与：尚未发帖或回帖")
+        else:
+            print(f"我的参与：发帖 {len(mine)}、回帖 {len(replies)}")
+            for p in mine:
+                print(f"  - 发帖 {local_time(p.get('created_at'), '%Y-%m-%d %H:%M')}"
+                      f"　{p.get('title', '')}  (topic {p['id']})")
+            for tp, r in replies:
+                print(f"  - 回帖 {local_time(r.get('created_at'), '%Y-%m-%d %H:%M')}"
+                      f"　→ {tp.get('title', '')}  (topic {tp['id']})")
 
 
 def cmd_forum(a):
     z = Zju()
     if a.action == "list":
-        uid = z.user_id() if a.mine else None
-        for t in z.topics(z.forum_category(a.id)):
+        if a.mine:
+            ts, replies = z.my_forum_posts(a.id)
+        else:
+            ts, replies = z.topics(z.forum_category(a.id)), []
+        for t in ts:
             by = t.get("created_by") or {}
-            if uid and by.get("id") != uid:
-                continue
             print(f"{t['id']}\t{local_time(t.get('created_at'))}\t{by.get('name', '')}\t"
                   f"回复 {t.get('reply_count', 0)}\t{t.get('title', '')}")
             if a.full:
                 print("  " + html_to_text(t.get("content")).replace("\n", "\n  "))
+        for tp, r in replies:
+            print(f"{tp['id']}\t{local_time(r.get('created_at'))}\t(回帖)\t\t→ {tp.get('title', '')}")
+            if a.full:
+                print("  " + html_to_text(r.get("content")).replace("\n", "\n  "))
     elif a.action == "read":
         t = z.topic(a.id)
         by = t.get("created_by") or {}
@@ -2421,7 +2456,7 @@ def main():
     fp = x.add_subparsers(dest="action", required=True)
     y = fp.add_parser("list", help="列出讨论帖（给讨论活动 id）")
     y.add_argument("id", type=int, help="讨论活动 id（activities --type forum 查）")
-    y.add_argument("--mine", action="store_true", help="只看自己发的")
+    y.add_argument("--mine", action="store_true", help="只看自己的发帖与回帖")
     y.add_argument("--full", action="store_true", help="连内文一起印")
     y = fp.add_parser("read", help="读一则帖子与回复")
     y.add_argument("id", type=int, help="topic id")
