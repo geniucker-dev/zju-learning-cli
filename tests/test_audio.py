@@ -558,7 +558,9 @@ class AudioCommands(unittest.TestCase):
                     mock.patch.object(zju, "audio_subs", return_value=0) as audio:
                 zju.cmd_classroom_sync(args)
                 self.assertEqual(audio.call_args.args[1].jobs, 3)
+                self.assertTrue((root / "课程 (1)/course.json").is_file())
+                args.out = str(root / "preview")
                 args.dry_run = True
                 zju.cmd_classroom_sync(args)
                 self.assertTrue(audio.call_args.args[1].dry_run)
-                self.assertFalse(root.exists())
+                self.assertFalse(Path(args.out).exists())

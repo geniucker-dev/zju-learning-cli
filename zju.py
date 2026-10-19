@@ -796,6 +796,165 @@ class Manifest:
         os.replace(tmp, self.path)
 
 
+def atomic_text(path: Path, text: str):
+    fd, name = tempfile.mkstemp(prefix=".part-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+def valid_course_material(path: Path, kind: str, cid: int, sid: int, recorded: dict | None) -> bool:
+    """只检查最终文件：文本/JSON、PDF 结束标记、MP4 顶层边界及已记录大小，不解码媒体。"""
+    size = path.stat().st_size
+    if not size or (recorded is not None and size != recorded.get("size")):
+        return False
+    if kind == "transcripts":
+        try:
+            return bool(path.read_text(encoding="utf-8").strip())
+        except UnicodeError:
+            return False
+    if kind == "ppt_events":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return (isinstance(data, dict) and data.get("schema_version") == 1
+                    and data.get("course_id") == cid and data.get("sub_id") == sid
+                    and data.get("pdf_file") == path.with_suffix(".pdf").name
+                    and isinstance(data.get("events"), list) and isinstance(data.get("pages"), list))
+        except (ValueError, UnicodeError):
+            return False
+    with path.open("rb") as f:
+        if kind == "ppt_pdfs":
+            if f.read(5) != b"%PDF-":
+                return False
+            f.seek(max(0, size - 1024))
+            return b"%%EOF" in f.read()
+        offset, boxes = 0, set()
+        for _ in range(128):
+            f.seek(offset)
+            header = f.read(16)
+            if len(header) < 8:
+                return False
+            length, name = struct.unpack_from(">I4s", header)
+            width = 8
+            if length == 1:
+                if len(header) < 16:
+                    return False
+                length, = struct.unpack_from(">Q", header, 8)
+                width = 16
+            elif length == 0:
+                length = size - offset
+            if length < width or offset + length > size or (offset == 0 and name != b"ftyp"):
+                return False
+            boxes.add(name)
+            offset += length
+            if offset == size:
+                return {b"ftyp", b"moov", b"mdat"} <= boxes
+    return False
+
+
+def course_materials(directory: Path, cid: int, records: dict) -> dict:
+    materials = {}
+    kinds = {"转录": ("transcripts", {"md", "txt", "srt"}),
+             "智云PPT": (None, {"pdf", "json"}), "音频": ("audio", {"m4a"}),
+             "录播": ("recordings", {"mp4"})}
+    for folder, (kind, extensions) in kinds.items():
+        parent = directory / folder
+        if not parent.exists():
+            continue
+        for path in sorted(parent.iterdir()):
+            match = re.fullmatch(r".+ \((\d+)\)(?: - (\d{2,}))?\.([a-z0-9]+)", path.name)
+            if (path.name.startswith(".") or not match or not path.is_file()
+                    or path.suffix[1:] not in extensions):
+                continue
+            # 不把课程外的符号链接写成随课程目录可移动的资料。
+            try:
+                path.resolve().relative_to(directory.resolve())
+            except ValueError:
+                continue
+            sid, part, extension = int(match[1]), int(match[2] or 1), match[3]
+            selected_kind = kind or ("ppt_pdfs" if extension == "pdf" else "ppt_events")
+            if part < 1 or (match[2] and selected_kind not in ("audio", "recordings")):
+                continue
+            recorded = records.get(path.relative_to(directory.parent).as_posix())
+            if not valid_course_material(path, selected_kind, cid, sid, recorded):
+                continue
+            item = {"path": path.relative_to(directory).as_posix()}
+            if selected_kind == "transcripts":
+                item["format"] = extension
+            elif selected_kind in ("audio", "recordings"):
+                item["part"] = part
+            materials.setdefault(sid, {}).setdefault(selected_kind, []).append(item)
+    for files in materials.values():
+        pdfs = {Path(item["path"]).with_suffix(".json").as_posix() for item in files.get("ppt_pdfs", [])}
+        if "ppt_events" in files:
+            files["ppt_events"] = [item for item in files["ppt_events"] if item["path"] in pdfs]
+        for items in files.values():
+            items.sort(key=lambda item: (item.get("part", 0), item["path"]))
+    return materials
+
+
+def write_course_metadata(root: Path, course: dict, subs: list[dict] | None):
+    """接口遗漏不代表删除；每个现有课程目录只引用自身资料，名称变化时不搬动文件。"""
+    cid = course["course_id"]
+    directories = {classroom_material_path(root, s, "转录", "md").parent.parent for s in subs or []}
+    if root.exists():
+        directories.update(p for p in root.iterdir() if p.is_dir() and p.name.endswith(f" ({cid})"))
+    if not directories:
+        directories.add(root / safe_name(f"{course['title']} ({cid})"))
+    manifest = Manifest(root).data
+    if not isinstance(manifest, dict):
+        raise ZjuError(".zju_manifest.json 必须是 JSON 对象，课程元数据未更新")
+    records = {value["path"].replace("\\", "/"): value for key, value in manifest.items()
+               if key.startswith((f"audio:{cid}:", f"video:{cid}:")) and isinstance(value, dict)
+               and isinstance(value.get("path"), str)}
+    for directory in sorted(directories):
+        out = directory / "course.json"
+        with download_lock(out, "课程元数据"):
+            old = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
+            if not isinstance(old, dict) or (old and (
+                    old.get("schema_version") != 1 or old.get("source") != "zju-classroom"
+                    or old.get("course_id") != cid)):
+                raise ZjuError(f"课程元数据身份或版本不符，未覆盖：{out}")
+            now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            data = {"schema_version": 1, "source": "zju-classroom", "course_id": cid,
+                    "updated_at": now, "lessons_fetch_status": "ok" if subs is not None else "error"}
+            for target, source in (("name", "title"), ("teacher", "teacher"), ("term", "term"), ("type", "type")):
+                data[target] = course.get(source) or old.get(target)
+            data["task_count"] = course.get("task_count", old.get("task_count"))
+            data["lessons_checked_at"] = now if subs is not None else old.get("lessons_checked_at")
+            lessons = {}
+            for lesson in old.get("lessons", []):
+                if not isinstance(lesson, dict) or not isinstance(lesson.get("sub_id"), int):
+                    raise ZjuError(f"课程堂次元数据格式错误，未覆盖：{out}")
+                # 只保留白名单字段，文件引用每次从磁盘重新核对。
+                lessons[lesson["sub_id"]] = {k: lesson.get(k) for k in
+                    ("sub_id", "name", "date", "lecturer", "availability", "last_seen_at")}
+            for s in subs or []:
+                lesson = lessons.setdefault(s["sub_id"], {"sub_id": s["sub_id"]})
+                for target, source in (("name", "sub_name"), ("date", "day"), ("lecturer", "lecturer")):
+                    value = s.get(source)
+                    if value is not None and value != "":
+                        lesson[target] = value.isoformat() if isinstance(value, dt.date) else value
+                if s.get("show") in ("yes", "no"):
+                    lesson["availability"] = "listed" if s["show"] == "yes" else "unlisted"
+                lesson["last_seen_at"] = now
+            materials = course_materials(directory, cid, records)
+            for sid in materials:
+                lessons.setdefault(sid, {"sub_id": sid})
+            for sid, lesson in lessons.items():
+                for key in ("name", "date", "lecturer", "last_seen_at"):
+                    lesson.setdefault(key, None)
+                lesson["availability"] = lesson.get("availability") or "unknown"
+                lesson["files"] = {kind: materials.get(sid, {}).get(kind, []) for kind in
+                                   ("transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings")}
+            data["lessons"] = sorted(lessons.values(), key=lambda s: (s["date"] or "9999", s["sub_id"]))
+            atomic_text(out, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            log(f"[课程元数据] {out}")
+
+
 def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4: bool = False) -> Path:
     """写暂存档再 rename；验证长度、拒收空档和错误页，免得坏档被记进 manifest 后永远不再重新下载。"""
     expected = r.headers.get("Content-Length")
@@ -2202,13 +2361,16 @@ def cmd_classroom_sync(a):
             selected.extend(matched)
         courses = list({c["course_id"]: c for c in selected}.values())
     root = Path(a.out).expanduser()
-    failed, subs, seen = 0, [], set()
+    failed, subs, seen, details = 0, [], set(), {}
     for c in courses:
         if c["type"] != "multi":
             log(f"[跳过] {c['title']}：课程类型 {c['type']} 不支持课堂资料同步")
             continue
+        details[c["course_id"]] = None
         try:
-            for s in z.course_subs(c["course_id"]):
+            rows = z.course_subs(c["course_id"])
+            details[c["course_id"]] = rows
+            for s in rows:
                 key = (s["course_id"], s["sub_id"])
                 if key not in seen:
                     seen.add(key)
@@ -2250,6 +2412,14 @@ def cmd_classroom_sync(a):
                 failed += recording_subs(z, a, root, subs, pool=pool)
         if getattr(a, "recording_audio", False):
             failed += audio_subs(z, a, root, subs)
+        for c in courses:
+            if c["course_id"] not in details:
+                continue
+            try:
+                write_course_metadata(root, c, details[c["course_id"]])
+            except Exception as e:
+                failed += 1
+                log(f"[失败] 课程元数据 {c['title']}: {e}")
     log(f"{'预览' if a.dry_run else '同步完成'}：{len(subs)} 堂课，{'有失败' if failed else '无失败'}")
     if failed:
         sys.exit(2)
@@ -2376,7 +2546,7 @@ def transcript_one(z: Zju, a, root: Path, s: dict):
         log(f"[无转录] {s['course_name']} {s['sub_name']}")
         return
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"), encoding="utf-8")
+    atomic_text(out, render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"))
     print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
 
 
@@ -3610,7 +3780,7 @@ def main():
         y.add_argument("more", nargs="*", help="其他课程 ID")
     cp.add_parser("tracked", help="列出追踪中的课程")
     y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播、音频",
-                      description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写。")
+                      description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写，并维护课程目录下的 course.json。")
     y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
     y.add_argument("-j", "--jobs", type=int, default=4, help="下载 worker 总数（默认 4）")
     y.add_argument("--recording", action="store_true", help="同时下载录播 MP4（支持断点续传）")

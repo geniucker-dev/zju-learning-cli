@@ -99,6 +99,41 @@ zju transcript --days 1 --format md
 
 `--dry-run` 不下載、不寫檔：PPT 與轉錄依現有檔案及堂次預覽路徑，標記為待檢查的資料可能尚未發布；錄播讀取目錄後預覽。單項失敗仍繼續處理其他資料，最終退出碼為 2。
 
+每次非預覽同步都會在 `<out>/<課程名稱> (<course_id>)/course.json` 原子更新課程中繼資料；即使資料全部增量略過，也會替既有目錄補建。它重用本次查詢的課程與堂次資訊，不額外請求 API，不改變資料配置。精簡範例（其他資料陣列可為空）：
+
+```json
+{
+  "schema_version": 1,
+  "source": "zju-classroom",
+  "course_id": 123,
+  "name": "範例課程",
+  "teacher": "教師",
+  "term": "2026秋",
+  "updated_at": "2026-10-20T02:00:00+00:00",
+  "lessons_fetch_status": "ok",
+  "lessons_checked_at": "2026-10-20T02:00:00+00:00",
+  "lessons": [{
+    "sub_id": 456,
+    "name": "第一堂",
+    "date": "2026-10-01",
+    "lecturer": "授課教師",
+    "availability": "listed",
+    "last_seen_at": "2026-10-20T02:00:00+00:00",
+    "files": {
+      "transcripts": [{"format": "md", "path": "转录/第一堂 (456).md"}],
+      "ppt_pdfs": [{"path": "智云PPT/第一堂 (456).pdf"}],
+      "ppt_events": [{"path": "智云PPT/第一堂 (456).json"}],
+      "audio": [{"part": 1, "path": "音频/第一堂 (456) - 01.m4a"}],
+      "recordings": []
+    }
+  }]
+}
+```
+
+所有資料路徑相對於 `course.json`，移動整個課程目錄後仍可使用。`type`、`task_count` 也會記錄既有課程資訊；未知資訊為 `null`。`availability` 僅表示接口的上架狀態：`listed` / `unlisted` / `unknown`，不表示一定有錄播或轉錄。`last_seen_at` 表示最後一次從堂次 API 看到該堂次的時間。本次遺漏的舊堂次繼續保留；堂次查詢失敗時保留舊資訊，`lessons_fetch_status` 為 `error`，`lessons_checked_at` 保留上次成功時間。下載部分失敗仍核對既有檔案，不把失敗當作下架。課程或堂次改名不移動舊檔，舊課程目錄也會更新中繼資料，各目錄僅引用自身資料。
+
+檔案引用包含目錄內既有的所有支援格式，與本次是否啟用影音下載無關；多段影音逐項記錄從 1 開始的 `part`。僅列出非空且通過格式檢查的最終檔案，並核對既有影音清單大小；PDF 事件 JSON 還需有有效的配套 PDF。未完成檔、暫存檔、缺失或明顯損壞的檔案不列入，也不保存憑證或播放網址。檢查不進行整段媒體解碼，無法保證發現任意媒體內容損壞。`course.json` 使用獨立寫鎖與原子替換，寫入失敗保留舊版；已有中繼資料損壞或身份不符時回報失敗並保留原檔，供使用者檢查。`.zju_manifest.json` 的下載狀態管理保持不變。`--dry-run` 不建立或更新中繼資料。
+
 Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23 → 00:01:38]** 內容`，精確到秒；SRT 精確到毫秒。已有 `.md` 仍會略過，不自動升級；使用獨立 `transcript --format md --force` 重新產生，可避免重抓 PPT、錄播與音軌。
 
 接口標記為已下架（`show: "no"`）的堂次，錄播與音軌會顯示「已下架，跳過」，不計為失敗；PPT 與轉錄仍按資料可用性處理。
