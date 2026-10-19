@@ -2527,7 +2527,7 @@ def recording_frame_times(a):
 
 
 class FrameRangeReader(io.RawIOBase):
-    """PyAV 自定义同步 IO；1MiB 相邻读取合并，最多缓存 8MiB。
+    """PyAV 自定义 IO：1MiB 块，已确认的 moov 索引最多合并 4 块，缓存 8MiB。
 
     独立无凭据客户端，直连，不继承学校 Cookie、认证或环境代理。
     不跟随重定向，避免把签名查询或未来加入的凭据转发到其他主机。
@@ -2663,10 +2663,7 @@ class FrameRangeReader(io.RawIOBase):
             while len(result) < size:
                 base = self.position // self.block_size * self.block_size
                 if base not in self.cache:
-                    data = self._fetch(base, min(base + self.block_size, self.total) - 1)
-                    self.cache[base] = data
-                    while len(self.cache) > self.cache_size // self.block_size:
-                        self.cache.popitem(last=False)
+                    self._cache_blocks(base)
                 data = self.cache[base]
                 self.cache.move_to_end(base)
                 offset = self.position - base
@@ -2679,6 +2676,47 @@ class FrameRangeReader(io.RawIOBase):
             # libavformat 可能忽略回调异常并重复读取；EOF 后在 Python 边界重抛，
             # 防止其继续请求、重复打印底层 traceback 或用不完整结果成功返回。
             return b""
+
+    def _cache_blocks(self, base):
+        end = min(base + self.block_size, self.total)
+        moov = getattr(self, "_moov_range", None)
+        if moov and moov[0] <= base < moov[1]:
+            # 仅合并已知索引的连续块，媒体仍按 1MiB 随机读取；不越过
+            # 原本逐块读取的对齐边界。预算不足时退回单块，避免提前耗尽预算。
+            blocks = min(4, max(1, self.cache_size // self.block_size))
+            upper = min(base + blocks * self.block_size, self.total,
+                        ((moov[1] + self.block_size - 1) // self.block_size) * self.block_size)
+            for cached_base in range(base + self.block_size, upper, self.block_size):
+                if cached_base in self.cache:
+                    upper = cached_base
+                    break
+            if self.bytes_received + upper - base <= self.max_bytes:
+                end = upper
+        data = self._fetch(base, end - 1)
+        # 从已确认的顶层 box 边界行走，不在媒体中搜索 "moov" 字符串。
+        # mdat 后的 moov 也可识别；头部不足或损坏时保持原逐块读取行为。
+        offset = getattr(self, "_next_box", 0)
+        while base <= offset and offset + 8 <= base + len(data):
+            pos = offset - base
+            size, kind = int.from_bytes(data[pos:pos + 4], "big"), data[pos + 4:pos + 8]
+            header = 8
+            if size == 1:
+                if pos + 16 > len(data):
+                    break
+                size, header = int.from_bytes(data[pos + 8:pos + 16], "big"), 16
+            if size == 0:
+                size = self.total - offset
+            if size < header or offset + size > self.total:
+                break
+            if kind == b"moov":
+                self._moov_range = offset, offset + size
+                break
+            offset += size
+            self._next_box = offset
+        for pos in range(0, len(data), self.block_size):
+            self.cache[base + pos] = data[pos:pos + self.block_size]
+            while len(self.cache) > self.cache_size // self.block_size:
+                self.cache.popitem(last=False)
 
     def close(self):
         if not self.closed:

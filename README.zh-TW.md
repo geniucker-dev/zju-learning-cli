@@ -196,7 +196,7 @@ Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23 → 00:01
 
 `--json` 回傳單一物件，單張與批次結構相同。`frames[]` 包含 `requested_time_sec`、`actual_time_sec`、`path` / `output_path`、`cache_hit` 及上述影格資料。請求層級有 `temporary`、`output_dir`（逐張路徑模式為 null）、`frame_count`、`network.requests`、`network.bytes_received`、`elapsed_sec` 及解碼統計。所有圖片路徑可直接讀取。診斷寫入 stderr，失敗回傳非零退出碼。網路統計只計媒體 HTTP 回應本文，不含登入/API 請求或 HTTP 標頭；耗時從提取開始計算，不含課程查詢與登入。
 
-遠端固定直連，預設嚴格限制 **64 MiB**，索引、重複讀取與失敗重試均計入；以 `--max-fetch-mb 128` 調整，不允許無上限。1 MiB 區塊合併相鄰讀取，讀取快取最多 8 MiB，不把完整 MP4 放入記憶體。只接受正確的 206 / Content-Range、長度及一致的強 ETag 或 Last-Modified；200、授權失敗、重新導向、沒有版本標識/固定 Content-Length 或影片變更都報錯，不退回完整下載。支援 moov 位於頭部或尾部的普通 MP4；HLS、直播、缺少時長/索引或 wheel 不支援的編碼會報錯。長 GOP 或大索引可能需提高流量上限。
+遠端固定直連，預設嚴格限制 **64 MiB**，索引、重複讀取與失敗重試均計入；以 `--max-fetch-mb 128` 調整，不允許無上限。媒體以 1 MiB 區塊隨機讀取；已確認的 moov 索引範圍內最多合併 4 塊請求，預算不足時使用單塊；讀取快取最多 8 MiB，不把完整 MP4 放入記憶體。只接受正確的 206 / Content-Range、長度及一致的強 ETag 或 Last-Modified；200、授權失敗、重新導向、沒有版本標識/固定 Content-Length 或影片變更都報錯，不退回完整下載。支援 moov 位於頭部或尾部的普通 MP4；HLS、直播、缺少時長/索引或 wheel 不支援的編碼會報錯。長 GOP 或大索引可能需提高流量上限。
 
 目前不持久快取影片索引或 Range 資料；不同呼叫的新時間點仍需讀取索引。預設只保留本次有界記憶體讀取快取，不額外建立媒體快取目錄。
 

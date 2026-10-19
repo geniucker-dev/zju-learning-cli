@@ -196,7 +196,7 @@ Markdown 转写的每段带开始和结束时间，例如 `**[00:01:23 → 00:01
 
 `--json` 返回一个对象，单帧与多帧结构相同：`frames[]` 含 `requested_time_sec`、`actual_time_sec`、`path` / `output_path`、`cache_hit` 及上述图片元数据；请求级字段含 `temporary`、`output_dir`（逐帧路径模式为 null）、`frame_count`、`network.requests`、`network.bytes_received`、`elapsed_sec` 和解码统计。所有路径可直接供 Agent 读取。诊断写入 stderr，失败返回非零退出码。网络统计只计媒体 HTTP 响应体，不含认证/API 请求或 HTTP 头；耗时从提取开始计算，不含课程查询与登录。
 
-远端默认直连，严格限量 **64 MiB**（索引、重复读取及失败重试均计入），可用 `--max-fetch-mb 128` 调整，不允许无上限。1 MiB 读取块合并相邻数据，内存读取缓存最多 8 MiB；不会把完整 MP4 放进内存。只接受正确的 206 / Content-Range、长度和一致的强 ETag 或 Last-Modified。200、鉴权失败、重定向、缺少版本标识/固定 Content-Length 或源文件变化均报错，不退回整文件下载。支持 moov 位于文件头或尾的普通 MP4；HLS、直播、缺少时长/索引或 wheel 不支持的编码会报错。较长 GOP 或很大的索引可能需要调大流量上限。
+远端默认直连，严格限量 **64 MiB**（索引、重复读取及失败重试均计入），可用 `--max-fetch-mb 128` 调整，不允许无上限。媒体按 1 MiB 块随机读取；已确认的 moov 索引范围内最多合并 4 块请求，预算不足时使用单块；内存读取缓存最多 8 MiB；不会把完整 MP4 放进内存。只接受正确的 206 / Content-Range、长度和一致的强 ETag 或 Last-Modified。200、鉴权失败、重定向、缺少版本标识/固定 Content-Length 或源文件变化均报错，不退回整文件下载。支持 moov 位于文件头或尾的普通 MP4；HLS、直播、缺少时长/索引或 wheel 不支持的编码会报错。较长 GOP 或很大的索引可能需要调大流量上限。
 
 目前不持久缓存视频索引或 Range 数据；不同调用的新时间点仍需读取索引。默认仅保留本次有界内存读取缓存，不额外创建媒体缓存目录。
 

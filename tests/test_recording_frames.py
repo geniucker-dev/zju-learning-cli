@@ -237,6 +237,51 @@ class Frames(unittest.TestCase):
             self.assertFalse(body.read)
             self.assertNotIn("SECRET", str(e.exception))
 
+    def test_contiguous_index_reads_merge_without_more_bytes_or_budget_overrun(self):
+        block = rf.FrameRangeReader.block_size
+        # 大索引测试只检查真实 Range IO；解码正确性由 H.264 head/tail fixture 验证。
+        header = zju.mp4_box(b"ftyp", b"isom" * 4)
+        moov = zju.mp4_box(b"moov", b"index" * (block + 1))
+        media = zju.mp4_box(b"mdat", b"m" * (2 * block))
+        for tail in (False, True):
+            # 尾部情况同时覆盖 64-bit extended-size box。
+            index = ((1).to_bytes(4, "big") + b"moov" + (len(moov) + 8).to_bytes(8, "big") + moov[8:]
+                     if tail else moov)
+            content = header + (media + index if tail else index + media)
+            path = self.dest / f"index-{tail}.mp4"
+            path.write_bytes(content)
+            start = len(header) + (len(media) if tail else 0)
+            stop = start + len(index)
+            with server(path) as (url, state), rf.FrameRangeReader(url) as reader:
+                reader.cache_size = 4 * block
+                reader.read(32768)  # 记录 mdat 后 moov 的已知边界。
+                reader.seek(start)
+                data = bytearray()
+                while len(data) < len(index):
+                    data.extend(reader.read(min(32768, len(index) - len(data))))
+                self.assertEqual(bytes(data), index)
+                self.assertTrue(any(hi - lo + 1 > block for lo, hi in state.ranges))
+                # 最后一个块可能到文件末尾，且头部发现块可能已含 moov 开始。
+                expected = sum(min(block, len(content) - base) for base in
+                               ({0} | set(range(start // block * block, stop, block))))
+                self.assertEqual(reader.bytes_received, expected + 16)
+                self.assertLessEqual(sum(map(len, reader.cache.values())), reader.cache_size)
+                self.assertEqual(reader.bytes_received, state.sent)
+                # 回读被淘汰的块时，不重新下载其后仍在缓存中的索引块。
+                first_cached = min(reader.cache)
+                before = reader.bytes_received
+                reader.seek(first_cached - block)
+                reader.read(1)
+                self.assertEqual(reader.bytes_received - before, block)
+            with server(path) as (url, _), rf.FrameRangeReader(url, 3 * block + 16) as reader:
+                reader.read(32768)
+                reader.seek(start)
+                for _ in range(10):
+                    if not reader.read(block):
+                        break
+                self.assertIsNotNone(reader.last_error)
+                self.assertLessEqual(reader.bytes_received, 3 * block + 16)
+
     def test_missing_validator_wrong_length_and_retry_accounting(self):
         for headers, body in [({"Content-Range": "bytes 0-15/20"}, b"a" * 16),
                               ({"Content-Range": "bytes 0-15/20", "ETag": '"v"', "Content-Length": "17"}, b"a" * 17)]:
