@@ -22,6 +22,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
   zju.py classroom courses [--has-tasks] [--json]  # 智云个人课程与任务数
   zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]  # PPT、转写及可选录播和音频
+  zju.py classroom context --course <cid> --sub <sid> --at HH:MM:SS [--json]  # 只读本地上下文
   zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂课
   zju.py classroom day [日期] [--days N]  # 含追踪中的课
@@ -58,7 +59,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from contextlib import AsyncExitStack, ExitStack, contextmanager, nullcontext
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 import ssl
@@ -2306,6 +2307,347 @@ def cmd_submit(a):
     print(f"[{kind}] submission {s.get('id', '')} ✓")
 
 
+def context_json(path: Path):
+    def invalid_constant(_):
+        raise ValueError("非有限 JSON 数值")
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=invalid_constant)
+
+
+def context_path(directory: Path, value) -> Path:
+    """元数据只允许课程目录内的相对文件，包括解析后的符号链接目标。"""
+    if (not isinstance(value, str) or not value or any(ord(c) < 32 for c in value)
+            or PureWindowsPath(value).drive or value.startswith(("/", "\\"))
+            or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value)):
+        raise ValueError("资料路径必须是课程内相对路径")
+    path = Path(value.replace("\\", "/"))
+    if ".." in path.parts:
+        raise ValueError("资料路径越界")
+    target = directory / path
+    target.resolve().relative_to(directory.resolve())
+    return target
+
+
+def context_course(root: Path, cid: int, sid: int):
+    """只查同步根目录及直接课程子目录；显式指向课程目录可消除改名歧义。"""
+    warnings, matches = [], []
+    try:
+        root = root.expanduser().resolve()
+        if not root.is_dir():
+            raise ZjuError("--out 本地目录不存在或不可用")
+        paths = ([root / "course.json"] if (root / "course.json").exists() else
+                 sorted(root.glob("*/course.json")))
+        for path in paths:
+            try:
+                context_path(root, path.relative_to(root).as_posix())
+                data = context_json(path)
+                if not isinstance(data, dict) or type(data.get("course_id")) is not int:
+                    raise ValueError("课程身份缺失")
+                if data["course_id"] != cid:
+                    continue
+                if data.get("schema_version") != 1 or data.get("source") != "zju-classroom":
+                    raise ZjuError(f"课程 {cid} 的 course.json 来源或版本不支持：{path}")
+                matches.append((path, data))
+            except ZjuError:
+                raise
+            except (OSError, ValueError, RuntimeError):
+                warnings.append(dict(code="invalid_course_metadata", message="有 course.json 损坏、不可读或路径越界；未使用"))
+    except OSError:
+        raise ZjuError("无法读取 --out 下的本地课程元数据") from None
+    if not matches:
+        raise ZjuError(f"未找到课程 {cid} 的有效 course.json（不可用元数据 {len(warnings)} 份）；请先同步或检查 --out")
+    if len(matches) > 1:
+        locations = "\n".join(str(p.parent) for p, _ in matches)
+        raise ZjuError(f"课程 {cid} 有多个本地目录；请将 --out 指向其中一个课程目录：\n{locations}")
+    path, course = matches[0]
+    lessons = course.get("lessons")
+    if not isinstance(lessons, list) or any(not isinstance(s, dict) or type(s.get("sub_id")) is not int for s in lessons):
+        raise ZjuError("course.json 的 lessons 格式无效")
+    selected = [s for s in lessons if s["sub_id"] == sid]
+    if len(selected) != 1:
+        raise ZjuError(f"course.json 中堂次 {sid} {'不存在' if not selected else '重复，无法确定身份'}")
+    if not isinstance(selected[0].get("files"), dict):
+        raise ZjuError("course.json 的堂次 files 格式无效")
+    if course.get("lessons_fetch_status") == "error":
+        warnings.append(dict(code="stale_course_metadata", message="上次堂次查询失败，保留的本地信息可能不完整"))
+    return path.parent, course, selected[0], warnings
+
+
+def context_files(directory, lesson, kind, cid, sid):
+    entries = lesson["files"].get(kind, [])
+    if not isinstance(entries, list):
+        return [dict(path=None, status="invalid", reason="files 中的资料列表格式无效")]
+    refs = []
+    for entry in entries:
+        ref = dict(path=None, status="invalid")
+        refs.append(ref)
+        if not isinstance(entry, dict):
+            ref["reason"] = "文件引用不是对象"
+            continue
+        try:
+            path = context_path(directory, entry.get("path"))
+        except (OSError, ValueError, RuntimeError):
+            # 不回显不可信路径，尤其是 URL 和越界路径。
+            ref.update(status="unsafe_path", reason="路径无效或超出课程目录，未访问")
+            continue
+        ref["path"] = path.relative_to(directory).as_posix()
+        if kind in ("audio", "recordings"):
+            ref["part"] = entry.get("part") if type(entry.get("part")) is int and entry["part"] > 0 else None
+            if ref["part"] is None:
+                ref["reason"] = "缺少有效分段编号"
+                continue
+        elif kind == "transcripts":
+            ref["format"] = entry.get("format") if entry.get("format") in ("md", "txt", "srt") else path.suffix[1:].lower()
+        extension = {"ppt_events": ".json", "ppt_pdfs": ".pdf", "audio": ".m4a", "recordings": ".mp4"}.get(kind)
+        if (path.name.startswith(".") or (extension and path.suffix.lower() != extension)
+                or (kind == "transcripts" and path.suffix.lower() not in (".md", ".txt", ".srt"))):
+            ref.update(status="invalid", reason="不是支持的最终资料文件")
+            continue
+        try:
+            if not path.exists():
+                ref.update(status="missing", reason="元数据有引用，但本地文件缺失")
+            elif not path.is_file():
+                ref.update(status="unavailable", reason="不是普通文件")
+            elif not valid_course_material(path, kind, cid, sid, None):
+                ref.update(status="invalid", reason="空文件、格式损坏或身份不符")
+            else:
+                ref["status"] = "ok"
+        except (OSError, ValueError):
+            ref.update(status="unavailable", reason="文件不可读或格式无效")
+    return refs
+
+
+def context_status(refs, found, empty="no_matches"):
+    if not refs:
+        return "missing"
+    good = any(r["status"] == "ok" for r in refs)
+    if any(r["status"] != "ok" for r in refs):
+        return "partial" if good else "unavailable"
+    return "ok" if found else empty
+
+
+def context_transcript(directory, refs, start, end, warnings):
+    segments = []
+    for ref in refs:
+        if ref["status"] != "ok":
+            continue
+        if ref["format"] != "md":
+            ref.update(search_status="unsupported_format", reason="保留文件引用；上下文检索仅解析 Markdown")
+            continue
+        issues, rows = {}, []
+        def issue(code, line):
+            count, lines = issues.setdefault(code, [0, []])
+            issues[code][0] = count + 1
+            if len(lines) < 5:
+                lines.append(line)
+        try:
+            text = (directory / ref["path"]).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            ref.update(status="unavailable", reason="Markdown 不可读")
+            continue
+        # 只解析行首时间标记，正文中的 Markdown、箭头、方括号均保持原样。
+        for number, line in enumerate(text.splitlines(), 1):
+            match = re.match(r"^\*\*\[([^\]]+)\]\*\*[ \t]?(.*)$", line)
+            if not match:
+                if rows:
+                    rows[-1]["text"] += "\n" + line
+                continue
+            try:
+                begin, sep, finish = match[1].partition("→")
+                begin = parse_frame_time(begin.strip())
+                finish = parse_frame_time(finish.strip()) if sep else None
+            except argparse.ArgumentTypeError:
+                issue("invalid_transcript_time", number)
+                # 分隔符不能导致后续正文粘到上一条有效转写。
+                rows.append(dict(line=number, invalid=True, text=""))
+                continue
+            flags = []
+            if finish is None:
+                flags.append("end_time_unknown")
+            elif finish < begin:
+                flags.append("reversed_interval")
+            elif finish == begin:
+                flags.append("zero_duration")
+            elif finish - begin > 300:
+                flags.append("long_interval")
+            rows.append(dict(file=ref["path"], line=number, begin_sec=begin, end_sec=finish,
+                             text=match[2].removesuffix("  "), flags=flags))
+        valid = [r for r in rows if not r.get("invalid")]
+        maximum, previous = -1, None
+        for row in sorted(valid, key=lambda r: (r["begin_sec"], r["line"])):
+            finish = row["end_sec"]
+            if row["begin_sec"] < maximum:
+                row["flags"].append("overlap")
+                if "overlap" not in previous["flags"]:
+                    previous["flags"].append("overlap")
+            if finish is not None and finish > maximum and finish >= row["begin_sec"]:
+                maximum, previous = finish, row
+        for row in valid:
+            row["text"] = row["text"].rstrip("\n")
+            for code in row["flags"]:
+                issue(code, row["line"])
+            finish = row["end_sec"]
+            # 反向区间或缺少结束时间只按开始点匹配，不擅自修正区间。
+            bound = finish if finish is not None and finish >= row["begin_sec"] else row["begin_sec"]
+            if row["begin_sec"] <= end and bound >= start:
+                segments.append(row)
+        if not valid:
+            ref.update(status="invalid", reason="没有可解析的 Markdown 时间段")
+        for code, (count, lines) in issues.items():
+            warnings.append(dict(code=code, file=ref["path"], count=count, lines=lines,
+                                 message="转写保留原始时间；异常区间不代表整段持续讲话"))
+    status = context_status(refs, segments)
+    if refs and all(r.get("search_status") == "unsupported_format" for r in refs):
+        status = "unsupported_format"
+    return dict(status=status, files=refs, segments=segments)
+
+
+def context_ppt(directory, event_refs, pdf_refs, cid, sid, start, end, warnings):
+    candidates, untimed = [], []
+    pdfs = {r["path"]: r for r in pdf_refs if r["path"] is not None}
+    for ref in event_refs:
+        if ref["status"] != "ok":
+            continue
+        try:
+            data = context_json(directory / ref["path"])
+            pdf = context_path(directory, (Path(ref["path"]).parent / data["pdf_file"]).as_posix())
+            pdf_ref = pdfs.get(pdf.relative_to(directory).as_posix())
+            if pdf_ref is None:
+                raise ValueError("PDF 未在 course.json 中登记")
+            pages = {}
+            for page in data["pages"]:
+                n, representative, indices = page["pdf_page"], page["representative_event_index"], page["event_indices"]
+                if (type(n) is not int or n < 1 or n in pages or type(representative) is not int
+                        or representative < 0 or not isinstance(indices, list)
+                        or any(type(i) is not int or i < 0 for i in indices) or representative not in indices):
+                    raise ValueError("无效 PDF 页映射")
+                pages[n] = page
+            events, seen = [], set()
+            for raw in data["events"]:
+                if not isinstance(raw, dict) or type(raw.get("event_index")) is not int or raw["event_index"] < 0 or raw["event_index"] in seen:
+                    raise ValueError("无效或重复事件编号")
+                index = raw["event_index"]
+                seen.add(index)
+                event = {k: raw.get(k) for k in ("event_index", "pdf_page", "representative_event_index", "relationship")}
+                event.update(file=ref["path"], pdf_path=pdf_ref["path"], pdf_status=pdf_ref["status"], flags=[])
+                sec = raw.get("created_sec")
+                try:
+                    if isinstance(sec, bool) or sec is None:
+                        raise ValueError("时间未知")
+                    sec = parse_frame_time(str(sec))
+                except (ValueError, argparse.ArgumentTypeError):
+                    sec = None
+                    event["flags"].append("unknown_event_time")
+                event["created_sec"] = sec
+                page, rep, relation = event["pdf_page"], event["representative_event_index"], event["relationship"]
+                mapping = pages.get(page) if type(page) is int else None
+                if not ((page is None and rep is None and relation == "blank") or
+                        (mapping and type(rep) is int and rep == mapping["representative_event_index"]
+                         and index in mapping["event_indices"]
+                         and relation == ("retained" if index == rep else "represented"))):
+                    # 保留事件时间，但不能把不一致的页码交给调用者当成有效映射。
+                    event.update(pdf_page=None, representative_event_index=None, relationship="invalid_mapping")
+                    event["flags"].append("invalid_ppt_mapping")
+                events.append(event)
+            if any(not set(page["event_indices"]) <= seen for page in pages.values()):
+                raise ValueError("PDF 页引用了不存在的事件")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+            ref.update(status="invalid", reason="事件 JSON 或 PDF 映射无效，未使用")
+            continue
+        timed = [e for e in events if e["created_sec"] is not None]
+        before = max((e["created_sec"] for e in timed if e["created_sec"] < start), default=None)
+        after = min((e["created_sec"] for e in timed if e["created_sec"] > end), default=None)
+        for event in events:
+            sec = event["created_sec"]
+            if sec is None:
+                event["selection"] = "untimed"
+                untimed.append(event)
+            elif start <= sec <= end or sec == before or sec == after:
+                event["selection"] = "window" if start <= sec <= end else "previous" if sec < start else "next"
+                candidates.append(event)
+        for flag in ("unknown_event_time", "invalid_ppt_mapping"):
+            count = sum(flag in e["flags"] for e in events)
+            if count:
+                warnings.append(dict(code=flag, file=ref["path"], count=count,
+                                     message="部分 PPT 事件时间或页码未知，未推断页面显示区间"))
+    candidates.sort(key=lambda e: (e["created_sec"], e["file"], e["event_index"]))
+    window_count = sum(e["selection"] == "window" for e in candidates)
+    status = context_status(event_refs + pdf_refs, window_count,
+                            "neighbors_only" if candidates else "untimed_only" if untimed else "no_matches")
+    if not event_refs and pdf_refs and all(r["status"] == "ok" for r in pdf_refs):
+        status = "missing_events"
+    return dict(status=status, event_files=event_refs, pdf_files=pdf_refs,
+                window_match_count=window_count, events=candidates, untimed_events=untimed)
+
+
+def classroom_context(a):
+    if a.course < 1 or a.sub < 1:
+        raise ZjuError("--course 和 --sub 必须是正整数")
+    if not all(math.isfinite(x) and x >= 0 for x in (a.at, a.window)) or not math.isfinite(a.at + a.window):
+        raise ZjuError("查询时间及窗口必须是有限非负秒数，且总和不能溢出")
+    directory, course, lesson, warnings = context_course(Path(a.out), a.course, a.sub)
+    # 避免 0.7 + 0.1 的浮点误差把恰好位于闭区间边界的事件排除。
+    start = max(0., float(Decimal(str(a.at)) - Decimal(str(a.window))))
+    end = float(Decimal(str(a.at)) + Decimal(str(a.window)))
+    refs = {kind: context_files(directory, lesson, kind, a.course, a.sub) for kind in
+            ("transcripts", "ppt_events", "ppt_pdfs", "audio", "recordings")}
+    transcript = context_transcript(directory, refs["transcripts"], start, end, warnings)
+    ppt = context_ppt(directory, refs["ppt_events"], refs["ppt_pdfs"], a.course, a.sub, start, end, warnings)
+    media = {}
+    for kind, target in (("audio", "audio"), ("recordings", "video")):
+        for ref in refs[kind]:
+            ref.update(duration_sec=None, time_range_sec=None)
+        parts = [r.get("part") for r in refs[kind] if r.get("part") is not None]
+        media[target] = dict(status=context_status(refs[kind], bool(parts)), parts=refs[kind],
+                             classroom_time_mapping="unknown", duration_status="not_recorded")
+        if len(parts) != len(set(parts)):
+            warnings.append(dict(code="duplicate_media_part", media=target, message="同一分段有多个文件，未自动选择"))
+    if any(r["status"] != "ok" for entries in refs.values() for r in entries):
+        warnings.append(dict(code="materials_unavailable", message="部分资料缺失、不可用或格式不支持；详见各文件 status"))
+    warnings.append(dict(code="uncalibrated_timeline", message="保留原始时间；转写、PPT 与媒体可能相差数秒或更多，候选窗口不保证覆盖真实内容"))
+    warnings.append(dict(code="ppt_observations", message="PPT 事件是观测点，不是页面精确显示起止区间"))
+    parts = sorted({r["part"] for kind in ("audio", "recordings") for r in refs[kind]
+                    if r["status"] == "ok" and r.get("part") is not None})
+    if len(parts) > 1:
+        warnings.append(dict(code="multipart_timeline_unknown", message="存在多段媒体，不能由课堂时间或累计时长推定所属分段"))
+    def identity(data, fields):
+        return {k: data.get(k) if isinstance(data.get(k), (str, int)) and not isinstance(data.get(k), bool) else None for k in fields}
+    return dict(schema_version=1, source="zju-classroom-local",
+                course=identity(course, ("course_id", "name", "teacher", "term")),
+                lesson=identity(lesson, ("sub_id", "name", "date", "lecturer", "availability")),
+                location=dict(course_dir=str(directory), metadata="course.json", paths_relative_to="course_dir"),
+                query=dict(at_sec=a.at, window_sec=a.window, start_sec=start, end_sec=end, alignment="unverified"),
+                transcript=transcript, ppt=ppt, **media,
+                recording_frame_hint=dict(course_id=a.course, sub_id=a.sub, known_local_parts=parts,
+                    part_selection_required=len(parts) > 1, candidate_window_sec=[start, end],
+                    alignment="unverified", remote_availability="unchecked", executed=False), warnings=warnings)
+
+
+def cmd_classroom_context(a):
+    result = classroom_context(a)
+    if a.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return
+    print(f"[本地上下文] {result['course']['name']} ({a.course}) / {result['lesson']['name']} ({a.sub})")
+    print(f"目录：{result['location']['course_dir']}")
+    print(f"窗口：{result['query']['start_sec']:g}–{result['query']['end_sec']:g} 秒（时间轴未校准）")
+    print(f"转写：{result['transcript']['status']}")
+    for row in result["transcript"]["segments"]:
+        print(f"  [{row['begin_sec']:g} → {row['end_sec']}] {row['text']}")
+        if row["flags"]:
+            print(f"    提示：{', '.join(row['flags'])}")
+    print(f"PPT：{result['ppt']['status']}，另有 {len(result['ppt']['untimed_events'])} 个无时间事件")
+    for event in result["ppt"]["events"]:
+        print(f"  {event['created_sec']:g} 秒 / 事件 {event['event_index']} / PDF 页 {event['pdf_page']} / {event['relationship']} / {event['selection']}")
+    for section, key in ((result["transcript"], "files"), (result["ppt"], "pdf_files"),
+                         (result["ppt"], "event_files"), (result["audio"], "parts"), (result["video"], "parts")):
+        for ref in section[key]:
+            print(f"  [{ref['status']}] {ref['path'] or '无效路径'}" + (f" / 分段 {ref['part']}" if ref.get("part") else ""))
+    for kind in ("audio", "video"):
+        print(f"{kind}：{result[kind]['status']}；时长及课堂时间映射未知")
+    for warning in result["warnings"]:
+        print(f"[提示] {warning['code']}：{warning['message']}")
+
+
 def cmd_classroom(a):
     z = Zju()
     if a.action == "courses":
@@ -3763,7 +4105,7 @@ def main():
     x.add_argument("-y", "--yes", action="store_true", help="不确认直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智云课堂：courses / sync / search / subs / day / add / rm / tracked")
+    x = sp.add_parser("classroom", help="智云课堂：courses / sync / context / search / subs / day / add / rm / tracked")
     x.set_defaults(fn=cmd_classroom)
     cp = x.add_subparsers(dest="action", required=True)
     y = cp.add_parser("courses", help="列出全部个人课程及任务数")
@@ -3782,6 +4124,14 @@ def main():
         y.add_argument("arg", help="智云课程 ID（classroom search 查）")
         y.add_argument("more", nargs="*", help="其他课程 ID")
     cp.add_parser("tracked", help="列出追踪中的课程")
+    y = cp.add_parser("context", help="只读检索本地课堂上下文，无需登录或网络",
+                      description="以 --out 下 course.json 定位资料；返回原始转写、PPT 候选及媒体引用，时间轴不自动校准。--out 也可指向具体课程目录。")
+    y.add_argument("--course", type=int, required=True, help="智云课程 ID")
+    y.add_argument("--sub", type=int, required=True, help="智云堂次 ID")
+    y.add_argument("--at", type=parse_frame_time, required=True, help="原始转写时间 HH:MM:SS.sss 或秒数")
+    y.add_argument("--window", type=parse_frame_time, default=20., help="前后窗口秒数，有限非负数（默认 20）；左端裁剪到 0")
+    y.add_argument("--json", action="store_true", help="输出 JSON；相对文件路径以 location.course_dir 为基准")
+    y.set_defaults(fn=cmd_classroom_context)
     y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播、音频",
                       description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写，并维护课程目录下的 course.json。")
     y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")

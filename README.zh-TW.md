@@ -22,6 +22,7 @@
 | `zju submit <作業id> --file … [--body …] [--draft] [-y]` | 交作業；預設送出前確認，已截止會擋下 |
 | `./zju.py classroom courses [--has-tasks] [--json]` | 智雲個人課程，顯示課程 ID、學期、教師與任務數 |
 | `./zju.py classroom sync [課程...] [-j 4] [--recording] [--recording-audio]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播、音訊 |
+| `./zju.py classroom context --course <cid> --sub <sid> --at <時間> [--json]` | 完全離線、唯讀檢索本地課堂候選上下文 |
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課，含追蹤中的課 |
@@ -143,6 +144,36 @@ Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23.120 → 0
 ./zju.py classroom sync 89418 --recording -j 8
 ./zju.py classroom sync 人工智能 --dry-run --recording
 ```
+
+### 本地課堂上下文
+
+`classroom context` 從同步目錄的 `course.json` 依課程及堂次 ID 查找資料，不登入、不請求 API、不下載或修改檔案，也不初始化媒體解碼器。`--out` 可以是同步根目錄，或直接是包含 `course.json` 的課程目錄；只掃描根目錄及其直接課程子目錄。同一課程 ID 有多個歷史目錄時會報錯，需將 `--out` 指向具體課程目錄，不按顯示名稱或更新時間猜測。
+
+```bash
+./zju.py --out "/path/to/Class/现代控制理论" classroom context \
+  --course 89253 --sub 2038852 --at 01:23:45.120 --window 20 --json
+# 省略 --json 輸出可讀摘要；--window 0 只查詢指定時間點。
+./zju.py --out "/path/to/課程目錄" classroom context --course 89253 --sub 2038852 --at 5025.12
+```
+
+時間接受 `HH:MM:SS[.sss]` 或非負秒數，視窗預設前後各 20 秒，左端裁剪到 0。查詢閉區間內所有相交轉錄，支援毫秒、舊版整秒及僅有起點的 Markdown；保留文字及原始時間，不自動修正偏移。零時長按時間點比對，結束早於開始或缺少結束時間時僅按起點比對；超過 300 秒的段及重疊段保留並標記。TXT/SRT 仍提供檔案引用，但不解析上下文。
+
+PPT 回傳視窗內事件，以及視窗之前最近、之後最近的事件（同時刻的多個事件均保留）。無時間事件另列於 `untimed_events`；空白、動畫去重和翻回同頁的事件不合併。保留事件編號、代表事件、關係及 PDF 頁碼；映射不一致時不提供可用頁碼。`created_sec` 是觀測時間，**不推斷頁面的精確顯示起止區間**。
+
+`--json` stdout 只有一個 JSON 物件，主要欄位為 `schema_version`、`course`、`lesson`、`location`、`query`、`transcript`、`ppt`、`audio`、`video`、`recording_frame_hint`、`warnings`。檔案 `path` / `file` / `pdf_path` 都相對於 `location.course_dir`，呼叫方拼接該目錄即可讀取；移動課程目錄後重新執行即可。精簡示意：
+
+```json
+{
+  "schema_version": 1,
+  "query": {"at_sec": 5025.12, "window_sec": 20, "start_sec": 5005.12, "end_sec": 5045.12, "alignment": "unverified"},
+  "transcript": {"status": "ok", "segments": [{"file": "转录/课堂.md", "line": 3, "begin_sec": 5020.0, "end_sec": 5030.5, "text": "原始轉錄內容", "flags": []}]},
+  "audio": {"status": "missing", "parts": [], "classroom_time_mapping": "unknown", "duration_status": "not_recorded"}
+}
+```
+
+`missing` 表示中繼資料未登記資料，或具體引用檔案已缺失；`invalid` / `unavailable` / `unsafe_path` 分別表示格式或身份損壞、不可用、路徑越界。資料分組有部分可用內容時為 `partial`。`no_matches` 表示附近沒有匹配；PPT 只有相鄰事件時為 `neighbors_only`，只有無時間事件時為 `untimed_only`，只有 PDF 缺事件表時為 `missing_events`。僅有 TXT/SRT 時轉錄為 `unsupported_format`。課程身份錯誤、中繼資料無效或目錄歧義回傳非零退出碼；資料缺失或部分不可用仍回傳帶狀態的結果。不輸出原始 PPT API 中繼資料或播放網址；絕對、越界及指向課程外的符號連結路徑不讀取。
+
+影音僅檢查最終檔案容器結構，不完整解碼，無法發現任意媒體內容損壞。現有 `course.json` 沒有可靠媒體時長，因此 `duration_sec` / `time_range_sec` 為 `null`；不以檔案大小或轉錄結尾推算。多段檔案逐項回傳 `part`，不累計時長、不自動選擇所屬段。`recording_frame_hint` 只提供尚未校準的候選視窗及本地已知分段；遠端是否可用仍為 `unchecked`，本命令不呼叫取幀。轉錄與實際媒體可能相差數秒或更多，預設視窗不保證涵蓋正確內容；呼叫方需結合相鄰 PPT、語音及實際畫面確認。
 
 ### 智雲錄播下載
 

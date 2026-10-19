@@ -22,6 +22,7 @@
 | `zju submit <作业id> --file … [--body …] [--draft] [-y]` | 交作业；默认提交前确认，已截止会拦下 |
 | `./zju.py classroom courses [--has-tasks] [--json]` | 智云个人课程，显示课程 ID、学期、教师和任务数 |
 | `./zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]` | 同步智云个人课程的 PPT 和转写，可选录播、音频 |
+| `./zju.py classroom context --course <cid> --sub <sid> --at <时间> [--json]` | 完全离线、只读检索本地课堂候选上下文 |
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课，含追踪中的课 |
@@ -143,6 +144,36 @@ Markdown 转写的每段带开始和结束时间，例如 `**[00:01:23.120 → 0
 ./zju.py classroom sync 89418 --recording -j 8
 ./zju.py classroom sync 人工智能 --dry-run --recording
 ```
+
+### 本地课堂上下文
+
+`classroom context` 从同步目录中的 `course.json` 按课程及堂次 ID 查找资料，不登录、不请求 API、不下载或修改任何文件，也不初始化媒体解码器。`--out` 可以是同步根目录，或直接是含 `course.json` 的课程目录；只扫描根目录及其直接课程子目录。同一课程 ID 对应多个历史目录时会报错，需将 `--out` 指向具体课程目录，不会按显示名称或更新时间猜测。
+
+```bash
+./zju.py --out "/path/to/Class/现代控制理论" classroom context \
+  --course 89253 --sub 2038852 --at 01:23:45.120 --window 20 --json
+# 省略 --json 输出可读摘要；--window 0 只查询指定时间点。
+./zju.py --out "/path/to/课程目录" classroom context --course 89253 --sub 2038852 --at 5025.12
+```
+
+时间支持 `HH:MM:SS[.sss]` 或非负秒数，窗口默认前后各 20 秒，左端裁剪到 0。查询闭区间内所有相交转写，兼容毫秒、旧版整秒及仅有起点的 Markdown；保留文本及原始时间，不自动修正偏移。零时长按时间点匹配，结束早于开始或缺少结束时间时仅按起点匹配；超过 300 秒的段及重叠段保留并标记。TXT/SRT 仍提供文件引用，但不解析上下文。
+
+PPT 返回窗口内事件，以及窗口之前最近、之后最近的事件（同一时间的多个事件均保留）。无时间事件单列 `untimed_events`；空白、动画去重和翻回同一页的事件不合并。输出保留事件编号、代表事件、关系及 PDF 页码；映射不一致时不给出可用页码。`created_sec` 是观测时间，**不推断页面的精确显示起止区间**。
+
+`--json` stdout 只有一个 JSON 对象，主要字段为 `schema_version`、`course`、`lesson`、`location`、`query`、`transcript`、`ppt`、`audio`、`video`、`recording_frame_hint`、`warnings`。所有文件 `path` / `file` / `pdf_path` 均相对 `location.course_dir`，调用方拼接该目录即可读取；移动课程目录后重新运行即可。示意片段：
+
+```json
+{
+  "schema_version": 1,
+  "query": {"at_sec": 5025.12, "window_sec": 20, "start_sec": 5005.12, "end_sec": 5045.12, "alignment": "unverified"},
+  "transcript": {"status": "ok", "segments": [{"file": "转录/课堂.md", "line": 3, "begin_sec": 5020.0, "end_sec": 5030.5, "text": "原始转写内容", "flags": []}]},
+  "audio": {"status": "missing", "parts": [], "classroom_time_mapping": "unknown", "duration_status": "not_recorded"}
+}
+```
+
+`missing` 表示元数据没有登记资料，或具体引用文件已缺失；`invalid` / `unavailable` / `unsafe_path` 分别标记格式或身份损坏、不可用、路径越界。资料分组存在部分可用内容时为 `partial`。`no_matches` 表示可解析资料在附近没有匹配；PPT 只有相邻事件时为 `neighbors_only`，只有无时间事件时为 `untimed_only`，仅有 PDF 缺事件表时为 `missing_events`。仅有 TXT/SRT 时转写为 `unsupported_format`。错误的课程身份、元数据或目录歧义返回非零退出码；资料缺失或部分不可用仍返回带状态的结果。原始 PPT API 元数据和播放地址不进入输出；绝对、越界和指向课程外的符号链接路径不读取。
+
+影音仅核对最终文件的容器结构，不进行完整解码，不能发现任意媒体内容损坏。现有 `course.json` 未记录可靠媒体时长，因此 `duration_sec` / `time_range_sec` 为 `null`；不会用文件大小或转写结尾推算。多段文件逐项返回 `part`，不累计时长、不自动选择所属段。`recording_frame_hint` 仅提供尚未校准的候选窗口和本地已知分段；远端是否可用仍为 `unchecked`，本命令不会调用取帧。转写与实际媒体可能相差数秒或更多，默认窗口不保证覆盖正确内容；需要调用方结合相邻 PPT、语音和实际画面确认。
 
 ### 智云录播下载
 
