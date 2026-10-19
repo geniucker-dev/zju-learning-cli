@@ -1,10 +1,12 @@
 """PyAV 生成离线 H.264 fixture；测试不调用 ffmpeg/ffprobe 等可执行程序。"""
 import argparse
+import bisect
 import contextlib
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,12 +32,16 @@ spec.loader.exec_module(zju)
 rf = zju
 
 
-def video(path, *, fast=False, count=100, noisy=False, offset=0, vfr=False):
-    opts = {"movflags": "+faststart"} if fast else {}
+def video(path, *, fast=False, count=100, noisy=False, offset=0, vfr=False,
+          negative_cts=False, open_gop=False):
+    flags = ("+faststart" if fast else "") + ("+negative_cts_offsets" if negative_cts else "")
+    opts = {"movflags": flags} if flags else {}
     with av.open(str(path), "w", format="mp4", options=opts) as c:
         s = c.add_stream("libx264", rate=10)
         s.width, s.height, s.pix_fmt = 192, 128, "yuv420p"
         s.options = {"preset": "ultrafast", "crf": "20"}
+        if open_gop:
+            s.options["x264-params"] = "open-gop=1"
         s.codec_context.gop_size = 20
         s.codec_context.max_b_frames = 2
         rng = np.random.default_rng(1)
@@ -50,6 +56,17 @@ def video(path, *, fast=False, count=100, noisy=False, offset=0, vfr=False):
                 c.mux(p)
         for p in s.encode():
             c.mux(p)
+
+
+def sequential_frames(path):
+    """不使用 seek 的独立参考：保留实际 PTS、时间基准及完整 RGB 画面摘要。"""
+    with av.open(str(path)) as c:
+        s = c.streams.video[0]
+        origin = (s.start_time or 0) * s.time_base
+        frames = [(f.pts * f.time_base - origin, f.pts, f.time_base,
+                   hashlib.sha256(f.to_image().tobytes()).digest(), f.pict_type)
+                  for f in c.decode(s)]
+    return frames
 
 
 def args(**kw):
@@ -126,10 +143,12 @@ class Frames(unittest.TestCase):
         cls.fast = cls.root / "fast.mp4"
         cls.large = cls.root / "large.mp4"
         cls.vfr = cls.root / "vfr.mp4"
+        cls.vfr_seek = cls.root / "vfr-seek.mp4"
         video(cls.small)
         video(cls.fast, fast=True)
         video(cls.large, count=600, noisy=True)
         video(cls.vfr, count=40, offset=50, vfr=True)
+        video(cls.vfr_seek, count=600, noisy=True, offset=50, vfr=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -182,6 +201,84 @@ class Frames(unittest.TestCase):
         # 源 PTS 从 5 秒开始，帧 19 到 20 的间隔是 2.1 秒。
         for i, (sec, number) in enumerate([(0, 0), (1.9, 19), (1.9, 19), (4, 20), (6.2, 31)]):
             self.assert_frame(r, sec, i, number)
+
+    def test_b_vfr_random_seek_matches_sequential_pts_and_pixels(self):
+        for offset in (0, 50):
+            for negative_cts in (False, True):
+                for open_gop in (False, True):
+                    with self.subTest(offset=offset, negative_cts=negative_cts, open_gop=open_gop):
+                        path = self.dest / "vfr.mp4"
+                        video(path, offset=offset, vfr=True, negative_cts=negative_cts, open_gop=open_gop)
+                        reference = sequential_frames(path)
+                        times = [f[0] for f in reference]
+                        self.assertEqual(len(reference), 100)
+                        self.assertTrue(all(a < b for a, b in zip(times, times[1:])))
+                        self.assertGreater(len({b - a for a, b in zip(times, times[1:])}), 1)
+                        self.assertTrue(any(f[4] == av.video.frame.PictureType.B for f in reference))
+                        # 每帧的显示边界与帧间时刻；逆序强制随机 seek，另测前后跳转及连续复用。
+                        targets = sorted(set(times + [(a + b) / 2 for a, b in zip(times, times[1:])]
+                                             + [t - Fraction(1, 1000) for t in times if t > 0]))
+                        with av.open(str(path)) as c:
+                            decoder = rf.FrameDecoder(c)
+                            requests = [t for t in reversed(targets) if t < decoder.duration]
+                            requests += list(map(Fraction, ["2.5", "3.999", "4", "15.95", "1.25", "16", "7.999", "8", "0", "19.6"]))
+                            for target in requests:
+                                frame, actual = decoder.at(float(target))
+                                expected = reference[bisect.bisect_right(times, target) - 1]
+                                self.assertEqual((frame.pts, frame.time_base, actual),
+                                                 (expected[1], expected[2], float(expected[0])), str(target))
+                                self.assertEqual(hashlib.sha256(frame.to_image().tobytes()).digest(), expected[3], str(target))
+
+    def test_b_vfr_range_and_index_cache_match_sequential_decode(self):
+        reference = sequential_frames(self.vfr_seek)
+        times = [f[0] for f in reference]
+        targets = [55.95, 55.8, 56, 56.001, 56.25, 2.5, 27.95]
+        cache = self.dest / "shared-index"
+        with server(self.vfr_seek) as (url, state):
+            results = []
+            for name, source, options in (("local", self.vfr_seek, {}),
+                                           ("disabled", url, {"no_index_cache": True}),
+                                           ("cold", url, {"index_cache_dir": cache}),
+                                           ("warm", url, {"index_cache_dir": cache})):
+                with self.subTest(mode=name), mock.patch.object(av, "open", wraps=av.open) as opened:
+                    result = self.run_frames(source, at=targets, format="png", output_dir=str(self.dest / name), **options)
+                    results.append(result)
+                    self.assertEqual(opened.call_count, 1)
+                    self.assertLessEqual(result["decode"]["seeks"], 6)
+                    self.assertLess(result["decode"]["frames"], 80)  # 只解码附近 GOP，非从头扫描 600 帧。
+                    for target, f in zip(targets, result["frames"]):
+                        expected = reference[bisect.bisect_right(times, Fraction(str(target))) - 1]
+                        self.assertEqual(f["actual_time_sec"], float(expected[0]))
+                        self.assertEqual(f["timebase"], str(expected[2]))
+                        self.assertFalse(f["cache_hit"])
+                        with Image.open(f["path"]) as image:
+                            self.assertEqual(hashlib.sha256(image.tobytes()).digest(), expected[3])
+                    self.assertLess(result["network"]["bytes_received"], self.vfr_seek.stat().st_size // 2)
+            self.assertEqual(len(list(cache.rglob("*.idx"))), 1)
+            self.assertLess(results[3]["network"]["bytes_received"], results[2]["network"]["bytes_received"])
+            self.assertEqual(results[2]["decode"], results[3]["decode"])
+        self.assertEqual(sum(r["network"]["bytes_received"] for r in results), state.sent)
+
+    def test_seek_that_keeps_landing_late_fails_without_scanning(self):
+        with av.open(str(self.vfr_seek)) as c:
+            broken = mock.Mock(streams=c.streams, demux=c.demux)
+            s = c.streams.video[0]
+            # 模拟异常索引/解复用器忽略回退，每次仍返回未来关键帧。
+            broken.seek.side_effect = lambda *a, **kw: c.seek(s.start_time + int(56 / s.time_base), **kw)
+            decoder = rf.FrameDecoder(broken)
+            with self.assertRaisesRegex(rf.FrameError, "没有可显示"):
+                decoder.at(55.95)
+            self.assertEqual(broken.seek.call_count, 2)
+            self.assertEqual(decoder.decoded_frames, 2)
+
+    def test_b_vfr_seek_preserves_network_budget_error(self):
+        # 越过目标的 seek 在读取期间耗尽预算，不能将网络错误误报为没有显示帧。
+        with server(self.vfr_seek) as (url, state):
+            with self.assertRaisesRegex(rf.FrameError, "上限"):
+                self.run_frames(url, at=[55.95], no_index_cache=True, max_fetch_mb=3.5)
+        self.assertLessEqual(state.sent, 3.5 * 2**20)
+        self.assertFalse(list(self.dest.rglob("*.jpg")))
+        self.assertFalse(list(self.dest.glob(".zju-frame-*")))
 
     def test_remote_tail_and_faststart_and_io_reuse(self):
         for fixture in (self.fast, self.large):

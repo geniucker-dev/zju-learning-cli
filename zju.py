@@ -3251,15 +3251,35 @@ class FrameDecoder:
             self.decoded_frames += 1
         return frame
 
+    def decode_after_seek(self):
+        # 保留落点包的 DTS；解码帧的 DTS 在 B 帧重排/多线程缓冲后不可用于回退。
+        self.seek_dts = None
+        first = True
+        for packet in self.container.demux(self.stream):
+            if first:
+                if packet.dts is not None:
+                    self.seek_dts = math.floor(packet.dts * packet.time_base / self.timebase)
+                first = False
+            yield from packet.decode()
+
     def at(self, target):
         point = Fraction(str(target))
         if self.iterator is None or target < self.last_target or target - self.last_target > 10:
             offset = math.floor((point + self.origin) / self.timebase)
-            self.container.seek(offset, stream=self.stream, backward=True, any_frame=False)
-            self.seeks += 1
-            self.iterator = iter(self.container.decode(self.stream))
-            self.previous = None
-            self.next_frame = self.advance()
+            for attempt in range(2):
+                self.container.seek(offset, stream=self.stream, backward=True, any_frame=False)
+                self.seeks += 1
+                self.iterator = self.decode_after_seek()
+                self.previous = None
+                self.next_frame = self.advance()
+                if self.next_frame is None or self.timestamp(self.next_frame) <= point:
+                    break
+                # MP4 按 DTS 索引 seek，固定的 PTS 偏移在 B 帧 + VFR 时可能落到未来。
+                # 仅纠正一次：退到落点包 DTS 前一 tick 的关键帧，再按实际 PTS 解码。
+                # 不猜帧率、不按秒扩大扫描；异常索引仍然失败，避免无界回退。
+                if attempt or self.seek_dts is None:
+                    break
+                offset = min(offset - 1, self.seek_dts - 1)
         # 解码器按显示顺序输出（包含 B 帧重排），不使用 DTS 或平均帧率。
         while self.next_frame is not None and self.timestamp(self.next_frame) <= point:
             self.previous = self.next_frame
@@ -3415,11 +3435,11 @@ def extract_recording_frames(a, source, part, *, client=None):
                 publish_frame_pair(staged, path, dict(record, request=request), a.force)
             result["elapsed_sec"] = time.monotonic() - started
             return result
-    except (FrameError, KeyboardInterrupt):
-        raise
     except Exception as e:
         if reader and reader.last_error:
             raise reader.last_error from None
+        if isinstance(e, FrameError):
+            raise
         # 原始 HTTP/FFmpeg 异常可能携带签名 URL；只返回异常类型。
         raise FrameError(f"视频帧提取失败（{type(e).__name__}）；请检查视频、输出权限和解码支持") from None
 
