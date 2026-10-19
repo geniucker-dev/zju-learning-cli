@@ -449,8 +449,14 @@ class Frames(unittest.TestCase):
         self.assertEqual(p.read_bytes(), b"original")
 
     def test_relative_paths_and_duplicate_millisecond_names(self):
-        relative = os.path.relpath(self.dest / "rel" / "frame.jpg", Path.cwd())
-        r = self.run_frames(output_dir=None, output=relative)
+        # Windows runner 的仓库与系统临时目录可能分别在 D: / C:；跨盘不存在
+        # 相对路径。在临时目录内验证真实相对路径解析，并保证异常时恢复 cwd。
+        previous = Path.cwd()
+        try:
+            os.chdir(self.dest)
+            r = self.run_frames(output_dir=None, output=str(Path("rel") / "frame.jpg"))
+        finally:
+            os.chdir(previous)
         self.assertEqual(Path(r["frames"][0]["path"]), (self.dest / "rel" / "frame.jpg"))
         r = self.run_frames(at=[1.25001, 1.25002])
         self.assertNotEqual(r["frames"][0]["path"], r["frames"][1]["path"])
