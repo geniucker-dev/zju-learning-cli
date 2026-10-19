@@ -8,6 +8,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,11 +23,11 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-import recording_frames as rf
 
 spec = importlib.util.spec_from_file_location("zju_frame_tests", ROOT / "zju.py")
 zju = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(zju)
+rf = zju
 
 
 def video(path, *, fast=False, count=100, noisy=False, offset=0, vfr=False):
@@ -54,7 +55,7 @@ def video(path, *, fast=False, count=100, noisy=False, offset=0, vfr=False):
 def args(**kw):
     data = dict(course=89253, sub=2038840, part=None, at=[1.25], frame=None, output=None,
                 output_dir=None, around=None, interval=None, quality=95, format="jpg",
-                max_fetch_mb=64, force=False, json=False)
+                max_fetch_mb=64, max_frames=100, force=False, json=False)
     data.update(kw)
     return argparse.Namespace(**data)
 
@@ -77,7 +78,9 @@ def server(path, mode="normal"):
             self.send_response(200 if state.mode == "ignore" else 206)
             if state.mode == "change" and state.requests > 1:
                 state.version = '"v2"'
-            self.send_header("ETag", state.version)
+            if state.mode != "modified":
+                self.send_header("ETag", 'W/' + state.version if state.mode == "weak" else state.version)
+            self.send_header("Last-Modified", state.modified)
             self.send_header("Content-Range", f"bytes {lo + (state.mode == 'bad')}-{hi}/{size}")
             self.send_header("Content-Length", str(hi - lo + 1))
             self.end_headers()
@@ -94,6 +97,7 @@ def server(path, mode="normal"):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
+    state.modified = "Mon, 19 Oct 2026 00:00:00 GMT"
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -130,7 +134,7 @@ class Frames(unittest.TestCase):
 
     def run_frames(self, source=None, **kw):
         kw.setdefault("output_dir", str(self.dest))
-        return rf.extract(args(**kw), source or self.small, kw.get("part") or 1)
+        return rf.extract_recording_frames(args(**kw), source or self.small, kw.get("part") or 1)
 
     def assert_frame(self, result, expected_sec, index=0, frame_number=None):
         f = result["frames"][index]
@@ -196,7 +200,7 @@ class Frames(unittest.TestCase):
             with self.assertRaisesRegex(rf.FrameError, "上限"):
                 self.run_frames(url, max_fetch_mb=.01)
             self.assertLessEqual(state.sent, .01 * 2**20)
-        with server(self.large) as (url, state), rf.RangeReader(url, 2**20 + 16) as reader:
+        with server(self.large) as (url, state), rf.FrameRangeReader(url, 2**20 + 16) as reader:
             self.assertEqual(len(reader.read(1)), 1)
             reader.seek(2**20)
             self.assertEqual(reader.read(1), b"")
@@ -206,7 +210,7 @@ class Frames(unittest.TestCase):
             self.assertEqual(reader.read(1), b"")
             self.assertEqual(reader.requests, before)
         # 缓存占用不会随整个视频大小增长；重复读取命中已取块。
-        with server(self.large) as (url, state), rf.RangeReader(url) as reader:
+        with server(self.large) as (url, state), rf.FrameRangeReader(url) as reader:
             reader.cache_size = 2 * reader.block_size
             for pos in range(0, min(reader.total, 2**20), reader.block_size):
                 reader.seek(pos)
@@ -229,7 +233,7 @@ class Frames(unittest.TestCase):
             with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(
                     status, headers={"Location": "https://evil.invalid/?SECRET"}, stream=body))) as client:
                 with self.assertRaisesRegex(rf.FrameError, str(status)) as e:
-                    rf.RangeReader("https://example.invalid/v?SECRET", client=client)
+                    rf.FrameRangeReader("https://example.invalid/v?SECRET", client=client)
             self.assertFalse(body.read)
             self.assertNotIn("SECRET", str(e.exception))
 
@@ -238,14 +242,16 @@ class Frames(unittest.TestCase):
                               ({"Content-Range": "bytes 0-15/20", "ETag": '"v"', "Content-Length": "17"}, b"a" * 17)]:
             with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(206, headers=headers, content=body))) as client:
                 with self.assertRaises(rf.FrameError):
-                    rf.RangeReader("https://example.invalid/v", client=client)
+                    rf.FrameRangeReader("https://example.invalid/v", client=client)
         modified = "Mon, 19 Oct 2026 00:00:00 GMT"
-        with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(206, headers={
-                "Content-Range": "bytes 0-15/100", "ETag": 'W/"weak"', "Last-Modified": modified},
-                content=b"0" * 16))) as client:
-            with rf.RangeReader("https://example.invalid/v", client=client) as reader:
-                self.assertEqual(reader.identity["validator"], ["Last-Modified", modified])
-        with server(self.large) as (url, _), rf.RangeReader(url) as reader:
+        for etag in ('W/"weak"', 'malformed-unquoted-tag'):
+            with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(206, headers={
+                    "Content-Range": "bytes 0-15/100", "ETag": etag, "Last-Modified": modified},
+                    content=b"0" * 16))) as client:
+                with rf.FrameRangeReader("https://example.invalid/v", client=client) as reader:
+                    self.assertEqual(reader.identity["validator"], ["Last-Modified", modified])
+                    self.assertFalse(reader.cache_reusable)
+        with server(self.large) as (url, _), rf.FrameRangeReader(url) as reader:
             class Partial(httpx.SyncByteStream):
                 def __iter__(self):
                     yield b"1234"
@@ -283,6 +289,107 @@ class Frames(unittest.TestCase):
         os.utime(copy, ns=(copy.stat().st_atime_ns, copy.stat().st_mtime_ns + 1000000))
         with self.assertRaisesRegex(rf.FrameError, "缓存"):
             self.run_frames(copy, **kw)
+
+    def test_frame_limits_precede_source_access_and_count_outputs(self):
+        oversized = [dict(at=[1] * 101), dict(at=None, frame=[(1, str(self.dest / f"{i}.jpg")) for i in range(101)]),
+                     dict(at=[5], around=5, interval=.01)]
+        for kw in oversized:
+            with self.subTest(kw=kw), mock.patch.object(rf, "recording_frame_source") as source:
+                with self.assertRaisesRegex(zju.ZjuError, "max-frames"):
+                    zju.cmd_recording_frame(args(**kw))
+                source.assert_not_called()
+        for value in (0, -1, 1.5, True):
+            with self.assertRaisesRegex(rf.FrameError, "正整数"):
+                rf.validate_frame_args(args(max_frames=value))
+        # 普通重复项实际产生不同图片，逐项计数；窗口重叠取并集。
+        self.assertEqual(len(rf.recording_frame_times(args(at=[1] * 101, max_frames=101))), 101)
+        r = self.run_frames(at=[1] * 3, max_frames=3)
+        self.assertEqual(r["frame_count"], 3)
+        r = self.run_frames(at=[1, 1, 2], around=1, interval=1, max_frames=4)
+        self.assertEqual([f["requested_time_sec"] for f in r["frames"]], [0, 1, 2, 3])
+        # 在获取时长前检查，视频尾裁剪不能绕过请求上限。
+        with self.assertRaisesRegex(rf.FrameError, "max-frames"):
+            self.run_frames(at=[9], around=2, interval=1, max_frames=4)
+        # 极密采样也不能无限迭代，舍入后重复点直接跳过。
+        with self.assertRaisesRegex(rf.FrameError, "max-frames"):
+            rf.validate_frame_args(args(at=[1], around=1, interval=1e-30))
+        self.assertEqual(rf.recording_frame_times(args(at=[0], around=1e-12, interval=1e-30)), [(0, None)])
+
+    def test_pair_write_failures_and_force_preserve_original(self):
+        path = self.dest / "pair.jpg"
+        opts = dict(output_dir=None, output=str(path))
+        with mock.patch.object(rf, "atomic_json", side_effect=OSError("disk full")), self.assertRaises(rf.FrameError):
+            self.run_frames(**opts)
+        self.assertFalse(path.exists())
+        self.assertFalse(rf.sidecar(path).exists())
+        self.assertFalse(list(self.dest.glob(".zju-frame-*")))
+        self.run_frames(**opts)
+        original, metadata = path.read_bytes(), rf.sidecar(path).read_bytes()
+        with mock.patch.object(rf, "atomic_json", side_effect=OSError("disk full")), self.assertRaises(rf.FrameError):
+            self.run_frames(at=[2], force=True, **opts)
+        self.assertEqual((path.read_bytes(), rf.sidecar(path).read_bytes()), (original, metadata))
+        # 模拟图片已替换、sidecar rename 失败，必须恢复原来的有效一对文件。
+        replace = os.replace
+        def fail_sidecar(src, dest):
+            if Path(dest) == rf.sidecar(path):
+                raise OSError("sidecar publish failed")
+            return replace(src, dest)
+        with mock.patch.object(rf.os, "replace", side_effect=fail_sidecar), self.assertRaises(rf.FrameError):
+            self.run_frames(at=[2], force=True, **opts)
+        self.assertEqual((path.read_bytes(), rf.sidecar(path).read_bytes()), (original, metadata))
+        self.assertTrue(self.run_frames(**opts)["frames"][0]["cache_hit"])
+        self.assertFalse(list(self.dest.glob(".zju-frame-*")))
+        # 相同失败发生在新建结果时，只移除本次发布的图片，不影响其他文件。
+        other = self.dest / "other.jpg"
+        def fail_new_sidecar(src, dest):
+            if Path(dest) == rf.sidecar(other):
+                raise OSError("sidecar publish failed")
+            return replace(src, dest)
+        with mock.patch.object(rf.os, "replace", side_effect=fail_new_sidecar), self.assertRaises(rf.FrameError):
+            self.run_frames(output_dir=None, output=str(other))
+        self.assertFalse(other.exists())
+        self.assertFalse(rf.sidecar(other).exists())
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_inconsistent_cache_and_competing_publishers(self):
+        path = self.dest / "pair.jpg"
+        opts = dict(output_dir=None, output=str(path))
+        self.run_frames(**opts)
+        record = json.loads(rf.sidecar(path).read_text())
+        record["image_sha256"] = "incorrect"
+        rf.sidecar(path).write_text(json.dumps(record))
+        with self.assertRaisesRegex(rf.FrameError, "缓存"):
+            self.run_frames(**opts)
+        self.assertFalse(self.run_frames(force=True, **opts)["frames"][0]["cache_hit"])
+        old = path.read_bytes(), rf.sidecar(path).read_bytes()
+        with rf.frame_output_lock(path):
+            with self.assertRaisesRegex(rf.FrameError, "另一进程"):
+                self.run_frames(at=[2], force=True, **opts)
+        self.assertEqual((path.read_bytes(), rf.sidecar(path).read_bytes()), old)
+        # 另一发布者在解码完成后抢先创建文件，必须拒绝而非覆盖/清理它。
+        competing = self.dest / "competing.jpg"
+        publish = rf.publish_frame_pair
+        def compete(staged, dest, record, overwrite):
+            dest.write_bytes(b"from another process")
+            return publish(staged, dest, record, overwrite)
+        with mock.patch.object(rf, "publish_frame_pair", side_effect=compete), self.assertRaises(rf.FrameError):
+            self.run_frames(output_dir=None, output=str(competing))
+        self.assertEqual(competing.read_bytes(), b"from another process")
+
+    def test_last_modified_is_not_cross_invocation_content_identity(self):
+        for mode in ("modified", "weak"):
+            with self.subTest(mode=mode), server(self.large, mode) as (url, state):
+                out = self.dest / f"{mode}.jpg"
+                opts = dict(at=[58], output_dir=None, output=str(out))
+                self.run_frames(url, **opts)  # 弱验证器仍可进行远端读取。
+                with self.assertRaisesRegex(rf.FrameError, "缓存"):
+                    self.run_frames(url, **opts)
+                self.assertFalse(self.run_frames(url, force=True, **opts)["frames"][0]["cache_hit"])
+                with rf.FrameRangeReader(url) as reader:
+                    self.assertFalse(reader.cache_reusable)
+                    state.modified = "Tue, 20 Oct 2026 00:00:00 GMT"
+                    with self.assertRaisesRegex(rf.FrameError, "版本已变化"):
+                        reader._fetch(16, 31)
 
     def test_remote_cache_signed_url_refresh_and_version_change(self):
         with server(self.large) as (url, state):
@@ -324,8 +431,8 @@ class Frames(unittest.TestCase):
                 self.run_frames(**overrides)
         for value in ("-1", "nan", "inf", "01:60:00", "a", "01:01", "00:00:61"):
             with self.assertRaises(argparse.ArgumentTypeError):
-                rf.parse_time(value)
-        self.assertEqual(rf.parse_time("01:23:45.125"), 5025.125)
+                rf.parse_frame_time(value)
+        self.assertEqual(rf.parse_frame_time("01:23:45.125"), 5025.125)
 
     def test_atomic_encoding_failure(self):
         p = self.dest / "frame.jpg"
@@ -352,10 +459,8 @@ class Frames(unittest.TestCase):
     def test_failed_publish_keeps_existing_image(self):
         path = self.dest / "exists.jpg"
         path.write_bytes(b"original")
-        frame = mock.Mock()
-        frame.to_image.return_value = Image.new("RGB", (10, 10))
         with self.assertRaisesRegex(rf.FrameError, "未覆盖"):
-            rf.atomic_image(frame, path, 95, False)
+            self.run_frames(output_dir=None, output=str(path))
         self.assertEqual(path.read_bytes(), b"original")
         self.assertEqual(list(self.dest.iterdir()), [path])
 
@@ -364,20 +469,19 @@ class Frames(unittest.TestCase):
         with mock.patch.object(rf.os, "link", side_effect=OSError(errno.ENOTSUP, "unsupported")):
             r = self.run_frames(output_dir=None, output=str(path))
             self.assert_frame(r, 1.2)
-            frame = mock.Mock()
-            frame.to_image.return_value = Image.new("RGB", (10, 10))
             original = path.read_bytes()
             with self.assertRaisesRegex(rf.FrameError, "未覆盖"):
-                rf.atomic_image(frame, path, 95, False)
+                self.run_frames(at=[2], output_dir=None, output=str(path))
             self.assertEqual(path.read_bytes(), original)
+            self.assert_frame(self.run_frames(at=[2], output_dir=None, output=str(path), force=True), 2)
         self.assertFalse(list(self.dest.glob(".zju-frame-*")))
 
     def test_part_selection_and_local_priority(self):
-        self.assertEqual(rf.select_part(["one"], None), (1, "one"))
-        self.assertEqual(rf.select_part(["one", "two"], 2), (2, "two"))
+        self.assertEqual(rf.select_recording_part(["one"], None), (1, "one"))
+        self.assertEqual(rf.select_recording_part(["one", "two"], 2), (2, "two"))
         for urls, part in [([], None), (["a", "b"], None), (["a"], 2)]:
             with self.assertRaises(rf.FrameError):
-                rf.select_part(urls, part)
+                rf.select_recording_part(urls, part)
         sub = dict(course_id=89253, sub_id=2038840, course_name="课", sub_name="堂")
         z = mock.Mock()
         z.course_subs.return_value = [sub]
@@ -429,6 +533,33 @@ with mock.patch.object(zju, 'recording_frame_source', return_value=(Path(sys.arg
             self.assertEqual(r["frames"][0]["requested_time_sec"], 1.25)
         self.assertNotEqual(*outputs)
         self.assertFalse((self.dest / "sync").exists())
+
+    def test_standalone_script_pep723_and_lazy_decoder(self):
+        isolated = self.dest / "standalone"
+        isolated.mkdir()
+        script = isolated / "zju.py"
+        shutil.copy2(ROOT / "zju.py", script)
+        # 独立目录只有脚本；检查普通 CLI 不导入 PyAV，也没有仓库搜索路径。
+        code = "import runpy,sys; runpy.run_path(sys.argv[1], run_name='standalone'); assert 'av' not in sys.modules"
+        subprocess.run([sys.executable, "-I", "-c", code, str(script)], cwd=isolated, check=True, capture_output=True)
+        source = self.dest / "local.mp4"
+        source.write_bytes(self.small.read_bytes())
+        manifest = {"video:89253:2038840:1": {"path": source.name, "size": source.stat().st_size}}
+        (self.dest / ".zju_manifest.json").write_text(json.dumps(manifest))
+        uv = shutil.which("uv")
+        runner = [uv, "run", "--script", str(script)] if uv else [sys.executable, "-I", str(script)]
+        env = dict(os.environ, ZJU_STATE_DIR=str(self.dest / "state"), PYTHONIOENCODING="utf-8")
+        env.pop("PYTHONPATH", None)
+        for option in ("--help", "recording-frame"):
+            options = ([option] if option == "--help" else
+                       ["--out", str(self.dest), option, "--course", "89253", "--sub", "2038840",
+                        "--at", "1.25", "--output", str(self.dest / "isolated.jpg"), "--json"])
+            run = subprocess.run(runner + options, cwd=isolated, env=env, capture_output=True, text=True, check=True)
+            if option == "recording-frame":
+                result = json.loads(run.stdout)
+                self.assert_frame(result, 1.2)
+                self.assertEqual(result["source_type"], "local")
+        self.assertEqual(list(isolated.iterdir()), [script])
 
 
 if __name__ == "__main__":

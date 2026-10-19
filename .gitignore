@@ -5,3 +5,6 @@ __pycache__/
 .env
 cookies.pkl
 config.json
+
+# 本地开发实验记录
+/docs/recording-frame-validation.md
