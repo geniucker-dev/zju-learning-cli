@@ -236,10 +236,12 @@ def refer_params(activity: dict | None) -> dict | None:
 
 
 class Zju:
-    def __init__(self):
+    def __init__(self, *, classroom_first=False):
         self.jar = requests.cookies.RequestsCookieJar()  # 各执行绪 session 共用（CookieJar 自带锁）
         self._tl = threading.local()
         self.logged_in = False
+        self.classroom_first = classroom_first
+        self._frame_reauthenticated = False
         self._load_cookies()
 
     def _load_cookies(self):
@@ -270,6 +272,15 @@ class Zju:
         """默认直连，连不上才退环境 proxy。
         重试只给幂等请求（GET 或明确 retry=True）；非幂等只在「确定没送出」（连接逾时／proxy 错）时重试，
         免得登录 POST 被重送、触发 CAS 验证码。TLS 错误不重试：跟断线要分得出来。"""
+        endpoint = urlsplit(url)
+        frame_api = (getattr(self, "classroom_first", False) and method == "GET" and endpoint.scheme == "https"
+                     and (endpoint.hostname, endpoint.path) in {
+            ("classroom.zju.edu.cn", "/userapi/v1/infosimple"),
+            ("classroom.zju.edu.cn", "/courseapi/v2/course/catalogue"),
+            ("yjapi.cmc.zju.edu.cn", "/courseapi/v3/multi-search/get-course-detail"),
+        })
+        if frame_api:
+            kw["allow_redirects"] = False
         kw.setdefault("timeout", TIMEOUT)
         idempotent = method in ("GET", "HEAD") if retry is None else retry
         last = None
@@ -291,6 +302,15 @@ class Zju:
                     r.close()
                     time.sleep(min(int(wait), 60) if wait.isdigit() else 2 * 2 ** attempt)
                     continue
+                if frame_api:
+                    if self._frame_auth_expired(r):
+                        r.close()
+                        self._frame_login()
+                        kw["headers"] = {**kw.get("headers", {}), **self.bearer()}
+                        return self.req(method, url, retry=retry, **kw)
+                    if not r.ok or r.is_redirect:
+                        r.close()
+                        raise ZjuError(f"智云接口请求失败 HTTP {r.status_code}（不跟随重定向）")
                 return r
             time.sleep(0.3 * 2 ** attempt)
         raise ZjuError(f"连接失败：{url}\n{last}")
@@ -352,10 +372,42 @@ class Zju:
     def ensure(self, need_classroom: bool = False):
         if self.logged_in:
             return
+        if getattr(self, "classroom_first", False) and need_classroom:
+            # 使用业务请求验证现有智云 token；不先访问学在浙大待办接口。
+            if not self._token(silent=True):
+                self._frame_login()
+            return
         if self.courses_alive() and (not need_classroom or self._token(silent=True)):
             self.logged_in = True
             return
         self.login(*get_credentials())
+
+    def _frame_login(self):
+        if self._frame_reauthenticated:
+            raise ZjuError("智云认证失败或无权访问该接口（重新登录后仍被拒绝）")
+        self._frame_reauthenticated = True
+        self.logged_in = False
+        self.login(*get_credentials())
+
+    @staticmethod
+    def _frame_auth_expired(r):
+        if r.status_code in (401, 403):
+            return True
+        if r.is_redirect:
+            target = urlsplit(urljoin(r.url, r.headers.get("Location", "")))
+            return (target.hostname in {"zjuam.zju.edu.cn", "identity.zju.edu.cn",
+                                        "classroom.zju.edu.cn", "tgmedia.cmc.zju.edu.cn"}
+                    and any(word in target.path.lower() for word in ("login", "auth")))
+        try:
+            data = r.json()
+        except ValueError:
+            return "统一身份认证" in r.text and 'name="execution"' in r.text
+        if not isinstance(data, dict):
+            return False
+        result = data.get("result")
+        return (data.get("code") in (401, 403, "401", "403") or
+                (isinstance(result, dict) and (result.get("status") in (401, 403, "401", "403")
+                                              or result.get("name") == "Unauthorized")))
 
     def _token(self, silent=False) -> str | None:
         for c in self.s.cookies:
@@ -2452,7 +2504,9 @@ def add_recording_frame_arguments(sp, fn):
     p.add_argument("--format", choices=("jpg", "png"), default="jpg", help="自动命名的图片格式；完整路径按扩展名选择")
     p.add_argument("--max-fetch-mb", type=float, default=64, help="远端实际响应体读取上限 MiB（默认 64，必须 > 0）")
     p.add_argument("--max-frames", type=int, default=100, help="请求输出帧数上限（默认 100，正整数）；窗口重叠去重，视频尾裁剪前计数")
-    p.add_argument("--force", action="store_true", help="覆盖已有图片及元数据，忽略缓存")
+    p.add_argument("--index-cache-dir", help="可选 MP4 索引缓存目录；默认不持久缓存，只有强 ETag 才复用")
+    p.add_argument("--index-cache-mb", type=int, default=256, help="索引缓存总容量 MiB（默认 256，正整数；仅搭配缓存目录生效）")
+    p.add_argument("--force", action="store_true", help="覆盖已有图片及元数据，忽略图片缓存（已验证索引仍可用）")
     p.add_argument("--json", action="store_true", help="stdout 只输出一个 JSON 对象，诊断信息在 stderr")
     p.set_defaults(fn=fn)
 
@@ -2466,6 +2520,11 @@ def validate_frame_args(a):
         raise FrameError("--max-fetch-mb 必须是有限正数")
     if isinstance(a.max_frames, bool) or not isinstance(a.max_frames, int) or a.max_frames < 1:
         raise FrameError("--max-frames 必须是正整数")
+    cache_mb = getattr(a, "index_cache_mb", 256)
+    if isinstance(cache_mb, bool) or not isinstance(cache_mb, int) or cache_mb < 1:
+        raise FrameError("--index-cache-mb 必须是正整数")
+    if getattr(a, "index_cache_dir", None) == "":
+        raise FrameError("--index-cache-dir 不能为空")
     if a.output == "" or a.output_dir == "":
         raise FrameError("输出路径不能为空")
     if a.frame and (a.output or a.output_dir or a.around is not None or a.interval is not None):
@@ -2526,6 +2585,208 @@ def recording_frame_times(a):
     return [(t, None) for t in sorted(points)]
 
 
+class FrameIndexCache:
+    """只存完整 moov；固定头 + 按 MiB 校验的索引正文，原子发布，写者非阻塞互斥。
+
+    读者不持锁等待网络。写者从首次索引数据到发布期间持锁，其他写者直接跳过；
+    OS 自动释放异常退出进程的锁，下次写入清理未发布的 .pending。
+    """
+    header_size = 64 * 1024
+    chunk_size = 1024 * 1024
+    max_index = 64 * 1024 * 1024
+    magic = b"ZJUIDX1\n"
+
+    def __init__(self, directory, limit, identity):
+        self.root = Path(directory).expanduser().resolve() / "zju-frame-index-v1"
+        self.limit = limit
+        self.key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        self.total = identity["size"]
+        self.path = self.root / (self.key + ".idx")
+        self.entry = self.writer = self.lock = None
+        self.coverage = []
+        self.write_attempted = self.warned = False
+        try:
+            self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                with frame_output_lock(self.root / "index-cache"):
+                    (self.root / ".pending").unlink(missing_ok=True)
+                    self._prune(0)
+            except (OSError, FrameError):
+                pass
+            if self.path.is_symlink():
+                return
+            with self.path.open("rb") as f:
+                if f.read(8) != self.magic:
+                    return
+                count = int.from_bytes(f.read(4), "big")
+                if not 0 < count <= self.header_size - 44:
+                    return
+                digest = f.read(32)
+                encoded = f.read(count)
+                if hashlib.sha256(encoded).digest() != digest:
+                    return
+                m = json.loads(encoded)
+                start, size = m["start"], m["size"]
+                if (m["key"] != self.key or m["total"] != self.total
+                        or type(start) is not int or type(size) is not int
+                        or not 0 <= start < self.total or not 8 <= size < self.total
+                        or start + size > self.total or size > self.max_index
+                        or self.header_size + size + 1 > limit
+                        or os.fstat(f.fileno()).st_size != self.header_size + size
+                        or not isinstance(m["sha256"], list)
+                        or len(m["sha256"]) != (size + self.chunk_size - 1) // self.chunk_size
+                        or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-f]{64}", h)
+                               for h in m["sha256"])):
+                    return
+                f.seek(self.header_size)
+                box = f.read(16)
+                box_size = int.from_bytes(box[:4], "big")
+                box_size = int.from_bytes(box[8:16], "big") if box_size == 1 else box_size or self.total - start
+                if box[4:8] != b"moov" or box_size != size:
+                    return
+                self.entry = m
+            os.utime(self.path, None)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError):
+            self.entry = None
+
+    def _prune(self, needed):
+        """调用者持写锁；只管理本命名空间的索引文件，总量包含元数据及暂存。"""
+        entries = [p for p in self.root.glob("*.idx")
+                   if re.fullmatch(r"[0-9a-f]{64}\.idx", p.name) and not p.is_symlink()]
+        used = sum(p.stat().st_size for p in entries)
+        for p in sorted(entries, key=lambda p: p.stat().st_mtime_ns):
+            if used + needed + 1 <= self.limit:
+                break
+            length = p.stat().st_size
+            try:
+                p.unlink()
+            except OSError:
+                continue  # Windows 正在读取的文件可能暂时不能删除。
+            used -= length
+        return used + needed + 1 <= self.limit
+
+    def _warn(self, error):
+        if not self.warned:
+            log(f"[索引缓存] 不可用（{type(error).__name__}），继续正常 Range 读取")
+            self.warned = True
+
+    def read(self, start, end):
+        """读取缓存范围内的闭区间，每次校验所用块；损坏/淘汰时回退网络。"""
+        m = self.entry
+        if not m or not m["start"] <= start <= end < m["start"] + m["size"]:
+            return None
+        result = bytearray()
+        try:
+            if self.path.is_symlink():
+                raise ValueError("symlink")
+            with self.path.open("rb") as f:
+                if os.fstat(f.fileno()).st_size != self.header_size + m["size"]:
+                    raise ValueError("size")
+                first, last = start - m["start"], end - m["start"]
+                for i in range(first // self.chunk_size, last // self.chunk_size + 1):
+                    offset = i * self.chunk_size
+                    f.seek(self.header_size + offset)
+                    data = f.read(min(self.chunk_size, m["size"] - offset))
+                    if hashlib.sha256(data).hexdigest() != m["sha256"][i]:
+                        raise ValueError("checksum")
+                    result.extend(data[max(0, first - offset):min(len(data), last - offset + 1)])
+            return bytes(result)
+        except (OSError, ValueError):
+            self.entry = None
+            try:
+                with frame_output_lock(self.root / "index-cache"):
+                    self.path.unlink(missing_ok=True)
+            except (OSError, FrameError):
+                pass
+            return None
+
+    def capture(self, moov, base, data):
+        """只收集已通过 Range 校验的数据；不会为填充缓存额外发起请求。"""
+        if self.entry:
+            return
+        start, end = moov
+        lo, hi = max(start, base), min(end, base + len(data))
+        if lo >= hi:
+            return
+        try:
+            if not self.write_attempted:
+                self.write_attempted = True
+                size = end - start
+                if size >= self.total or size > self.max_index or size + self.header_size + 1 > self.limit:
+                    return
+                lock = ExitStack()
+                try:
+                    lock.enter_context(frame_output_lock(self.root / "index-cache"))
+                except (OSError, FrameError):
+                    lock.close()
+                    return  # 另一个写者在填充；不阻塞截图，也不重复创建暂存数据。
+                self.lock = lock
+                pending = self.root / ".pending"
+                pending.unlink(missing_ok=True)
+                needed = self.header_size + size
+                if not self._prune(needed):
+                    self.close()
+                    return
+                self.writer = pending.open("x+b")
+                self.writer.truncate(needed)  # 总容量也包含尚未发布的暂存文件。
+                self.writing = {"key": self.key, "total": self.total, "start": start, "size": size}
+            if not self.writer:
+                return
+            self.writer.seek(self.header_size + lo - start)
+            self.writer.write(data[lo - base:hi - base])
+            merged = []
+            for left, right in sorted(self.coverage + [(lo - start, hi - start)]):
+                if merged and left <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(right, merged[-1][1]))
+                else:
+                    merged.append((left, right))
+            self.coverage = merged
+            if merged != [(0, end - start)]:
+                return
+            self.writer.seek(self.header_size)
+            hashes = []
+            remaining = end - start
+            while remaining:
+                chunk = self.writer.read(min(self.chunk_size, remaining))
+                if not chunk:
+                    raise OSError("incomplete index")
+                hashes.append(hashlib.sha256(chunk).hexdigest())
+                remaining -= len(chunk)
+            metadata = dict(self.writing, sha256=hashes)
+            encoded = json.dumps(metadata, separators=(",", ":")).encode()
+            self.writer.seek(0)
+            self.writer.write(self.magic + len(encoded).to_bytes(4, "big")
+                              + hashlib.sha256(encoded).digest() + encoded)
+            self.writer.flush()
+            os.fsync(self.writer.fileno())
+            self.writer.close()
+            self.writer = None
+            os.replace(self.root / ".pending", self.path)
+            self.entry = metadata
+            self.close()
+        except (OSError, ValueError) as error:
+            self._warn(error)
+            self.close()
+
+    def close(self):
+        try:
+            if self.writer:
+                self.writer.close()
+        except OSError:
+            pass
+        finally:
+            self.writer = None
+            if self.lock:
+                try:
+                    (self.root / ".pending").unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self.lock.close()
+                self.lock = None
+
+
 class FrameRangeReader(io.RawIOBase):
     """PyAV 自定义 IO：1MiB 块，已确认的 moov 索引最多合并 4 块，缓存 8MiB。
 
@@ -2535,7 +2796,8 @@ class FrameRangeReader(io.RawIOBase):
     block_size = 1024 * 1024
     cache_size = 8 * 1024 * 1024
 
-    def __init__(self, url, max_bytes=64 * 2**20, *, client=None):
+    def __init__(self, url, max_bytes=64 * 2**20, *, client=None,
+                 index_cache_dir=None, index_cache_bytes=256 * 2**20):
         super().__init__()
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
@@ -2549,6 +2811,7 @@ class FrameRangeReader(io.RawIOBase):
         self.total = None
         self.validator = None
         self.cache = OrderedDict()
+        self.index_cache = None
         self.last_error = None
         try:
             self._fetch(0, 15)
@@ -2560,6 +2823,8 @@ class FrameRangeReader(io.RawIOBase):
             if not self.cache_reusable:
                 # Last-Modified 只用于本次 If-Range/响应校验，不能证明跨次内容相同。
                 self.identity["invocation"] = os.urandom(16).hex()
+            elif index_cache_dir is not None:
+                self.index_cache = FrameIndexCache(index_cache_dir, index_cache_bytes, self.identity)
         except BaseException:
             self.close()
             raise
@@ -2692,7 +2957,7 @@ class FrameRangeReader(io.RawIOBase):
                     break
             if self.bytes_received + upper - base <= self.max_bytes:
                 end = upper
-        data = self._fetch(base, end - 1)
+        data = self._range_data(base, end - 1)
         # 从已确认的顶层 box 边界行走，不在媒体中搜索 "moov" 字符串。
         # mdat 后的 moov 也可识别；头部不足或损坏时保持原逐块读取行为。
         offset = getattr(self, "_next_box", 0)
@@ -2713,13 +2978,31 @@ class FrameRangeReader(io.RawIOBase):
                 break
             offset += size
             self._next_box = offset
+        if self.index_cache and getattr(self, "_moov_range", None):
+            self.index_cache.capture(self._moov_range, base, data)
         for pos in range(0, len(data), self.block_size):
             self.cache[base + pos] = data[pos:pos + self.block_size]
             while len(self.cache) > self.cache_size // self.block_size:
                 self.cache.popitem(last=False)
 
+    def _range_data(self, start, end):
+        cache = self.index_cache
+        if cache and cache.entry:
+            m = cache.entry
+            lo, hi = max(start, m["start"]), min(end, m["start"] + m["size"] - 1)
+            if lo <= hi:
+                middle = cache.read(lo, hi)
+                if middle is not None:
+                    # 索引外的字节仍经过原 Range 校验与流量计数，不持久保存媒体。
+                    prefix = self._fetch(start, lo - 1) if start < lo else b""
+                    suffix = self._fetch(hi + 1, end) if hi < end else b""
+                    return prefix + middle + suffix
+        return self._fetch(start, end)
+
     def close(self):
         if not self.closed:
+            if getattr(self, "index_cache", None):
+                self.index_cache.close()
             if getattr(self, "own_client", False):
                 self.client.close()
             if hasattr(self, "cache"):
@@ -2993,7 +3276,10 @@ def extract_recording_frames(a, source, part, *, client=None):
                             "size": before.st_size, "mtime_ns": before.st_mtime_ns,
                             "ctime_ns": before.st_ctime_ns, "inode": before.st_ino}
             else:
-                reader = stack.enter_context(FrameRangeReader(source, int(a.max_fetch_mb * 2**20), client=client))
+                reader = stack.enter_context(FrameRangeReader(
+                    source, int(a.max_fetch_mb * 2**20), client=client,
+                    index_cache_dir=getattr(a, "index_cache_dir", None),
+                    index_cache_bytes=getattr(a, "index_cache_mb", 256) * 2**20))
                 handle, source_type, identity = reader, "remote", reader.identity
             plans = None
             # 已有输出且所有精确时间均命中时，只验证来源/图片，不打开 MP4 索引。
@@ -3107,7 +3393,7 @@ def cmd_recording_frame(a):
         # 认证过程中若有交互提示，也不能污染 --json 的 stdout。
         from contextlib import redirect_stdout
         with redirect_stdout(sys.stderr):
-            source, part = recording_frame_source(Zju(), a, Path(a.out).expanduser())
+            source, part = recording_frame_source(Zju(classroom_first=True), a, Path(a.out).expanduser())
             result = extract_recording_frames(a, source, part)
         if a.json:
             # JSON 转义保留真实路径，且兼容 Windows 重定向时的非 UTF-8 代码页。
