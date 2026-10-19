@@ -2909,14 +2909,78 @@ class FrameDecoder:
         return self.previous, float(self.timestamp(self.previous))
 
 
+def frame_output_plans(a, part, identity, times, directory):
+    plans, occupied = [], set()
+    for sec, explicit in times:
+        path = (Path(explicit).expanduser().resolve() if explicit else
+                directory / f"{a.course}_{a.sub}_p{part:02d}_{stamp_name(sec)}.{a.format}")
+        key = {"version": 1, "source": identity, "course_id": a.course, "sub_id": a.sub,
+               "part": part, "requested_time_sec": sec, "format": image_format(path), "quality": a.quality}
+        hit = None if a.force else cached(path, key)
+        exists = path.exists() or sidecar(path).exists()
+        if explicit and exists and not hit and not a.force:
+            raise FrameError(f"已有图片无法确认缓存有效，未覆盖：{path}（使用 --force）")
+        if not explicit:
+            base, number = path, 1
+            while ((path.exists() or sidecar(path).exists()) and not hit and not a.force) or path in occupied:
+                path = base.with_name(f"{base.stem}_{number}{base.suffix}")
+                number += 1
+                hit = None if a.force else cached(path, key)
+        occupied.add(path)
+        plans.append((sec, path, key, hit))
+    return plans
+
+
+def cached_frame_duration(plans):
+    """全部图片命中时，从匹配来源的请求记录恢复时长；旧/缺失记录回退到 MP4。"""
+    if not plans or not all(hit for _, _, _, hit in plans):
+        return None
+    duration = None
+    try:
+        for sec, path, key, hit in plans:
+            record = json.loads(sidecar(path).read_text(encoding="utf-8"))
+            # 再次核对 key，避免两次 sidecar 读取之间被另一进程替换。
+            request = record["request"]
+            value = request["duration_sec"]
+            if (record["cache_key"] != key or isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or not 0 <= sec < value
+                    or any(request[field] != key[field] for field in ("course_id", "sub_id", "part"))
+                    or request["source_size"] != key["source"]["size"]
+                    or request["source_type"] != hit["source_type"]
+                    or (duration is not None and duration != value)):
+                return None
+            duration = value
+    except (OSError, ValueError, KeyError, TypeError, OverflowError):
+        return None
+    return duration
+
+
 def extract_recording_frames(a, source, part, *, client=None):
     """source 是完整本地 Path 或远端 URL；返回稳定的请求级 JSON 对象。"""
     validate_frame_args(a)
     started = time.monotonic()
     reader = None
+    temporary = not (a.frame or a.output or a.output_dir)
+    directory = Path(a.output_dir).expanduser().resolve() if a.output_dir else None
+
+    def result_for(frames, duration, seeks=0, decoded=0):
+        return {"course_id": a.course, "sub_id": a.sub, "part": part, "temporary": temporary,
+                "output_dir": str(directory) if directory else None, "frames": frames,
+                "frame_count": len(frames), "source_type": source_type,
+                "source_size": identity["size"], "duration_sec": duration,
+                "network": {"requests": reader.requests if reader else 0,
+                            "bytes_received": reader.bytes_received if reader else 0},
+                "decode": {"seeks": seeks, "frames": decoded},
+                "elapsed_sec": time.monotonic() - started}
+
+    def check_local_source():
+        if source_type == "local":
+            after = source.stat()
+            if (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino) != (
+                    before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino):
+                raise FrameError("本地视频在提取期间发生变化，输出不可复用；请重新运行")
+
     try:
-        # 运行其他命令不初始化原生视频库。
-        import av
         with ExitStack() as stack:
             if isinstance(source, Path):
                 source = source.resolve()
@@ -2931,6 +2995,17 @@ def extract_recording_frames(a, source, part, *, client=None):
             else:
                 reader = stack.enter_context(FrameRangeReader(source, int(a.max_fetch_mb * 2**20), client=client))
                 handle, source_type, identity = reader, "remote", reader.identity
+            plans = None
+            # 已有输出且所有精确时间均命中时，只验证来源/图片，不打开 MP4 索引。
+            # 远端仍先发 Range 探测，只有强 ETag 身份才能跨次命中。
+            if not a.force and not temporary and a.around is None:
+                plans = frame_output_plans(a, part, identity, recording_frame_times(a), directory)
+                duration = cached_frame_duration(plans)
+                if duration is not None:
+                    check_local_source()
+                    return result_for([hit for _, _, _, hit in plans], duration)
+            # 运行其他命令或全部缓存命中时均不初始化原生视频库。
+            import av
             container = stack.enter_context(av.open(handle, mode="r", format="mp4"))
             if reader and reader.last_error:
                 raise reader.last_error
@@ -2939,27 +3014,10 @@ def extract_recording_frames(a, source, part, *, client=None):
                 if sec >= decoder.duration:
                     raise FrameError(f"请求时间 {sec:g} 秒超出视频范围 [0, {decoder.duration:g}) 秒")
             times = [(sec, path) for sec, path in recording_frame_times(a) if sec < decoder.duration]
-            temporary = not (a.frame or a.output or a.output_dir)
-            directory = (Path(tempfile.mkdtemp(prefix="zju-frames-")).resolve() if temporary else
-                         Path(a.output_dir).expanduser().resolve() if a.output_dir else None)
-            plans, occupied = [], set()
-            for sec, explicit in times:
-                path = (Path(explicit).expanduser().resolve() if explicit else
-                        directory / f"{a.course}_{a.sub}_p{part:02d}_{stamp_name(sec)}.{a.format}")
-                key = {"version": 1, "source": identity, "course_id": a.course, "sub_id": a.sub,
-                       "part": part, "requested_time_sec": sec, "format": image_format(path), "quality": a.quality}
-                hit = None if a.force else cached(path, key)
-                exists = path.exists() or sidecar(path).exists()
-                if explicit and exists and not hit and not a.force:
-                    raise FrameError(f"已有图片无法确认缓存有效，未覆盖：{path}（使用 --force）")
-                if not explicit:
-                    base, number = path, 1
-                    while ((path.exists() or sidecar(path).exists()) and not hit and not a.force) or path in occupied:
-                        path = base.with_name(f"{base.stem}_{number}{base.suffix}")
-                        number += 1
-                        hit = None if a.force else cached(path, key)
-                occupied.add(path)
-                plans.append((sec, path, key, hit))
+            if temporary:
+                directory = Path(tempfile.mkdtemp(prefix="zju-frames-")).resolve()
+            if plans is None:
+                plans = frame_output_plans(a, part, identity, times, directory)
             results, written = {}, []
             # 排序解码，返回时恢复请求顺序；相同时间复用解码结果。
             frame = None
@@ -2986,19 +3044,9 @@ def extract_recording_frames(a, source, part, *, client=None):
                 record = {"cache_key": key, "image_sha256": digest, "frame": metadata}
                 written.append((staged, path, record))
                 results[index] = metadata
-            after = source.stat() if source_type == "local" else None
-            if after and (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino) != (
-                    before.st_size, before.st_mtime_ns, before.st_ctime_ns, before.st_ino):
-                raise FrameError("本地视频在提取期间发生变化，输出不可复用；请重新运行")
+            check_local_source()
             frames = [results[i] for i in range(len(plans))]
-            result = {"course_id": a.course, "sub_id": a.sub, "part": part, "temporary": temporary,
-                    "output_dir": str(directory) if directory else None, "frames": frames,
-                    "frame_count": len(frames), "source_type": source_type,
-                    "source_size": identity["size"], "duration_sec": decoder.duration,
-                    "network": {"requests": reader.requests if reader else 0,
-                                "bytes_received": reader.bytes_received if reader else 0},
-                    "decode": {"seeks": decoder.seeks, "frames": decoder.decoded_frames},
-                    "elapsed_sec": time.monotonic() - started}
+            result = result_for(frames, decoder.duration, decoder.seeks, decoder.decoded_frames)
             request = {key: value for key, value in result.items() if key != "frames"}
             for staged, path, record in written:
                 publish_frame_pair(staged, path, dict(record, request=request), a.force)

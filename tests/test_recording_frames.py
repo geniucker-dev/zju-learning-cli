@@ -444,11 +444,43 @@ class Frames(unittest.TestCase):
             second = self.run_frames(url.replace("SECRET", "NEW_SIGNATURE"), **kw)
             self.assertTrue(second["frames"][0]["cache_hit"])
             self.assertEqual(second["decode"]["frames"], 0)
+            self.assertEqual(second["network"], {"requests": 1, "bytes_received": 16})
             state.version = '"new-version"'
             with self.assertRaisesRegex(rf.FrameError, "缓存"):
                 self.run_frames(url, **kw)
             self.assertFalse(self.run_frames(url, force=True, **kw)["frames"][0]["cache_hit"])
             self.assertLess(first["network"]["bytes_received"], self.large.stat().st_size)
+
+    def test_verified_cache_skips_container_and_legacy_metadata_falls_back(self):
+        out = self.dest / "cached.jpg"
+        options = dict(output_dir=None, output=str(out))
+        first = self.run_frames(**options)
+        with mock.patch.object(av, "open", side_effect=AssertionError("缓存命中不应打开视频")):
+            cached = self.run_frames(**options)
+        self.assertTrue(cached["frames"][0]["cache_hit"])
+        self.assertEqual(cached["duration_sec"], first["duration_sec"])
+        self.assertEqual(cached["decode"], {"seeks": 0, "frames": 0})
+        self.assertEqual(cached["network"], {"requests": 0, "bytes_received": 0})
+        metadata = json.loads(rf.sidecar(out).read_text())
+        for change in (None, dict(metadata["request"], duration_sec=-1),
+                       dict(metadata["request"], source_size=0)):
+            altered = dict(metadata)
+            if change is None:
+                altered.pop("request")
+            else:
+                altered["request"] = change
+            rf.sidecar(out).write_text(json.dumps(altered))
+            with mock.patch.object(av, "open", wraps=av.open) as opened:
+                result = self.run_frames(**options)
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(result["duration_sec"], first["duration_sec"])
+        rf.sidecar(out).write_text(json.dumps(metadata))
+        self.run_frames()  # 为下一批准备一张命中、一张缺失的自动命名截图。
+        with mock.patch.object(av, "open", wraps=av.open) as opened:
+            result = self.run_frames(at=[1.25, 2], output_dir=str(self.dest))
+        self.assertEqual(opened.call_count, 1)
+        self.assertTrue(result["frames"][0]["cache_hit"])
+        self.assertFalse(result["frames"][1]["cache_hit"])
 
     def test_auto_names_no_collisions_and_batch_explicit_paths(self):
         paths = set()
