@@ -313,5 +313,47 @@ class CourseMetadata(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), content)
 
 
+class TranscriptPrecision(unittest.TestCase):
+    def test_milliseconds_rounding_carries_and_formatting(self):
+        cases = [(5025.12, "01:23:45.120"), (5032.875, "01:23:52.875"),
+                 (61.12, "00:01:01.120"), (0, "00:00:00.000"),
+                 (1.0004, "00:00:01.000"), (1.9995, "00:00:02.000"),
+                 (59.9995, "00:01:00.000"), (3599.9995, "01:00:00.000")]
+        for seconds, expected in cases:
+            with self.subTest(seconds=seconds):
+                items = [dict(BeginSec=seconds, EndSec=seconds, Text="内容")]
+                self.assertEqual(zju.render_transcript(items, "md", "标题"),
+                                 f"# 标题\n\n**[{expected} → {expected}]** 内容  \n")
+                self.assertEqual(zju.render_transcript(items, "srt", "标题"),
+                                 f"1\n{expected.replace('.', ',')} --> {expected.replace('.', ',')}\n内容\n\n")
+        self.assertEqual(zju.render_transcript([dict(BeginSec=61.12, Text="内容")], "txt", "标题"),
+                         "[00:01:01] 内容\n")
+
+    def test_old_markdown_skipped_and_force_only_rewrites_after_successful_write(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sub = dict(course_id=1, course_name="课程", sub_id=11, sub_name="堂次")
+            path = zju.classroom_material_path(root, sub, "转录", "md")
+            path.parent.mkdir(parents=True)
+            old = "# 课程 堂次\n\n**[00:00:01 → 00:00:02]** 旧内容  \n"
+            path.write_text(old, encoding="utf-8")
+            before = path.stat().st_mtime_ns
+            client = mock.MagicMock()
+            client.subtitle.return_value = [dict(BeginSec=1.12, EndSec=2.875, Text="新内容")]
+            args = Namespace(format="md", force=False)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                zju.transcript_one(client, args, root, sub)
+                client.subtitle.assert_not_called()
+                self.assertEqual((path.read_text(encoding="utf-8"), path.stat().st_mtime_ns), (old, before))
+                args.force = True
+                with mock.patch.object(zju.os, "replace", side_effect=OSError("写入失败")):
+                    with self.assertRaises(OSError):
+                        zju.transcript_one(client, args, root, sub)
+                self.assertEqual(path.read_text(encoding="utf-8"), old)
+                self.assertFalse(list(path.parent.glob(".part-*")))
+                zju.transcript_one(client, args, root, sub)
+            self.assertIn("**[00:00:01.120 → 00:00:02.875]** 新内容", path.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

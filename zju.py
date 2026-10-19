@@ -39,6 +39,7 @@ import argparse
 import io
 from collections import OrderedDict
 from fractions import Fraction
+from decimal import Decimal, ROUND_HALF_UP
 import math
 import array
 import asyncio
@@ -1805,10 +1806,11 @@ def upload_all(z: "Zju", files: list[str] | None) -> list[int]:
 
 
 def fmt_ts(sec: float, srt=True) -> str:
-    sec = float(sec)
-    h, rem = divmod(int(sec), 3600)
+    # 先统一量化为整数毫秒再进位，避免 61.12 被二进制浮点截成 119 毫秒。
+    milliseconds = int((Decimal(str(sec)) * 1000).to_integral_value(rounding=ROUND_HALF_UP)) if srt else 0
+    whole, ms = divmod(milliseconds, 1000) if srt else (int(float(sec)), 0)
+    h, rem = divmod(whole, 3600)
     m, s = divmod(rem, 60)
-    ms = int((sec - int(sec)) * 1000)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}" if srt else f"{h:02d}:{m:02d}:{s:02d}"
 
 
@@ -1820,8 +1822,9 @@ def render_transcript(items: list[dict], fmt: str, title: str) -> str:
     elif fmt == "md":
         lines.append(f"# {title}\n")
         for c in items:
-            lines.append(f"**[{fmt_ts(c.get('BeginSec', 0), False)} → "
-                         f"{fmt_ts(c.get('EndSec', 0), False)}]** {c.get('Text', '')}  ")
+            begin = fmt_ts(c.get("BeginSec", 0)).replace(",", ".")
+            end = fmt_ts(c.get("EndSec", 0)).replace(",", ".")
+            lines.append(f"**[{begin} → {end}]** {c.get('Text', '')}  ")
     else:
         for c in items:
             lines.append(f"[{fmt_ts(c.get('BeginSec', 0), False)}] {c.get('Text', '')}")
@@ -3787,7 +3790,7 @@ def main():
     y.add_argument("--recording-audio", action="store_true", help="同时获取 M4A 音频；优先从已下载录播提取")
     y.add_argument("--dry-run", action="store_true", help="预览资料路径，不下载、不写文件")
     y.add_argument("--force", action="store_true", help="重新下载已有资料，丢弃录播分片进度")
-    y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md）")
+    y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md；md / srt 保留毫秒）")
     y.add_argument("--dedup", action="store_true", help="合并 PPT 时去除重复截图")
     y.add_argument("--keep-images", action="store_true", help="保留全部 PPT 原始截图")
     y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播或音频单文件上限（默认 0 = 不限）")
@@ -3806,7 +3809,7 @@ def main():
             x.add_argument("--dedup", action="store_true",
                            help="删掉重复截图（动画逐步出现、边讲边写、翻回前页），每页只留最完整的一张")
         elif name == "transcript":
-            x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
+            x.add_argument("--format", choices=["txt", "srt", "md"], default="txt", help="转写格式（默认 txt；md / srt 保留毫秒）")
         else:
             x.add_argument("--dry-run", action="store_true", help="预览待处理音频" if name == "recording-audio" else "只列出待下载录播")
             x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")

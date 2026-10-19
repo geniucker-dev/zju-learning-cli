@@ -121,7 +121,7 @@ class Offline(unittest.TestCase):
                     timeline = json.loads((root / "课程 (1)/智云PPT/第1堂 (1).json").read_text())
                     self.assertEqual([e["pdf_page"] for e in timeline["events"]], [1, 2, 3, 4, 5])
                     self.assertEqual([e["created_sec"] for e in timeline["events"]], [0, 20, 40, 60, 80])
-                    self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00 → 00:00:02]** 转写内容  \n")
+                    self.assertEqual((root / "课程 (1)/转录/第1堂 (1).md").read_text(), "# 课程 第1堂\n\n**[00:00:00.000 → 00:00:02.000]** 转写内容  \n")
                     client.subtitle.reset_mock()
                     client.ppt_events.reset_mock()
                     zju.cmd_classroom_sync(args)
