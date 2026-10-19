@@ -1,8 +1,8 @@
 """本地 HTTP 服务器及生成的 MP4 验证音频范围下载，不访问学校。"""
 import asyncio
 import importlib.util
-import shutil
-import subprocess
+import hashlib
+from fractions import Fraction
 import tempfile
 import threading
 import time
@@ -13,6 +13,8 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
+import av
+import numpy as np
 
 spec = importlib.util.spec_from_file_location("zju_audio_tests", Path(__file__).resolve().parents[1] / "zju.py")
 zju = importlib.util.module_from_spec(spec)
@@ -85,20 +87,38 @@ class RangeResponses(unittest.TestCase):
                 list(zju.mp4_boxes(data))
 
 
-@unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg 生成测试 MP4")
 class AudioHTTP(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
         cls.video = cls.root / "fixture.mp4"
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
-                        "color=c=black:s=64x64:r=10", "-f", "lavfi", "-i",
-                        "sine=frequency=1000:sample_rate=32000", "-t", "40", "-c:v", "mpeg4",
-                        "-c:a", "aac", "-b:a", "48k", "-movflags", "+faststart", str(cls.video)], check=True)
+        with av.open(str(cls.video), "w", options={"movflags": "+faststart"}) as output:
+            v = output.add_stream("mpeg4", rate=10)
+            v.width = v.height = 64
+            v.pix_fmt = "yuv420p"
+            a = output.add_stream("aac", rate=32000)
+            a.layout, a.bit_rate = "mono", 48000
+            for i in range(400):
+                frame = av.VideoFrame.from_ndarray(np.zeros((64, 64, 3), dtype=np.uint8), format="rgb24")
+                frame.pts, frame.time_base = i, Fraction(1, 10)
+                for packet in v.encode(frame):
+                    output.mux(packet)
+                wave = (.1 * np.sin(np.arange(i * 3200, (i + 1) * 3200) * (2 * np.pi * 1000 / 32000))).astype(np.float32)
+                frame = av.AudioFrame.from_ndarray(wave.reshape(1, -1), format="fltp", layout="mono")
+                frame.sample_rate, frame.pts, frame.time_base = 32000, i * 3200, Fraction(1, 32000)
+                for packet in a.encode(frame):
+                    output.mux(packet)
+            for stream in (v, a):
+                for packet in stream.encode():
+                    output.mux(packet)
         cls.tail = cls.root / "tail.mp4"
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(cls.video),
-                        "-c", "copy", str(cls.tail)], check=True)
+        with av.open(str(cls.video)) as source, av.open(str(cls.tail), "w") as output:
+            streams = {s.index: output.add_stream_from_template(s) for s in source.streams}
+            for packet in source.demux():
+                if packet.dts is not None:
+                    packet.stream = streams[packet.stream.index]
+                    output.mux(packet)
         # 索引在文件尾时扩展 stco 为 co64，媒体偏移无需改变。
         import array
         import struct
@@ -176,9 +196,11 @@ class AudioHTTP(unittest.TestCase):
         type(self).change_version = False
 
     def audio_hash(self, file):
-        return subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(file),
-                               "-map", "0:a:0", "-c:a", "copy", "-f", "hash", "-hash", "sha256", "-"],
-                              check=True, capture_output=True).stdout
+        h = hashlib.sha256()
+        with av.open(str(file)) as container:
+            for packet in container.demux(audio=0):
+                h.update(bytes(packet))
+        return h.digest()
 
     def test_local_and_remote_audio_match_for_head_and_tail_index(self):
         for source in (self.video, self.tail, self.wide):

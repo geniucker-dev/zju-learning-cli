@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "httpx", "img2pdf", "pillow", "keyring", "numpy"]
+# dependencies = ["requests", "httpx", "img2pdf", "pillow", "keyring", "numpy", "av>=16,<18"]
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 8eoyw
@@ -31,6 +31,7 @@ API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
   zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
   zju.py recording-audio --course <cid> | --days N [-j 32]  # 本地录播提取或仅下载音轨
+  zju.py recording-frame --course <cid> --sub <sid> --at HH:MM:SS [--json]  # 按需视频帧
 """
 from __future__ import annotations
 
@@ -2401,6 +2402,71 @@ def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExec
     return failed
 
 
+def recording_frame_source(z, a, root):
+    """复用课程查询、标准录播路径及完成清单；不把 .part 当作完整视频。"""
+    from recording_frames import FrameError, select_part
+    man, local = Manifest(root), {}
+    if not isinstance(man.data, dict):
+        raise FrameError(".zju_manifest.json 必须是 JSON 对象")
+    prefix = f"video:{a.course}:{a.sub}:"
+    for key, rec in man.data.items():
+        if not key.startswith(prefix) or not key[len(prefix):].isdigit() or not isinstance(rec, dict):
+            continue
+        recorded = rec.get("path")
+        if not isinstance(recorded, str):
+            continue
+        path = root / recorded
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError:
+            continue
+        if path.suffix.lower() == ".mp4" and path.is_file() and 0 < path.stat().st_size == rec.get("size"):
+            local[int(key[len(prefix):])] = path
+    if a.part in local:
+        return local[a.part], a.part
+    if a.part is None and local:
+        if set(local) == {1} and not local[1].stem.endswith(" - 01"):
+            return local[1], 1
+        raise FrameError("本地有分段录播，请指定 --part（编号与 recording 相同）")
+    # 有完整本地来源时不需要认证/API，允许离线读取；否则复用智云认证与查询。
+    subs = z.course_subs(a.course)
+    sub = next((s for s in subs if s["sub_id"] == a.sub), None)
+    if sub is None:
+        raise FrameError(f"课程 {a.course} 中没有堂次 {a.sub}")
+    if sub.get("show") == "no":
+        raise FrameError("该堂次课程已下架，且没有可确认完整的本地录播")
+    catalogue = z.video_catalogue(a.course)
+    if a.sub not in catalogue:
+        raise FrameError(f"录播目录缺少堂次 {a.sub}")
+    urls = catalogue[a.sub]
+    part, url = select_part(urls, a.part)
+    return url, part
+
+
+def cmd_recording_frame(a):
+    from recording_frames import FrameError, extract, validate_args
+    try:
+        validate_args(a)
+        # 认证过程中若有交互提示，也不能污染 --json 的 stdout。
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            source, part = recording_frame_source(Zju(), a, Path(a.out).expanduser())
+            result = extract(a, source, part)
+        if a.json:
+            # JSON 转义保留真实路径，且兼容 Windows 重定向时的非 UTF-8 代码页。
+            print(json.dumps(result, ensure_ascii=True, allow_nan=False))
+        else:
+            for frame in result["frames"]:
+                state = "缓存" if frame["cache_hit"] else "截图"
+                print(f"[{state}] {frame['requested_time_sec']:g}s → {frame['actual_time_sec']:g}s  {frame['path']}")
+            log(f"完成：{result['frame_count']} 帧，读取 {result['network']['bytes_received'] / 2**20:.2f} MiB，"
+                f"{result['network']['requests']} 次媒体请求，{result['elapsed_sec']:.2f} 秒")
+    except FrameError as e:
+        raise ZjuError(str(e)) from None
+    except (OSError, ValueError, TypeError) as e:
+        raise ZjuError(f"录播帧参数或本地清单读取失败（{type(e).__name__}），请检查输出根目录及 .zju_manifest.json") from None
+
+
 def main():
     p = argparse.ArgumentParser(prog="zju.py", description="学在浙大 / 智云课堂 CLI")
     try:
@@ -2539,6 +2605,9 @@ def main():
                              if name == "recording-audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
         x.set_defaults(fn=fn)
 
+    # 只加载参数定义（不导入 PyAV），其他命令不初始化解码库。
+    from recording_frames import add_arguments
+    add_arguments(sp, cmd_recording_frame)
     a = p.parse_args()
     if a.cmd == "classroom" and a.action == "sync" and (a.jobs < 1 or a.max_size < 0):
         p.error("--jobs 必须 >= 1，--max-size 必须 >= 0")

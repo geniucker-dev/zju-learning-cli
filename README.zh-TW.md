@@ -2,9 +2,9 @@
 
 [简体中文](README.md) | 繁體中文
 
-學在浙大（courses.zju.edu.cn）與智雲課堂（classroom.zju.edu.cn）的單檔命令列工具：同步課件、把智雲課堂的 PPT 截圖合併成 PDF（可去除重複截圖）、匯出課堂語音轉錄、查待辦。
+學在浙大（courses.zju.edu.cn）與智雲課堂（classroom.zju.edu.cn）的輕量命令列工具：同步課件、把智雲課堂的 PPT 截圖合併成 PDF（可去除重複截圖）、匯出課堂語音轉錄、查待辦。
 
-它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但沒辦法寫進腳本、排程或讓 AI agent 呼叫；這個專案把它的 API 邏輯改寫成一個 Python 檔，補上增量同步、並行下載、PPT 去重，也修了幾個上游的邊界狀況。
+它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但沒辦法寫進腳本、排程或讓 AI agent 呼叫；這個專案把它的 API 邏輯改寫成輕量 Python CLI，補上增量同步、並行下載、PPT 去重，也修了幾個上游的邊界狀況。
 
 ## 功能
 
@@ -31,19 +31,22 @@
 | `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程> (<id>)/转录/<堂> (<sub_id>).txt\|srt\|md` |
 | `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
 | `./zju.py recording-audio --course <id> \| --days N [-j 32]` | 優先從本地錄播提取音軌，否則只下載音訊 → `<課程> (<id>)/音频/<堂> (<sub_id>).m4a` |
+| `./zju.py recording-frame --course <id> --sub <id> --at HH:MM:SS [--json]` | 按需提取真實影片影格，本地優先、遠端限量 Range 讀取；預設系統暫存目錄 |
 
 
 ## 安裝
 
-需要 [uv](https://docs.astral.sh/uv/)。相依套件寫在檔頭（PEP 723），第一次執行時 uv 會自動安裝。
+需要 [uv](https://docs.astral.sh/uv/) 與 Python >=3.10（uv 可管理 Python）。相依套件寫在檔頭（PEP 723），第一次執行時 uv 會自動安裝。請保留 `recording_frames.py` 與 `zju.py` 在同一目錄。
 
 ```bash
-git clone https://github.com/8eoyw/zju-learning-cli.git
-ln -s "$PWD/zju-learning-cli/zju.py" ~/.local/bin/zju   # 或直接 ./zju.py
-zju login
+git clone https://github.com/geniucker-dev/zju-learning-cli.git
+cd zju-learning-cli
+./zju.py login
 ```
 
-沒有 uv 的話：`pip install requests httpx img2pdf pillow keyring numpy`，再用 `python zju.py ...` 執行。
+沒有 uv 的話：`pip install requests httpx img2pdf pillow keyring numpy 'av>=16,<18'`，再用 `python zju.py ...` 執行。
+
+影片影格解碼使用 [PyAV](https://pyav.basswood.io/docs/stable/) 的跨平台 wheel。wheel 可內建 FFmpeg 編解碼函式庫，使用者**不必安裝或呼叫系統 ffmpeg / ffprobe**；其他命令不會初始化影片解碼函式庫。常見 macOS、Windows、Linux 的 Python 版本有預編譯 wheel；沒有對應 wheel 的平台需要自行處理函式庫建置，不會退回呼叫外部程式。
 
 也可以不開終端機，直接雙擊登入腳本（每次都會清掉上一次的學號、密碼和 cookie，重新登入）：
 
@@ -153,6 +156,54 @@ Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23 → 00:01
 輸出為 `<輸出目錄>/<課程名稱> (<course_id>)/音频/<堂次名稱> (<sub_id>).m4a`，多段回放分別編號。已完成音訊會略過；`--force` 重新提取或下載，`--max-size MB` 限制最終音訊大小。成功後才原子替換輸出並更新清單，失敗或中斷會清理暫存資料，保留舊檔案；音訊暫不支援跨次執行的續傳。
 
 支援有完整音軌索引的直接 MP4；沒有音軌、HLS、分片 MP4或不支援多範圍請求的伺服器會報錯，不自動下載整個影片。本地提取不受遠端 Range 支援情況影響。
+
+### 按需提取錄播影片影格
+
+新增 `./zju.py recording-frame`，供使用者或 Agent 臨時查看黑板、推導與操作畫面，不加入 `classroom sync` 預設資料。優先使用路徑及大小符合原下載清單的完整本地 MP4，本地命中時不需要認證或課程查詢，否則以 HTTP Range 讀取遠端；`.part` 不視為完整影片。全域 `--out` 只用來尋找本地錄播，不控制影格輸出位置。
+
+```bash
+# 預設建立獨立系統暫存目錄，列出每張圖片的完整絕對路徑
+./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45
+
+# 單張完整路徑，自動建立父目錄；支援相對路徑、中文和 PNG
+./zju.py recording-frame --course 89253 --sub 2038840 --at 5025.125 --output "./images/板書.png"
+
+# 多個時間點共用同一容器、讀取快取與解碼上下文
+./zju.py recording-frame --course 89253 --sub 2038840 \
+  --at 01:23:40 --at 01:23:45 --at 01:23:50 --output-dir "./images/課堂"
+
+# 逐張指定完整路徑，只在第一個 = 處分隔
+./zju.py recording-frame --course 89253 --sub 2038840 \
+  --frame "01:23:40=./before/板書.jpg" --frame "01:23:45=./after/板書 = 完整.png"
+
+# 前後各 10 秒，每隔 2 秒；越過影片邊界的部分裁剪，始終包含中心時間
+./zju.py recording-frame --course 89253 --sub 2038840 \
+  --at 01:23:45 --around 10 --interval 2 --output-dir ./sequence
+
+# 多段錄播必須指定分段；Agent 使用 JSON，stdout 不混入進度或診斷
+./zju.py recording-frame --course 89253 --sub 2038840 --part 1 --at 01:23:45 --json
+```
+
+時間接受 `HH:MM:SS`、`HH:MM:SS.sss` 或浮點秒數，必須非負且小於影片長度。`--at` 是所選 MP4 分段內的相對時間，**不假定**已與轉錄 BeginSec、PPT created_sec 或音軌時間對齊。單段自動選取，多段省略 `--part` 會報錯。依 PTS 取得該時刻正在顯示的影格（兩影格之間取前一張），並記錄真正的 `actual_time_sec`；從之前的關鍵影格開始解碼，支援 B 影格重排、常見可變影格率與非零串流起點。
+
+`--output` 只可搭配單個 `--at`；`--output-dir` 可搭配單張、批次或時間窗口；可重複的 `--frame` 不能與 `--at`、`--output`、`--output-dir` 或窗口選項混用。同次呼叫不可重複指定同一完整路徑。Windows 可使用引號包圍 `"01:23:45=C:\課程\板書.jpg"`，路徑的空格、中文與 `=` 會保留。
+
+預設用 `tempfile.mkdtemp()` 建立 `zju-frames-<隨機字串>` 系統暫存目錄，不寫死 `/tmp`。**程式結束後圖片與中繼資料仍存在**，呼叫方分析後自行刪除；系統之後也可能清理。明確指定位置時只寫入該位置，不另存到課程同步目錄。自動檔名例如 `89253_2038840_p01_01-23-45-000.jpg`，包含課程、堂次、分段與時間。JPEG 預設品質 95、原解析度，使用 `--quality 1…100` 調整；自動命名可用 `--format png`，完整路徑則依 `.jpg` / `.jpeg` / `.png` 副檔名選擇。
+
+每張圖片旁有 `<圖片名>.json`，記錄來源身分、請求/實際時間、timebase、編碼、尺寸、路徑與圖片 SHA-256，以及產生請求的網路、耗時、輸出數量與暫存目錄標記。只有來源、時間、編碼設定與圖片校驗都一致時才重用快取。本地身分包括大小、奈秒修改/變更時間及 inode；遠端使用無簽名資源路徑摘要、總大小、強 ETag 或 Last-Modified，不保存簽名 URL、Cookie 或 Authorization。預設暫存目錄不提供跨次快取；指定同一目錄或完整路徑可重用有效快取。自動檔名衝突時加入 `_1` 等後綴；完整路徑已有其他內容或快取失效則報錯。`--force` 重新編碼並允許覆寫。圖片完整寫入同目錄暫存檔後才原子發布，失敗不留半張圖片。不支援硬連結的檔案系統使用系統鎖保護原子替換；這時或使用 `--force` 時，目錄會保留小型隱藏 `.frame.lock` 檔，程序結束會自動釋放鎖。
+
+`--json` 回傳單一物件，單張與批次結構相同。`frames[]` 包含 `requested_time_sec`、`actual_time_sec`、`path` / `output_path`、`cache_hit` 及上述影格資料。請求層級有 `temporary`、`output_dir`（逐張路徑模式為 null）、`frame_count`、`network.requests`、`network.bytes_received`、`elapsed_sec` 及解碼統計。所有圖片路徑可直接讀取。診斷寫入 stderr，失敗回傳非零退出碼。網路統計只計媒體 HTTP 回應本文，不含登入/API 請求或 HTTP 標頭；耗時從提取開始計算，不含課程查詢與登入。
+
+遠端固定直連，預設嚴格限制 **64 MiB**，索引、重複讀取與失敗重試均計入；以 `--max-fetch-mb 128` 調整，不允許無上限。1 MiB 區塊合併相鄰讀取，讀取快取最多 8 MiB，不把完整 MP4 放入記憶體。只接受正確的 206 / Content-Range、長度及一致的強 ETag 或 Last-Modified；200、授權失敗、重新導向、沒有版本標識/固定 Content-Length 或影片變更都報錯，不退回完整下載。支援 moov 位於頭部或尾部的普通 MP4；HLS、直播、缺少時長/索引或 wheel 不支援的編碼會報錯。長 GOP 或大索引可能需提高流量上限。
+
+實測 2,834,281,001 位元組、約 3 小時 49 分鐘的智雲 H.264 錄播，在 `03:48:00 / 02 / 04` 提取 3 張：本地約 0.41 秒、零網路請求；遠端 13 次請求、12,582,928 位元組（約 12 MiB）、19.01 秒。該影片 moov 索引約 10.67 MiB，是主要讀取開銷。這是單次實測，非固定速度；詳見 [驗證紀錄](docs/recording-frame-validation.md)。
+
+離線測試使用 PyAV 產生影片，不需要學校帳號或外部 FFmpeg：
+
+```bash
+uv run --with requests --with httpx --with img2pdf --with pillow --with keyring --with numpy --with 'av>=16,<18' \
+  python -m unittest discover -s tests
+```
 
 ### 其他改進
 
