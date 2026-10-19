@@ -48,7 +48,7 @@ class UpstreamSync(unittest.TestCase):
         self.assertEqual([s["sub_id"] for _, s in subs], [10, 20])
         self.assertEqual(subs[1][1]["show"], "no")
         self.assertEqual(zju.classroom_material_path(Path("output"), subs[1][1], "音频", "m4a"),
-                         Path("output/课程 教师 (2)/音频/第二堂 (20).m4a"))
+                         Path("output/音频/第二堂 (20).m4a"))
 
     def test_course_detail_keeps_both_day_and_visibility(self):
         client = zju.Zju.__new__(zju.Zju)

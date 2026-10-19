@@ -6,33 +6,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 8eoyw
 # Portions ported from PeiPei233/zju-learning-assistant, Copyright (c) 2023 PeiPei233 (MIT).
-"""学在浙大 / 智云课堂 命令列工具。
+"""学在浙大 / 智云课堂单文件 CLI。
 
-API 逻辑移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju_assist.rs，
-改成可脚本化、可排程、可被 AI agent 直接呼叫的单文件 CLI。
+  ./zju.py login
+  ./zju.py lms sync 123 --library ~/ZJU-Courses/lms
+  ./zju.py classroom sync 89253 --recording-audio
+  ./zju.py classroom context --course-dir /path/to/course --sub 2038852 --at 01:23:45 --json
 
-  zju.py login                         # 首次：存学号，密码进 macOS Keychain
-  zju.py courses [--all]               # 学在浙大课程列表
-  zju.py sync [课程...] [--dry-run]     # 增量同步课程附件（含排程中的活动）
-  zju.py todo                          # 待办
-  zju.py activities [课程...] [--type forum homework ...]  # 所有活动（含测验）
-  zju.py show <活动id> [--read]         # 活动详情；作业显示提交状态、讨论显示自己的发帖回帖；--read 印出附件文字
-  zju.py forum list|read|post|reply ... # 讨论区
-  zju.py upload 文件...                 # 上传，印 upload id
-  zju.py submit <作业id> --file ... [--body ...] [--draft] [-y]  # 交作业
-  zju.py classroom courses [--has-tasks] [--json]  # 智云个人课程与任务数
-  zju.py classroom sync [课程...] [-j 4] [--recording] [--recording-audio]  # PPT、转写及可选录播和音频
-  zju.py classroom context --course <cid> --sub <sid> --at HH:MM:SS [--json]  # 只读本地上下文
-  zju.py classroom search 关键字        # 智云课堂找课（id 与学在浙大不同）
-  zju.py classroom subs <cid>          # 列出每堂课
-  zju.py classroom day [日期] [--days N]  # 含追踪中的课
-  zju.py classroom add|rm <cid>...      # 追踪课表外的课
-  zju.py classroom tracked             # 列出追踪中的课
-  zju.py ppt --course <cid> | --days N [--dedup]  # 智云 PPT 截图合并 PDF
-  zju.py transcript --course <cid> | --days N [--format txt|srt|md]
-  zju.py recording --course <cid> | --days N [--dry-run]  # 智云录播 MP4
-  zju.py recording-audio --course <cid> | --days N [-j 32]  # 本地录播提取或仅下载音轨
-  zju.py recording-frame --course <cid> --sub <sid> --at HH:MM:SS [--json]  # 按需视频帧
+课程以 (platform, course_id) 识别，课程目录携带独立元数据与下载状态。
+媒体算法使用 Python wheel，不依赖系统 FFmpeg。
 """
 from __future__ import annotations
 
@@ -77,7 +59,7 @@ COOKIE_FILE = STATE_DIR / "cookies.json"
 LEGACY_TLS_HOSTS = ("courses.zju.edu.cn", "identity.zju.edu.cn")
 CST = dt.timezone(dt.timedelta(hours=8))  # 学校 API 没带时区时视为北京时间
 LMS = "https://courses.zju.edu.cn"
-DEFAULT_OUT = Path.home() / "ZJU-Courses"  # 可用 config.json 的 "out" 或环境变数 ZJU_OUT 覆盖
+DEFAULT_LIBRARIES = {p: Path.home() / "ZJU-Courses" / p for p in ("classroom", "lms")}
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/88.0"
 MEDIA_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".m4v", ".wmv", ".webm", ".mp3", ".m4a", ".wav"}
 TIMEOUT = (6, 60)  # connect, read — 排程时别卡在单一 hop 上
@@ -107,11 +89,19 @@ def safe_name(s: str) -> str:
     return s
 
 
-def classroom_material_path(root: Path, sub: dict, kind: str, extension: str, part: str = "") -> Path:
-    """智云资料统一按课程和堂次 ID 命名。"""
-    course = safe_name(f"{sub['course_name']} ({sub['course_id']})")
+def material_key(sub, kind, extension, part=""):
+    prefix = {"转录": "transcript", "智云PPT": "ppt", "录播": "video", "音频": "audio"}[kind]
+    variant = int(part.strip(" -") or 1) if prefix in ("audio", "video") else extension
+    return f"{prefix}:{sub['course_id']}:{sub['sub_id']}:{variant}"
+
+
+def classroom_material_path(directory: Path, sub: dict, kind: str, extension: str, part: str = "") -> Path:
+    """课程内已登记路径优先；显示名称变化不改变文件身份。"""
+    record = DownloadState(directory).get(material_key(sub, kind, extension, part))
+    if record:
+        return context_path(directory, record["path"])
     stem = f"{safe_name(sub['sub_name'])} ({sub['sub_id']})"
-    return root / course / kind / f"{stem}{part}.{extension}"
+    return directory / kind / f"{stem}{part}.{extension}"
 
 
 # ---------------- config / credentials ----------------
@@ -126,14 +116,17 @@ def load_config() -> dict:
     if not CONFIG_FILE.exists():
         return {}
     try:
-        return json.loads(CONFIG_FILE.read_text())
-    except ValueError as e:
+        value = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("配置必须是 JSON 对象")
+        return value
+    except (OSError, ValueError) as e:
         raise ZjuError(f"{CONFIG_FILE} 格式错误：{e}")
 
 
 def save_config(cfg: dict):
     state_dir()
-    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+    atomic_text(CONFIG_FILE, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
 
 
 def keychain_get(user: str) -> str | None:
@@ -247,7 +240,6 @@ class Zju:
         self._load_cookies()
 
     def _load_cookies(self):
-        (STATE_DIR / "cookies.pkl").unlink(missing_ok=True)  # 旧版 pickle 快取：不再读取
         if not COOKIE_FILE.exists():
             return
         try:
@@ -781,21 +773,207 @@ class Zju:
 
 # ---------------- helpers ----------------
 
-class Manifest:
-    """out/.zju_manifest.json：记录 upload id → 本地路径，换版（新 id）就重新下载。"""
+def read_course(directory: Path, platform=None, cid=None):
+    path = directory / "course.json"
+    try:
+        context_path(directory, "course.json")
+        data = context_json(path)
+        if (not isinstance(data, dict) or data.get("schema_version") != 2
+                or not isinstance(data.get("platform"), str) or data["platform"] not in DEFAULT_LIBRARIES
+                or type(data.get("course_id")) is not int or data["course_id"] < 1):
+            raise ValueError("不支持的课程格式")
+        if (platform and data["platform"] != platform) or (cid is not None and data["course_id"] != cid):
+            raise ValueError("课程平台或 ID 不符")
+        items = data.get("lessons" if data["platform"] == "classroom" else "files")
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise ValueError("课程资料列表无效")
+        if data["platform"] == "classroom":
+            ids = [item.get("sub_id") for item in items]
+            if any(type(sid) is not int or sid < 1 for sid in ids) or len(ids) != len(set(ids)):
+                raise ValueError("堂次 ID 无效或重复")
+        return data
+    except (OSError, ValueError, RuntimeError) as e:
+        raise ZjuError(f"课程元数据不可用或身份冲突：{path}（{e}）") from None
 
-    def __init__(self, root: Path):
-        self.path = root / ".zju_manifest.json"
-        self.data = json.loads(self.path.read_text()) if self.path.exists() else {}
+
+def library_path(a, platform):
+    if getattr(a, "library", None) is not None:
+        value = a.library
+    else:
+        libraries = load_config().get("libraries", {})
+        if not isinstance(libraries, dict):
+            raise ZjuError("config.json 的 libraries 必须是对象")
+        value = libraries.get(platform, DEFAULT_LIBRARIES[platform])
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise ZjuError("资料库路径必须是非空路径")
+    return Path(value).expanduser().resolve()
+
+
+def local_courses(library, platform):
+    if not library.exists():
+        return []
+    if not library.is_dir() or (library / "course.json").exists():
+        raise ZjuError("--library 必须是课程目录的父目录；单门课程请使用 --course-dir")
+    rows = []
+    for path in sorted(library.glob("*/course.json")):
+        data = read_course(path.parent)
+        if data["platform"] == platform:
+            rows.append((path.parent.resolve(), data))
+    ids = [data["course_id"] for _, data in rows]
+    if len(ids) != len(set(ids)):
+        duplicates = [str(p) for p, d in rows if ids.count(d["course_id"]) > 1]
+        raise ZjuError("同一课程有多个本地目录，请用 --course-dir 明确选择：\n" + "\n".join(duplicates))
+    return rows
+
+
+def resolve_course(a, platform, cid=None, *, name=None, writing=False, optional=False):
+    """唯一课程定位入口；只读可用 cwd，写操作只用显式目录或配置的资料库。"""
+    direct = getattr(a, "course_dir", None)
+    if direct is not None and getattr(a, "library", None) is not None:
+        raise ZjuError("--library 与 --course-dir 互斥")
+    if direct is None and not writing and getattr(a, "library", None) is None and (Path.cwd() / "course.json").exists():
+        direct = Path.cwd()
+    if direct is not None:
+        if not str(direct).strip():
+            raise ZjuError("--course-dir 不能为空")
+        directory = Path(direct).expanduser().resolve()
+        if (directory / "course.json").exists():
+            data = read_course(directory, platform, cid)
+            return directory, data["course_id"], data
+        if not writing or cid is None:
+            raise ZjuError("课程目录尚未初始化；首次 sync 必须明确课程 ID")
+        if directory.exists() and not directory.is_dir():
+            raise ZjuError("课程路径不是目录")
+        if (directory / ".zju").exists():
+            raise ZjuError("未初始化目录含 .zju 状态，不能自动接管")
+        return directory, cid, None
+    if cid is None:
+        raise ZjuError("请提供课程 ID 或 --course-dir")
+    library = library_path(a, platform)
+    matches = [(p, d) for p, d in local_courses(library, platform) if d["course_id"] == cid]
+    if matches:
+        return matches[0][0], cid, matches[0][1]
+    if not writing:
+        if optional:
+            return None, cid, None
+        raise ZjuError(f"资料库中未找到课程 {cid}；请检查 --library 或指定 --course-dir")
+    suffix = str(cid) if platform == "classroom" else f"lms-{cid}"
+    directory = library / f"{safe_name(name or str(cid))[:110]} ({suffix})"
+    if directory.exists():
+        raise ZjuError(f"新课程目标目录已存在但未登记，不能自动接管：{directory}；请明确 --course-dir")
+    return directory, cid, None
+
+
+def initialize_course(directory, platform, cid, name):
+    if (directory / "course.json").exists():
+        return read_course(directory, platform, cid)
+    data = dict(schema_version=2, platform=platform, course_id=cid, name=name,
+                updated_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+    data["lessons" if platform == "classroom" else "files"] = []
+    atomic_text(directory / "course.json", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return data
+
+
+class DownloadState:
+    """课程内状态；每次更新在锁内重读合并，pending 只代表文件所有权，不代表下载完成。"""
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.path = context_path(directory, ".zju/downloads.json")
+        self.course_id = None
+        self.data = self._read()
+
+    def _read(self):
+        if not self.path.exists():
+            return {}
+        try:
+            data = context_json(self.path)
+            course = read_course(self.directory)
+            self.course_id = course["course_id"]
+            if (not isinstance(data, dict) or data.get("schema_version") != 1
+                    or data.get("platform") != course["platform"] or data.get("course_id") != course["course_id"]
+                    or not isinstance(data.get("entries"), dict)):
+                raise ValueError("状态身份不符")
+            for key, entry in data["entries"].items():
+                if not isinstance(entry, dict) or entry.get("status") not in ("pending", "complete"):
+                    raise ValueError("下载记录无效")
+                context_path(self.directory, entry.get("path"))
+                kind = entry.get("kind")
+                kinds = {"attachment"} if course["platform"] == "lms" else {
+                    "transcripts", "ppt_pdfs", "ppt_events", "recordings", "audio", "ppt_images", "ppt_image"}
+                if not isinstance(kind, str) or kind not in kinds:
+                    raise ValueError("下载资料类别无效")
+                if kind != "attachment" and (type(entry.get("sub_id")) is not int or entry["sub_id"] < 1):
+                    raise ValueError("下载堂次 ID 无效")
+                if kind in ("recordings", "audio") and (type(entry.get("part")) is not int or entry["part"] < 1):
+                    raise ValueError("媒体分段无效")
+                if kind in ("recordings", "audio") and entry["status"] == "complete" and (
+                        type(entry.get("part_count")) is not int or entry["part_count"] < entry["part"]):
+                    raise ValueError("媒体分段总数无效")
+                if entry["status"] == "complete" and (type(entry.get("size")) is not int or entry["size"] <= 0):
+                    raise ValueError("完成记录大小无效")
+            return data["entries"]
+        except (OSError, ValueError, RuntimeError) as e:
+            raise ZjuError(f"下载状态损坏，保留原文件：{self.path}（{e}）") from None
 
     def get(self, key):
         return self.data.get(key)
 
-    def put(self, key, val):
-        self.data[key] = val
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1))
-        os.replace(tmp, self.path)
+    def put(self, key, value):
+        context_path(self.directory, value.get("path"))
+        with download_lock(self.path, "下载状态", timeout=30):
+            data = self._read()
+            if any(k != key and r["path"] == value["path"] for k, r in data.items()):
+                raise ZjuError(f"文件已由其他资料登记：{value['path']}")
+            data[key] = value
+            course = read_course(self.directory)
+            payload = dict(schema_version=1, platform=course["platform"], course_id=course["course_id"], entries=data)
+            atomic_text(self.path, json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+            self.data = data
+
+    def claim(self, key, path, **details):
+        # 调用者持课程锁；未登记的用户文件，即使 --force 也不能覆盖。
+        relative = path.relative_to(self.directory).as_posix()
+        context_path(self.directory, relative)
+        rec = self.get(key)
+        if rec and rec["path"] == relative:
+            return
+        ancillary = [path]
+        if details.get("kind") == "recordings":
+            ancillary += [path.with_name(f".{path.name}{suffix}") for suffix in (".part", ".part.json", ".part.json.tmp", ".download.lock")]
+        if any(p.exists() or p.is_symlink() for p in ancillary):
+            raise ZjuError(f"目标或进度是未登记的用户文件，未覆盖：{path}")
+        self.put(key, dict(path=relative, status="pending", **details))
+
+    def finish(self, key, path, **details):
+        previous = self.get(key)
+        if not previous or previous["path"] != path.relative_to(self.directory).as_posix():
+            raise ZjuError("资料尚未登记，不能标记下载完成")
+        self.put(key, dict(previous, **details, status="complete", size=path.stat().st_size,
+                           at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")))
+
+
+def material_details(sub, kind, extension, part=""):
+    category = {"转录": "transcripts", "智云PPT": "ppt_pdfs" if extension == "pdf" else "ppt_events",
+                "录播": "recordings", "音频": "audio"}[kind]
+    details = dict(kind=category, sub_id=sub["sub_id"])
+    if category == "transcripts":
+        details["format"] = extension
+    if category in ("recordings", "audio"):
+        details["part"] = int(part.strip(" -") or 1)
+    return details
+
+
+def material_complete(directory, key, state=None):
+    state = state if state is not None else DownloadState(directory)
+    rec = state.get(key)
+    if not rec or rec["status"] != "complete":
+        return False
+    path = context_path(directory, rec["path"])
+    try:
+        return path.is_file() and valid_course_material(path, rec["kind"], state.course_id,
+                                                        rec["sub_id"], rec)
+    except (OSError, ValueError, ZjuError):
+        return False
 
 
 def atomic_text(path: Path, text: str):
@@ -857,108 +1035,68 @@ def valid_course_material(path: Path, kind: str, cid: int, sid: int, recorded: d
     return False
 
 
-def course_materials(directory: Path, cid: int, records: dict) -> dict:
+def course_materials(directory: Path, cid: int) -> dict:
     materials = {}
-    kinds = {"转录": ("transcripts", {"md", "txt", "srt"}),
-             "智云PPT": (None, {"pdf", "json"}), "音频": ("audio", {"m4a"}),
-             "录播": ("recordings", {"mp4"})}
-    for folder, (kind, extensions) in kinds.items():
-        parent = directory / folder
-        if not parent.exists():
+    state = DownloadState(directory)
+    for key, rec in state.data.items():
+        if rec.get("kind") not in ("transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings"):
             continue
-        for path in sorted(parent.iterdir()):
-            match = re.fullmatch(r".+ \((\d+)\)(?: - (\d{2,}))?\.([a-z0-9]+)", path.name)
-            if (path.name.startswith(".") or not match or not path.is_file()
-                    or path.suffix[1:] not in extensions):
-                continue
-            # 不把课程外的符号链接写成随课程目录可移动的资料。
-            try:
-                path.resolve().relative_to(directory.resolve())
-            except ValueError:
-                continue
-            sid, part, extension = int(match[1]), int(match[2] or 1), match[3]
-            selected_kind = kind or ("ppt_pdfs" if extension == "pdf" else "ppt_events")
-            if part < 1 or (match[2] and selected_kind not in ("audio", "recordings")):
-                continue
-            recorded = records.get(path.relative_to(directory.parent).as_posix())
-            if not valid_course_material(path, selected_kind, cid, sid, recorded):
-                continue
-            item = {"path": path.relative_to(directory).as_posix()}
-            if selected_kind == "transcripts":
-                item["format"] = extension
-            elif selected_kind in ("audio", "recordings"):
-                item["part"] = part
-            materials.setdefault(sid, {}).setdefault(selected_kind, []).append(item)
+        if not material_complete(directory, key, state):
+            continue
+        item = {k: rec[k] for k in ("path", "format", "part") if k in rec}
+        materials.setdefault(rec["sub_id"], {}).setdefault(rec["kind"], []).append(item)
     for files in materials.values():
         pdfs = {Path(item["path"]).with_suffix(".json").as_posix() for item in files.get("ppt_pdfs", [])}
-        if "ppt_events" in files:
-            files["ppt_events"] = [item for item in files["ppt_events"] if item["path"] in pdfs]
+        files["ppt_events"] = [item for item in files.get("ppt_events", []) if item["path"] in pdfs]
         for items in files.values():
             items.sort(key=lambda item: (item.get("part", 0), item["path"]))
     return materials
 
 
-def write_course_metadata(root: Path, course: dict, subs: list[dict] | None):
-    """接口遗漏不代表删除；每个现有课程目录只引用自身资料，名称变化时不搬动文件。"""
+def write_course_metadata(directory: Path, course: dict, subs: list[dict] | None):
+    """调用者持课程锁；未获取的堂次信息保留，资料只来自本课程完成记录。"""
     cid = course["course_id"]
-    directories = {classroom_material_path(root, s, "转录", "md").parent.parent for s in subs or []}
-    if root.exists():
-        directories.update(p for p in root.iterdir() if p.is_dir() and p.name.endswith(f" ({cid})"))
-    if not directories:
-        directories.add(root / safe_name(f"{course['title']} ({cid})"))
-    manifest = Manifest(root).data
-    if not isinstance(manifest, dict):
-        raise ZjuError(".zju_manifest.json 必须是 JSON 对象，课程元数据未更新")
-    records = {value["path"].replace("\\", "/"): value for key, value in manifest.items()
-               if key.startswith((f"audio:{cid}:", f"video:{cid}:")) and isinstance(value, dict)
-               and isinstance(value.get("path"), str)}
-    for directory in sorted(directories):
-        out = directory / "course.json"
-        with download_lock(out, "课程元数据"):
-            old = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
-            if not isinstance(old, dict) or (old and (
-                    old.get("schema_version") != 1 or old.get("source") != "zju-classroom"
-                    or old.get("course_id") != cid)):
-                raise ZjuError(f"课程元数据身份或版本不符，未覆盖：{out}")
-            now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-            data = {"schema_version": 1, "source": "zju-classroom", "course_id": cid,
-                    "updated_at": now, "lessons_fetch_status": "ok" if subs is not None else "error"}
-            for target, source in (("name", "title"), ("teacher", "teacher"), ("term", "term"), ("type", "type")):
-                data[target] = course.get(source) or old.get(target)
-            data["task_count"] = course.get("task_count", old.get("task_count"))
-            data["lessons_checked_at"] = now if subs is not None else old.get("lessons_checked_at")
-            lessons = {}
-            for lesson in old.get("lessons", []):
-                if not isinstance(lesson, dict) or not isinstance(lesson.get("sub_id"), int):
-                    raise ZjuError(f"课程堂次元数据格式错误，未覆盖：{out}")
-                # 只保留白名单字段，文件引用每次从磁盘重新核对。
-                lessons[lesson["sub_id"]] = {k: lesson.get(k) for k in
-                    ("sub_id", "name", "date", "lecturer", "availability", "last_seen_at")}
-            for s in subs or []:
-                lesson = lessons.setdefault(s["sub_id"], {"sub_id": s["sub_id"]})
-                for target, source in (("name", "sub_name"), ("date", "day"), ("lecturer", "lecturer")):
-                    value = s.get(source)
-                    if value is not None and value != "":
-                        lesson[target] = value.isoformat() if isinstance(value, dt.date) else value
-                if s.get("show") in ("yes", "no"):
-                    lesson["availability"] = "listed" if s["show"] == "yes" else "unlisted"
-                lesson["last_seen_at"] = now
-            materials = course_materials(directory, cid, records)
-            for sid in materials:
-                lessons.setdefault(sid, {"sub_id": sid})
-            for sid, lesson in lessons.items():
-                for key in ("name", "date", "lecturer", "last_seen_at"):
-                    lesson.setdefault(key, None)
-                lesson["availability"] = lesson.get("availability") or "unknown"
-                lesson["files"] = {kind: materials.get(sid, {}).get(kind, []) for kind in
-                                   ("transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings")}
-            data["lessons"] = sorted(lessons.values(), key=lambda s: (s["date"] or "9999", s["sub_id"]))
-            atomic_text(out, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
-            log(f"[课程元数据] {out}")
+    out = directory / "course.json"
+    old = read_course(directory, "classroom", cid)
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    data = {"schema_version": 2, "platform": "classroom", "course_id": cid,
+            "updated_at": now, "lessons_fetch_status": "ok" if subs is not None else "error"}
+    for target, source in (("name", "title"), ("teacher", "teacher"), ("term", "term"), ("type", "type")):
+        data[target] = course.get(source) or old.get(target)
+    data["task_count"] = course.get("task_count", old.get("task_count"))
+    data["lessons_checked_at"] = now if subs is not None else old.get("lessons_checked_at")
+    lessons = {}
+    for lesson in old.get("lessons", []):
+        if not isinstance(lesson, dict) or not isinstance(lesson.get("sub_id"), int):
+            raise ZjuError(f"课程堂次元数据格式错误，未覆盖：{out}")
+        # 只保留白名单字段，文件引用每次从磁盘重新核对。
+        lessons[lesson["sub_id"]] = {k: lesson.get(k) for k in
+            ("sub_id", "name", "date", "lecturer", "availability", "last_seen_at")}
+    for s in subs or []:
+        lesson = lessons.setdefault(s["sub_id"], {"sub_id": s["sub_id"]})
+        for target, source in (("name", "sub_name"), ("date", "day"), ("lecturer", "lecturer")):
+            value = s.get(source)
+            if value is not None and value != "":
+                lesson[target] = value.isoformat() if isinstance(value, dt.date) else value
+        if s.get("show") in ("yes", "no"):
+            lesson["availability"] = "listed" if s["show"] == "yes" else "unlisted"
+        lesson["last_seen_at"] = now
+    materials = course_materials(directory, cid)
+    for sid in materials:
+        lessons.setdefault(sid, {"sub_id": sid})
+    for sid, lesson in lessons.items():
+        for key in ("name", "date", "lecturer", "last_seen_at"):
+            lesson.setdefault(key, None)
+        lesson["availability"] = lesson.get("availability") or "unknown"
+        lesson["files"] = {kind: materials.get(sid, {}).get(kind, []) for kind in
+                           ("transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings")}
+    data["lessons"] = sorted(lessons.values(), key=lambda s: (s["date"] or "9999", s["sub_id"]))
+    atomic_text(out, json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    log(f"[课程元数据] {out}")
 
 
-def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4: bool = False) -> Path:
-    """写暂存档再 rename；验证长度、拒收空档和错误页，免得坏档被记进 manifest 后永远不再重新下载。"""
+def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4: bool = False, prepare=None) -> Path:
+    """写暂存档再 rename；验证长度、拒收空档和错误页，免得坏档被记进完成状态后永远不再重新下载。"""
     expected = r.headers.get("Content-Length")
     expected = int(expected) if expected and expected.isdigit() and not r.headers.get("Content-Encoding") else None
     if limit and expected and expected > limit:
@@ -988,6 +1126,8 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
         # preview 版常是 PDF，但档名还是 .pptx/.docx — 补副档名免得打不开
         if head[:5] == b"%PDF-" and dest.suffix.lower() != ".pdf":
             dest = dest.with_name(dest.name + ".pdf")
+        if prepare is not None:
+            prepare(dest)
         os.replace(tmp, dest)
         return dest
     except BaseException:
@@ -998,26 +1138,32 @@ def stream_to(r: requests.Response, dest: Path, limit: int | None = None, *, mp4
 
 
 @contextmanager
-def download_lock(dest: Path, kind: str):
+def download_lock(dest: Path, kind: str, *, timeout=0):
     """同一输出文件只允许一个程序写入，锁文件保留以免 inode 更换。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     # 锁档保留以避免删除后新旧 inode 被不同程序同时锁定。
     lock_path = dest.with_name(f".{dest.name}.download.lock")
     with lock_path.open("a+b") as lock_file:
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-                lock_file.seek(0)
-                if not lock_file.read(1):
-                    lock_file.write(b"\0")
-                    lock_file.flush()
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            raise ZjuError(f"另一个程序正在处理此{kind}") from e
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    lock_file.seek(0)
+                    if not lock_file.read(1):
+                        lock_file.write(b"\0")
+                        lock_file.flush()
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                if time.monotonic() >= deadline:
+                    raise ZjuError(f"另一个程序正在处理此{kind}") from e
+                time.sleep(0.05)
+                continue
+            break
         yield
 
 
@@ -1982,8 +2128,7 @@ def range_subs(z: Zju, end: dt.date, days: int) -> list[tuple[dt.date, dict]]:
         for s in subs:
             if s["day"] and start <= s["day"] <= end and s["sub_id"] not in seen:
                 seen.add(s["sub_id"])
-                # 旁聽課常和自己那班同名同節次（別的老師開的同一門），不改名會寫進同一個資料夾而被當成已存在略過
-                out.append((s["day"], {**s, "course_name": name}))
+                out.append((s["day"], s))
     out.sort(key=lambda x: x[0], reverse=True)
     return out
 
@@ -1991,10 +2136,10 @@ def range_subs(z: Zju, end: dt.date, days: int) -> list[tuple[dt.date, dict]]:
 def resolve_subs(z: Zju, a) -> list[dict]:
     if a.course:
         subs = z.course_subs(a.course)
-        name = tracked_courses().get(str(a.course))
-        if name:
-            subs = [{**s, "course_name": name} for s in subs]
         if a.sub:
+            missing = set(a.sub) - {s["sub_id"] for s in subs}
+            if missing:
+                raise ZjuError(f"课程中没有堂次：{sorted(missing)}")
             subs = [s for s in subs if s["sub_id"] in a.sub]
         return subs
     return [s for _, s in range_subs(z, dt.date.today(), a.days or 1)]
@@ -2012,6 +2157,8 @@ def cmd_login(a):
         keychain_set_interactive(user)
     cfg["username"] = user
     save_config(cfg)
+    if a.reset:
+        COOKIE_FILE.unlink(missing_ok=True)
     z = Zju()
     z.login(*get_credentials())
     ok = z._token(silent=True) is not None
@@ -2019,109 +2166,110 @@ def cmd_login(a):
 
 
 def cmd_courses(a):
+    if getattr(a, "local", False):
+        return cmd_local_courses(a)
     z = Zju()
     cs = z.courses()
+    cs = cs if a.all else current_year(cs)
     if a.json:
         print(json.dumps(cs, ensure_ascii=False, indent=1))
         return
     sem = z.semesters()
-    for c in (cs if a.all else current_year(cs)):
+    for c in cs:
         teachers = ",".join(i["name"] for i in c.get("instructors") or [])
         print(f"{c['id']}\t{sem.get(c.get('semester_id'), '-')}\t{c['name']}\t{teachers}")
 
 
 def cmd_sync(a):
+    ids = sync_ids(a, "lms")
     z = Zju()
-    courses = match_courses(z.courses(), a.course, a.all)
-    if not courses:
-        raise ZjuError("没有符合的课程（用 courses --all 看 id）")
-    root = Path(a.out).expanduser()
-    root.mkdir(parents=True, exist_ok=True)
-    man = Manifest(root)
-    new = skipped = failed = media = total = 0
-    big: list[str] = []
-    jobs: list[tuple] = []
-    pending: list[str] = []
-    dup = {n for n in (c["name"] for c in courses) if [x["name"] for x in courses].count(n) > 1}
-    for c in courses:
-        # 同名课程（不同班）分开放，免得同名档互盖
-        cdir = root / safe_name(f"{c['name']} ({c['id']})" if c["name"] in dup else c["name"])
-        items = z.uploads(c["id"])
-        log(f"== {c['name']}（{len(items)} 个档）")
-        # 同名不同档：全部加 id，命名不依 API 返回顺序（顺序变了也不会重新下载、不会互换）
-        uids_by_name: dict[str, set] = {}
-        for _, u in items:
-            uids_by_name.setdefault(safe_name(u.get("name") or str(u["id"])), set()).add(u["id"])
-        seen_keys: set[str] = set()
-        for a_, u in items:
-            act = a_.get("title", "")
-            uid, rid = u["id"], u.get("reference_id") or u["id"]
-            key = f"{c['id']}:{uid}"
-            if key in seen_keys:  # 同一档同时挂在活动和作业
-                continue
-            seen_keys.add(key)
-            name = safe_name(u.get("name") or str(uid))
-            if len(uids_by_name[name]) > 1:
-                stem, dot, ext = name.rpartition(".")
-                name = f"{stem} ({uid}).{ext}" if dot else f"{name} ({uid})"
-            rec = man.get(key)
-            if rec and (root / rec["path"]).exists():
-                skipped += 1
-                continue
-            size = u.get("size") or 0
-            if not a.videos and Path(name).suffix.lower() in MEDIA_EXT:
-                media += 1
-                continue
-            if a.max_size and size > a.max_size * 2**20:
-                big.append(f"{c['name']}/{name}  {size / 2**20:.0f}MB")
-                continue
-            if a.dry_run:
-                print(f"[会下载] {c['name']}/{name}  {size / 2**20:.1f}MB  ({act})")
-                new += 1
-                total += size
-                continue
-            jobs.append((key, uid, rid, cdir / name, a_))
-
-    limit = a.max_size * 2**20 if a.max_size else None
-
-    def fetch(job):
-        key, uid, rid, dest, a_ = job
-        r, src = z.upload_response(uid, rid, a_)
-        return stream_to(r, dest, limit), src  # API 没给 size 的档，靠 Content-Length 把关
-
-    # 多档并行：单条连接常被服务器限速，并行吃满频宽；manifest 只在主执行绪写
-    with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
-        futs = {pool.submit(fetch, j): j for j in jobs}
-        for f in as_completed(futs):
-            key, uid, rid, dest0, a_ = futs[f]
-            act = a_.get("title", "")
-            try:
-                dest, src = f.result()
-                man.put(key, {"path": str(dest.relative_to(root)), "rid": rid, "source": src,
-                              "activity": act, "at": dt.datetime.now().isoformat(timespec="seconds")})
-                new += 1
-                print(f"[{src}] {dest.relative_to(root)}", flush=True)
-            except TooBig as e:
-                big.append(f"{dest0.parent.name}/{dest0.name}  {e}")
-            except Exception as e:
-                if a_.get("is_started") is False and 403 in getattr(e, "codes", ()):
-                    # 排程未开放且所有来源皆回 403：开放后下次 sync 自动抓
-                    pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 开放）")
-                    continue
-                failed += 1
-                log(f"[失败] {dest0.name}: {e}")
-    for p_ in pending:
-        log(f"[未开放] {p_}")
-    for b in big:
-        log(f"[太大跳过] {b}")
-    if big:
-        log(f"  → {len(big)} 个档超过 {a.max_size}MB，要抓就指定课程加 --max-size 0")
-    extra = f"、未开放 {len(pending)}" if pending else ""
-    extra += f"、影音跳过 {media}（加 --videos 才抓）" if media else ""
-    size_s = f"（约 {total / 2**20:.0f}MB）" if a.dry_run else ""
-    log(f"{'预览' if a.dry_run else '完成'}：{'待下载' if a.dry_run else '新增'} {new}{size_s}、已有 {skipped}、失败 {failed}{extra} → {root}")
+    available = z.courses()
+    by_id = {c["id"]: c for c in available}
+    if ids and any(cid not in by_id for cid in ids):
+        raise ZjuError("没有符合的学在浙大课程；请用 lms courses --all 查看 ID")
+    courses = available if a.all else [by_id[cid] for cid in ids]
+    failed = 0
+    for course in courses:
+        try:
+            with course_writer(a, "lms", course["id"], course["name"]) as directory:
+                failed += sync_lms_course(z, a, directory, course)
+        except (OSError, ValueError, ZjuError) as error:
+            failed += 1
+            log(f"[失败] {course['name']}: {error}")
+    log(f"{'预览' if a.dry_run else '同步完成'}：{len(courses)} 门课程、{failed} 项失败")
     if failed:
         sys.exit(2)
+
+
+def sync_lms_course(z, a, directory, course):
+    state = DownloadState(directory)
+    jobs, seen = [], set()
+    failed = 0
+    limit = a.max_size * 2**20 if a.max_size else None
+    for activity, upload in z.uploads(course["id"]):
+        uid, rid = upload["id"], upload.get("reference_id") or upload["id"]
+        key = f"upload:{uid}"
+        if key in seen:
+            continue
+        seen.add(key)
+        rec = state.get(key)
+        name = safe_name(upload.get("name") or str(uid))
+        filename = f"{Path(name).stem[:110]} ({uid}){Path(name).suffix}"
+        dest = context_path(directory, rec["path"]) if rec else directory / "附件" / filename
+        if rec and rec["status"] == "complete" and dest.is_file() and dest.stat().st_size == rec["size"]:
+            log(f"[跳过] {dest}")
+            continue
+        if not a.videos and Path(name).suffix.lower() in MEDIA_EXT:
+            log(f"[跳过音视频] {name}（使用 --videos）")
+            continue
+        if limit and (upload.get("size") or 0) > limit:
+            log(f"[太大跳过] {name}")
+            continue
+        if a.dry_run:
+            print(f"[会下载] {dest}")
+            continue
+        state.claim(key, dest, kind="attachment", upload_id=uid, reference_id=rid,
+                    activity=activity.get("title", ""))
+        jobs.append((key, uid, rid, dest, activity))
+
+    def fetch(job):
+        key, uid, rid, dest, activity = job
+        response, source = z.upload_response(uid, rid, activity)
+        # 存储路径固定；远端 Content-Disposition 不参与本地身份。
+        response.headers.pop("Content-Disposition", None)
+        def prepare(target):
+            state.claim(key, target, kind="attachment", upload_id=uid, reference_id=rid,
+                        activity=activity.get("title", ""))
+        return stream_to(response, dest, limit, prepare=prepare), source
+
+    with ThreadPoolExecutor(max_workers=a.jobs) as pool:
+        futures = {pool.submit(fetch, job): job for job in jobs}
+        for future in as_completed(futures):
+            key, uid, rid, dest, activity = futures[future]
+            try:
+                path, source = future.result()
+                state.finish(key, path, source=source)
+                print(f"[下载] {path}")
+            except TooBig as error:
+                log(f"[太大跳过] {dest.name}: {error}")
+            except Exception as error:
+                if activity.get("is_started") is False and 403 in getattr(error, "codes", ()):
+                    log(f"[未开放] {dest.name}")
+                else:
+                    failed += 1
+                    log(f"[失败] {dest.name}: {error}")
+    if not a.dry_run:
+        data = read_course(directory, "lms", course["id"])
+        data.update(name=course["name"], teacher=[i.get("name") for i in course.get("instructors", [])],
+                    semester_id=course.get("semester_id"), academic_year_id=course.get("academic_year_id"),
+                    updated_at=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"))
+        data["files"] = []
+        for rec in state.data.values():
+            path = context_path(directory, rec["path"])
+            if rec["status"] == "complete" and path.is_file() and path.stat().st_size == rec["size"]:
+                data["files"].append({k: rec[k] for k in ("path", "upload_id", "reference_id", "activity") if k in rec})
+        atomic_text(directory / "course.json", json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    return failed
 
 
 def cmd_todo(a):
@@ -2327,38 +2475,9 @@ def context_path(directory: Path, value) -> Path:
     return target
 
 
-def context_course(root: Path, cid: int, sid: int):
-    """只查同步根目录及直接课程子目录；显式指向课程目录可消除改名歧义。"""
-    warnings, matches = [], []
-    try:
-        root = root.expanduser().resolve()
-        if not root.is_dir():
-            raise ZjuError("--out 本地目录不存在或不可用")
-        paths = ([root / "course.json"] if (root / "course.json").exists() else
-                 sorted(root.glob("*/course.json")))
-        for path in paths:
-            try:
-                context_path(root, path.relative_to(root).as_posix())
-                data = context_json(path)
-                if not isinstance(data, dict) or type(data.get("course_id")) is not int:
-                    raise ValueError("课程身份缺失")
-                if data["course_id"] != cid:
-                    continue
-                if data.get("schema_version") != 1 or data.get("source") != "zju-classroom":
-                    raise ZjuError(f"课程 {cid} 的 course.json 来源或版本不支持：{path}")
-                matches.append((path, data))
-            except ZjuError:
-                raise
-            except (OSError, ValueError, RuntimeError):
-                warnings.append(dict(code="invalid_course_metadata", message="有 course.json 损坏、不可读或路径越界；未使用"))
-    except OSError:
-        raise ZjuError("无法读取 --out 下的本地课程元数据") from None
-    if not matches:
-        raise ZjuError(f"未找到课程 {cid} 的有效 course.json（不可用元数据 {len(warnings)} 份）；请先同步或检查 --out")
-    if len(matches) > 1:
-        locations = "\n".join(str(p.parent) for p, _ in matches)
-        raise ZjuError(f"课程 {cid} 有多个本地目录；请将 --out 指向其中一个课程目录：\n{locations}")
-    path, course = matches[0]
+def context_course(directory: Path, cid: int, sid: int):
+    warnings = []
+    course = read_course(directory, "classroom", cid)
     lessons = course.get("lessons")
     if not isinstance(lessons, list) or any(not isinstance(s, dict) or type(s.get("sub_id")) is not int for s in lessons):
         raise ZjuError("course.json 的 lessons 格式无效")
@@ -2369,7 +2488,7 @@ def context_course(root: Path, cid: int, sid: int):
         raise ZjuError("course.json 的堂次 files 格式无效")
     if course.get("lessons_fetch_status") == "error":
         warnings.append(dict(code="stale_course_metadata", message="上次堂次查询失败，保留的本地信息可能不完整"))
-    return path.parent, course, selected[0], warnings
+    return directory, course, selected[0], warnings
 
 
 def context_files(directory, lesson, kind, cid, sid):
@@ -2580,11 +2699,12 @@ def context_ppt(directory, event_refs, pdf_refs, cid, sid, start, end, warnings)
 
 
 def classroom_context(a):
+    directory, a.course, _ = resolve_course(a, "classroom", a.course)
     if a.course < 1 or a.sub < 1:
         raise ZjuError("--course 和 --sub 必须是正整数")
     if not all(math.isfinite(x) and x >= 0 for x in (a.at, a.window)) or not math.isfinite(a.at + a.window):
         raise ZjuError("查询时间及窗口必须是有限非负秒数，且总和不能溢出")
-    directory, course, lesson, warnings = context_course(Path(a.out), a.course, a.sub)
+    directory, course, lesson, warnings = context_course(directory, a.course, a.sub)
     # 避免 0.7 + 0.1 的浮点误差把恰好位于闭区间边界的事件排除。
     start = max(0., float(Decimal(str(a.at)) - Decimal(str(a.window))))
     end = float(Decimal(str(a.at)) + Decimal(str(a.window)))
@@ -2649,7 +2769,9 @@ def cmd_classroom_context(a):
 
 
 def cmd_classroom(a):
-    z = Zju()
+    if a.action == "courses" and getattr(a, "local", False):
+        return cmd_local_courses(a)
+    z = Zju() if a.action not in ("tracked", "rm") else None
     if a.action == "courses":
         courses = z.classroom_courses()
         if a.has_tasks:
@@ -2663,11 +2785,6 @@ def cmd_classroom(a):
     elif a.action == "search":
         for c in z.classroom_search(a.arg or "", a.teacher or ""):
             print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}\t{c.get('term_name', '')}")
-    elif a.action == "subs":
-        if not a.arg:
-            raise ZjuError("用法：classroom subs <course_id>")
-        for s in z.course_subs(int(a.arg)):
-            print(f"{s['sub_id']}\t{s['sub_name']}\t{s['lecturer']}")
     elif a.action == "day":
         start = dt.date.fromisoformat(a.arg) if a.arg else dt.date.today()
         for d, s in range_subs(z, start, a.days or 1):
@@ -2693,108 +2810,168 @@ def cmd_classroom(a):
             print(f"{cid}\t{name}")
 
 
-def cmd_classroom_sync(a):
-    z = Zju()
-    courses = z.classroom_courses()
-    if a.course:
-        selected = []
-        for selector in a.course:
-            matched = [c for c in courses if (str(c["course_id"]) == selector if selector.isdigit()
-                                             else selector.casefold() in c["title"].casefold())]
-            if not matched:
-                raise ZjuError(f"没有符合的个人课程：{selector}（用 classroom courses 查看）")
-            selected.extend(matched)
-        courses = list({c["course_id"]: c for c in selected}.values())
-    root = Path(a.out).expanduser()
-    failed, subs, seen, details = 0, [], set(), {}
-    for c in courses:
-        if c["type"] != "multi":
-            log(f"[跳过] {c['title']}：课程类型 {c['type']} 不支持课堂资料同步")
-            continue
-        details[c["course_id"]] = None
-        try:
-            rows = z.course_subs(c["course_id"])
-            details[c["course_id"]] = rows
-            for s in rows:
-                key = (s["course_id"], s["sub_id"])
-                if key not in seen:
-                    seen.add(key)
-                    subs.append(s)
-        except Exception as e:
-            failed += 1
-            log(f"[失败] {c['title']}: {e}")
-    log(f"[同步] {len(courses)} 门课程、{len(subs)} 堂课，{a.jobs} 个 worker")
+@contextmanager
+def course_writer(a, platform, cid, name):
     if a.dry_run:
-        for s in subs:
-            for kind, suffix in (("智云PPT", "pdf"), ("转录", a.format)):
-                dest = classroom_material_path(root, s, kind, suffix)
-                complete = dest.exists() and (kind != "智云PPT" or dest.with_suffix(".json").exists())
-                status = "跳过" if complete and not a.force else "待检查并下载"
-                print(f"[{status}] {dest.relative_to(root)}")
-        if a.recording:
-            failed += recording_subs(z, a, root, subs)
-        if getattr(a, "recording_audio", False):
-            failed += audio_subs(z, a, root, subs)
-    else:
-        # 主线程负责组织材料，worker 只下载单个文件或录播分片；避免嵌套线程池与 -j 倍增。
-        # 转写、PPT、录播依次处理，整个同步复用同一线程池。
-        with ThreadPoolExecutor(max_workers=a.jobs) as pool:
-            futures = {pool.submit(transcript_one, z, a, root, s): s for s in subs}
+        directory, _, _ = resolve_course(a, platform, cid, name=name, writing=True)
+        yield directory
+        return
+    # 资料库锁只保护定位及首次登记；不同课程的媒体传输不共用锁。
+    with ExitStack() as locks:
+        with ExitStack() as allocation:
+            if not getattr(a, "course_dir", None):
+                allocation.enter_context(download_lock(library_path(a, platform) / ".courses", "资料库登记", timeout=30))
+            directory, _, _ = resolve_course(a, platform, cid, name=name, writing=True)
+            context_path(directory, ".course.json.download.lock")
+            locks.enter_context(download_lock(directory / "course.json", "课程", timeout=30))
+            initialize_course(directory, platform, cid, name)
+        yield directory
+
+
+def sync_ids(a, platform):
+    ids = list(dict.fromkeys(a.course))
+    if a.all and (ids or a.course_dir):
+        raise ZjuError("--all 不能与课程 ID 或 --course-dir 混用")
+    if a.course_dir:
+        if len(ids) > 1:
+            raise ZjuError("--course-dir 只能用于一门课程")
+        _, cid, _ = resolve_course(a, platform, ids[0] if ids else None, writing=True)
+        return [cid]
+    if not ids and not a.all:
+        raise ZjuError("请选择课程 ID、已有 --course-dir，或显式 --all")
+    return ids
+
+
+def run_classroom_downloads(z, a, directory, subs, kinds):
+    failed = 0
+    with ThreadPoolExecutor(max_workers=a.jobs) as pool:
+        if "transcript" in kinds:
+            futures = {pool.submit(transcript_one, z, a, directory, s): s for s in subs}
             for future in as_completed(futures):
-                s = futures[future]
                 try:
                     future.result()
-                except Exception as e:
+                except Exception as error:
                     failed += 1
-                    log(f"[失败] 转录 {s['course_name']} {s['sub_name']}: {e}")
-            for s in subs:
+                    log(f"[失败] 转录 {futures[future]['sub_name']}: {error}")
+        if "ppt" in kinds:
+            for sub in subs:
                 try:
-                    ppt_one(z, a, root, s, pool=pool)
-                except Exception as e:
+                    ppt_one(z, a, directory, sub, pool=pool)
+                except Exception as error:
                     failed += 1
-                    log(f"[失败] PPT {s['course_name']} {s['sub_name']}: {e}")
-            if a.recording:
-                failed += recording_subs(z, a, root, subs, pool=pool)
-        if getattr(a, "recording_audio", False):
-            failed += audio_subs(z, a, root, subs)
-        for c in courses:
-            if c["course_id"] not in details:
-                continue
-            try:
-                write_course_metadata(root, c, details[c["course_id"]])
-            except Exception as e:
-                failed += 1
-                log(f"[失败] 课程元数据 {c['title']}: {e}")
-    log(f"{'预览' if a.dry_run else '同步完成'}：{len(subs)} 堂课，{'有失败' if failed else '无失败'}")
-    if failed:
-        sys.exit(2)
+                    log(f"[失败] PPT {sub['sub_name']}: {error}")
+        if "recording" in kinds:
+            failed += recording_subs(z, a, directory, subs, pool=pool)
+    if "recording-audio" in kinds:
+        failed += audio_subs(z, a, directory, subs)
+    return failed
 
 
-def cmd_ppt(a):
+def cmd_classroom_sync(a):
+    ids = sync_ids(a, "classroom")
     z = Zju()
-    root = Path(a.out).expanduser()
-    subs = resolve_subs(z, a)
-    if not subs:
-        log("没有课堂")
-        return
-    failed = 0
-    for s in subs:
+    rows = z.classroom_courses()
+    by_id = {row["course_id"]: row for row in rows}
+    courses = rows if a.all else [by_id.get(cid, dict(course_id=cid, title=str(cid), type="multi")) for cid in ids]
+    failed = count = 0
+    kinds = {"ppt", "transcript"}
+    if a.recording:
+        kinds.add("recording")
+    if a.recording_audio:
+        kinds.add("recording-audio")
+    for course in courses:
+        if course["type"] != "multi":
+            log(f"[跳过] {course['title']}：不支持的课程类型 {course['type']}")
+            continue
+        subs = None
         try:
-            ppt_one(z, a, root, s)
-        except Exception as e:  # 一堂坏掉不拖垮其他堂
+            subs = z.course_subs(course["course_id"])
+            if subs:
+                course = dict(course, title=subs[0]["course_name"])
+            count += len(subs)
+        except Exception as error:
             failed += 1
-            log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
+            log(f"[失败] 堂次查询 {course['course_id']}: {error}")
+        try:
+            with course_writer(a, "classroom", course["course_id"], course["title"]) as directory:
+                if subs is not None:
+                    failed += run_classroom_downloads(z, a, directory, subs, kinds)
+                if not a.dry_run:
+                    write_course_metadata(directory, course, subs)
+        except (ZjuError, OSError, ValueError) as error:
+            failed += 1
+            log(f"[失败] 课程 {course['course_id']}: {error}")
+    log(f"{'预览' if a.dry_run else '同步完成'}：{len(courses)} 门课程、{count} 堂课、{failed} 项失败")
     if failed:
         sys.exit(2)
+
+
+def cmd_classroom_material(a):
+    if a.course_dir:
+        _, a.course, _ = resolve_course(a, "classroom", a.course, writing=True)
+    z = Zju()
+    subs = resolve_subs(z, a)
+    groups = {}
+    for sub in subs:
+        groups.setdefault(sub["course_id"], []).append(sub)
+    if not groups and a.course:
+        groups[a.course] = []
+    failed = 0
+    for cid, lessons in groups.items():
+        name = lessons[0]["course_name"] if lessons else str(cid)
+        try:
+            with course_writer(a, "classroom", cid, name) as directory:
+                failed += run_classroom_downloads(z, a, directory, lessons, {a.action})
+                if not a.dry_run:
+                    old = read_course(directory)
+                    course = dict(course_id=cid, title=lessons[0]["course_name"] if lessons else old.get("name"))
+                    write_course_metadata(directory, course, lessons)
+        except (ZjuError, OSError, ValueError) as error:
+            failed += 1
+            log(f"[失败] 课程 {cid}: {error}")
+    if failed:
+        sys.exit(2)
+
+
+def cmd_local_courses(a):
+    rows = [dict({k: data.get(k) for k in ("platform", "course_id", "name", "teacher", "term", "updated_at")},
+                 course_dir=str(path)) for path, data in local_courses(library_path(a, a.platform), a.platform)]
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, allow_nan=False))
+    else:
+        for row in rows:
+            print(f"{row['course_id']}\t{row.get('name', '')}\t{row['course_dir']}")
+
+
+def cmd_classroom_subs(a):
+    if a.local or a.course_dir or (a.course is None and (Path.cwd() / "course.json").exists()):
+        _, _, data = resolve_course(a, "classroom", a.course)
+        rows = data.get("lessons", [])
+    else:
+        if a.course is None:
+            raise ZjuError("远端堂次查询需要 --course；本地查询使用 --local 或 --course-dir")
+        rows = Zju().course_subs(a.course)
+    if a.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2, default=str, allow_nan=False))
+    else:
+        for row in rows:
+            print(f"{row['sub_id']}\t{row.get('name', row.get('sub_name', ''))}\t{row.get('lecturer', '')}")
 
 
 def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = None):
     pdf = classroom_material_path(root, s, "智云PPT", "pdf")
     cdir = pdf.parent
     mapping_path = pdf.with_suffix(".json")
-    if pdf.exists() and mapping_path.exists() and not a.force:
+    state = DownloadState(root)
+    pdf_key, mapping_key = (material_key(s, "智云PPT", ext) for ext in ("pdf", "json"))
+    if material_complete(root, pdf_key) and material_complete(root, mapping_key) and not a.force:
         log(f"[跳过] {pdf.relative_to(root)}")
         return
+    if getattr(a, "dry_run", False):
+        print(f"[待检查并下载] {pdf.relative_to(root)}")
+        return
+    state.claim(pdf_key, pdf, **material_details(s, "智云PPT", "pdf"))
+    state.claim(mapping_key, mapping_path, **material_details(s, "智云PPT", "json"))
     if pdf.exists() and not mapping_path.exists():
         log(f"[补建事件映射] {pdf.relative_to(root)}（重新生成 PDF 以保证页码对应）")
     events = z.ppt_events(s["course_id"], s["sub_id"])
@@ -2848,14 +3025,31 @@ def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = No
         # 移除旧映射，避免 PDF 更新后仍留下旧页码；失败时下次运行会重建。
         mapping_path.unlink(missing_ok=True)
         images_to_pdf(pages, pdf)
-        if a.keep_images:  # 留全部原图，去重只影响 PDF
-            shutil.copytree(tmpdir, cdir / pdf.stem, dirs_exist_ok=True)
+        if a.keep_images:  # 原图目录也要登记，不能合并到用户自有目录。
+            images = cdir / pdf.stem
+            image_key = f"ppt-images:{s['course_id']}:{s['sub_id']}"
+            state.claim(image_key, images, kind="ppt_images", sub_id=s["sub_id"])
+            images.mkdir(exist_ok=True)
+            for source in paths:
+                target = images / source.name
+                key = f"{image_key}:{source.name}"
+                state.claim(key, target, kind="ppt_image", sub_id=s["sub_id"])
+                fd, temporary = tempfile.mkstemp(prefix=".part-", dir=images)
+                try:
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(source.read_bytes())
+                    os.replace(temporary, target)
+                finally:
+                    Path(temporary).unlink(missing_ok=True)
+                state.finish(key, target)
         mapping_tmp = mapping_path.with_name(f".part-{mapping_path.name}")
         try:
             mapping_tmp.write_text(json.dumps(timeline, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             os.replace(mapping_tmp, mapping_path)
         finally:
             mapping_tmp.unlink(missing_ok=True)
+        state.finish(pdf_key, pdf)
+        state.finish(mapping_key, mapping_path)
         missing_times = sum(event["created_sec"] is None for event in events)
         if missing_times:
             log(f"[注意] {missing_times} 个截图事件无有效时间，映射中保留为 null")
@@ -2866,53 +3060,37 @@ def ppt_one(z: Zju, a, root: Path, s: dict, pool: ThreadPoolExecutor | None = No
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def cmd_transcript(a):
-    z = Zju()
-    root = Path(a.out).expanduser()
-    failed = 0
-    for s in resolve_subs(z, a):
-        try:
-            transcript_one(z, a, root, s)
-        except Exception as e:
-            failed += 1
-            log(f"[失败] {s['course_name']} {s['sub_name']}: {e}")
-            continue
-    if failed:
-        sys.exit(2)
-
-
 def transcript_one(z: Zju, a, root: Path, s: dict):
     out = classroom_material_path(root, s, "转录", a.format)
-    if out.exists() and not a.force:
+    state = DownloadState(root)
+    key = material_key(s, "转录", a.format)
+    if material_complete(root, key) and not a.force:
         log(f"[跳过] {out.relative_to(root)}")
         return
+    if getattr(a, "dry_run", False):
+        print(f"[待检查并下载] {out.relative_to(root)}")
+        return
+    state.claim(key, out, **material_details(s, "转录", a.format))
     items = z.subtitle(s["sub_id"])
     if not items:
         log(f"[无转录] {s['course_name']} {s['sub_name']}")
         return
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_text(out, render_transcript(items, a.format, f"{s['course_name']} {s['sub_name']}"))
+    state.finish(key, out)
     print(f"[转录] {out.relative_to(root)}（{len(items)} 段）")
-
-
-def cmd_recording_audio(a):
-    z = Zju()
-    if audio_subs(z, a, Path(a.out).expanduser(), resolve_subs(z, a)):
-        sys.exit(2)
 
 
 def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
     if not subs:
         log("没有课堂")
         return 0
-    man, catalogues = Manifest(root), {}
+    man, catalogues = DownloadState(root), {}
     failed = completed = skipped = planned = unavailable = 0
     limit = a.max_size * 2**20 if a.max_size else None
 
-    def complete(path, key):
-        rec = man.get(key)
-        return (path.is_file() and path.stat().st_size > 0
-                and (not rec or path.stat().st_size == rec.get("size")))
+    def complete(key):
+        return material_complete(root, key, man)
 
     for s in subs:
         if s.get("show") == "no":
@@ -2920,14 +3098,18 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
             log(f"[已下架，跳过] 录播音轨 {s['course_name']} {s['sub_name']}")
             continue
         cid, sid = s["course_id"], s["sub_id"]
-        video = classroom_material_path(root, s, "录播", "mp4")
         single = classroom_material_path(root, s, "音频", "m4a")
-        if not a.force and complete(single, f"audio:{cid}:{sid}:1"):
+        audio_record = man.get(f"audio:{cid}:{sid}:1")
+        if not a.force and audio_record and audio_record.get("part_count") == 1 and complete(f"audio:{cid}:{sid}:1"):
             skipped += 1
             log(f"[跳过] {single.relative_to(root)}")
             continue
-        if complete(video, f"video:{cid}:{sid}:1"):
-            sources = [(1, "", None, video)]
+        local_videos = {r["part"]: r for key, r in man.data.items()
+                        if r.get("kind") == "recordings" and r.get("sub_id") == sid and material_complete(root, key, man)}
+        total = local_videos.get(1, {}).get("part_count", 0)
+        if total and set(local_videos) == set(range(1, total + 1)):
+            sources = [(i, f" - {i:02d}" if total > 1 else "", None, context_path(root, local_videos[i]["path"]))
+                       for i in range(1, total + 1)]
         else:
             try:
                 if cid not in catalogues:
@@ -2949,7 +3131,7 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
                 for i, url in enumerate(urls, 1):
                     suffix = f" - {i:02d}" if len(urls) > 1 else ""
                     path = classroom_material_path(root, s, "录播", "mp4", suffix)
-                    sources.append((i, suffix, url, path if complete(path, f"video:{cid}:{sid}:{i}") else None))
+                    sources.append((i, suffix, url, path if complete(f"video:{cid}:{sid}:{i}") else None))
             except ZjuError as e:
                 failed += 1
                 log(f"[失败] 音频 {s['course_name']} {s['sub_name']}: {e}")
@@ -2957,7 +3139,7 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
         for i, suffix, url, video in sources:
             dest = classroom_material_path(root, s, "音频", "m4a", suffix)
             key = f"audio:{cid}:{sid}:{i}"
-            if not a.force and complete(dest, key):
+            if not a.force and complete(key):
                 skipped += 1
                 log(f"[跳过] {dest.relative_to(root)}")
                 continue
@@ -2968,11 +3150,9 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
                 continue
             try:
                 log(f"[{action}] {dest.relative_to(root)}")
+                man.claim(key, dest, **material_details(s, "音频", "m4a", suffix))
                 make_audio(url, video, dest, a.jobs, limit, **index_cache_options(a))
-                man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
-                              "course_id": cid, "sub_id": sid,
-                              "source": "local" if video is not None else "remote",
-                              "at": dt.datetime.now().isoformat(timespec="seconds")})
+                man.finish(key, dest, source="local" if video is not None else "remote", part_count=len(sources))
                 completed += 1
                 print(f"[音频] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
             except TooBig as e:
@@ -2986,21 +3166,13 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
     return failed
 
 
-def cmd_recording(a):
-    z = Zju()
-    root = Path(a.out).expanduser()
-    subs = resolve_subs(z, a)
-    if recording_subs(z, a, root, subs):
-        sys.exit(2)
-
-
 def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExecutor | None = None) -> int:
     if not subs:
         log("没有课堂")
         return 0
     # 同一课程只读一次目录；完整下载成功后才记入清单。
     catalogues = {}
-    man = Manifest(root)
+    man = DownloadState(root)
     failed = downloaded = skipped = unavailable = planned = 0
     limit = a.max_size * 2**20 if a.max_size else None
     for s in subs:
@@ -3033,8 +3205,7 @@ def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExec
             key = f"video:{cid}:{sid}:{i}"
             part = f" - {i:02d}" if len(urls) > 1 else ""
             dest = classroom_material_path(root, s, "录播", "mp4", part)
-            rec = man.get(key)
-            if not a.force and rec and dest.is_file() and dest.stat().st_size == rec.get("size"):
+            if not a.force and material_complete(root, key, man):
                 skipped += 1
                 log(f"[跳过] {dest.relative_to(root)}")
                 continue
@@ -3045,10 +3216,9 @@ def recording_subs(z: Zju, a, root: Path, subs: list[dict], pool: ThreadPoolExec
             try:
                 log(f"[下载] {dest.relative_to(root)}")
                 kwargs = {"pool": pool} if pool is not None else {}
+                man.claim(key, dest, **material_details(s, "录播", "mp4", part))
                 download_video(z, url, dest, limit, a.jobs, restart=a.force, **kwargs)
-                man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
-                              "course_id": cid, "sub_id": sid,
-                              "at": dt.datetime.now().isoformat(timespec="seconds")})
+                man.finish(key, dest, part_count=len(urls))
                 downloaded += 1
                 print(f"[录播] {dest.relative_to(root)}（{dest.stat().st_size / 2**20:.1f}MB）")
             except TooBig as e:
@@ -3094,9 +3264,11 @@ def frame_arg(value: str) -> tuple[float, str]:
 def add_recording_frame_arguments(sp, fn):
     p = sp.add_parser("recording-frame", help="按需提取智云录播真实视频帧（本地优先，远端限量 Range 读取）",
                       description="时间相对所选 MP4 分段；默认保存在独立系统临时目录，退出后保留。无需系统 FFmpeg。")
-    p.add_argument("--course", type=int, required=True, help="智云 course_id")
+    p.add_argument("--course", type=positive_int, help="智云课程 ID；已有课程目录可省略")
     p.add_argument("--sub", type=int, required=True, help="智云 sub_id（单堂课）")
     p.add_argument("--part", type=int, help="录播分段，从 1 开始；多段时必须指定")
+    course_path_arguments(p)
+    p.add_argument("--offline", action="store_true", help="仅用本地完整录播，不认证、不访问远端")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--at", type=parse_frame_time, action="append", help="目标时间 HH:MM:SS.sss 或秒数，可重复")
     g.add_argument("--frame", type=frame_arg, action="append", metavar="TIME=PATH", help="每帧时间与完整路径，可重复；不能与 --output / --output-dir 混用")
@@ -3961,30 +4133,25 @@ def extract_recording_frames(a, source, part, *, client=None):
 
 def recording_frame_source(z, a, root):
     """复用课程查询、标准录播路径及完成清单；不把 .part 当作完整视频。"""
-    man, local = Manifest(root), {}
-    if not isinstance(man.data, dict):
-        raise FrameError(".zju_manifest.json 必须是 JSON 对象")
-    prefix = f"video:{a.course}:{a.sub}:"
-    for key, rec in man.data.items():
-        if not key.startswith(prefix) or not key[len(prefix):].isdigit() or not isinstance(rec, dict):
-            continue
-        recorded = rec.get("path")
-        if not isinstance(recorded, str):
-            continue
-        path = root / recorded
-        try:
-            path.resolve().relative_to(root.resolve())
-        except ValueError:
-            continue
-        if path.suffix.lower() == ".mp4" and path.is_file() and 0 < path.stat().st_size == rec.get("size"):
-            local[int(key[len(prefix):])] = path
+    local = {}
+    if root is not None:
+        read_course(root, "classroom", a.course)
+        state = DownloadState(root)
+        for key, rec in state.data.items():
+            if rec.get("kind") == "recordings" and rec.get("sub_id") == a.sub and material_complete(root, key, state):
+                if rec["part"] in local:
+                    raise FrameError("同一分段有多个已登记视频，无法选择")
+                local[rec["part"]] = context_path(root, rec["path"])
     if a.part in local:
         return local[a.part], a.part
     if a.part is None and local:
-        if set(local) == {1} and not local[1].stem.endswith(" - 01"):
+        if set(local) == {1} and state.get(f"video:{a.course}:{a.sub}:1").get("part_count") == 1:
             return local[1], 1
         raise FrameError("本地有分段录播，请指定 --part（编号与 recording 相同）")
     # 有完整本地来源时不需要认证/API，允许离线读取；否则复用智云认证与查询。
+    if getattr(a, "offline", False):
+        raise FrameError("没有可确认完整的本地录播；--offline 禁止远端读取")
+    z = z or Zju(classroom_first=True)
     subs = z.course_subs(a.course)
     sub = next((s for s in subs if s["sub_id"] == a.sub), None)
     if sub is None:
@@ -4001,11 +4168,12 @@ def recording_frame_source(z, a, root):
 
 def cmd_recording_frame(a):
     try:
+        directory, a.course, _ = resolve_course(a, "classroom", a.course, optional=True)
         validate_frame_args(a)
         # 认证过程中若有交互提示，也不能污染 --json 的 stdout。
         from contextlib import redirect_stdout
         with redirect_stdout(sys.stderr):
-            source, part = recording_frame_source(Zju(classroom_first=True), a, Path(a.out).expanduser())
+            source, part = recording_frame_source(None, a, directory)
             result = extract_recording_frames(a, source, part)
         if a.json:
             # JSON 转义保留真实路径，且兼容 Windows 重定向时的非 UTF-8 代码页。
@@ -4019,50 +4187,72 @@ def cmd_recording_frame(a):
     except FrameError as e:
         raise ZjuError(str(e)) from None
     except (OSError, ValueError, TypeError) as e:
-        raise ZjuError(f"录播帧参数或本地清单读取失败（{type(e).__name__}），请检查输出根目录及 .zju_manifest.json") from None
+        raise ZjuError(f"录播帧参数或本地清单读取失败（{type(e).__name__}），请检查课程目录及 .zju/downloads.json") from None
+
+
+def positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return value
+
+
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("必须是非负整数")
+    return value
+
+
+def course_path_arguments(parser):
+    paths = parser.add_mutually_exclusive_group()
+    paths.add_argument("--library", help="包含多门课程目录的资料库；显式路径不追加父级")
+    paths.add_argument("--course-dir", help="直接包含 course.json 的单门课程目录")
+
+
+def sync_arguments(parser):
+    course_path_arguments(parser)
+    parser.add_argument("course", type=positive_int, nargs="*", help="课程 ID；已有 --course-dir 可省略")
+    parser.add_argument("--all", action="store_true", help="显式同步全部可访问个人课程")
+    parser.add_argument("--dry-run", action="store_true", help="预览，不写课程资料；认证仍可能更新会话")
+    parser.add_argument("-j", "--jobs", type=positive_int, default=4)
 
 
 def main():
-    p = argparse.ArgumentParser(prog="zju.py", description="学在浙大 / 智云课堂 CLI")
-    try:
-        default_out = os.environ.get("ZJU_OUT") or load_config().get("out") or str(DEFAULT_OUT)
-    except ZjuError as e:
-        log(f"错误：{e}")
-        sys.exit(1)
-    p.add_argument("--out", default=default_out, help=f"输出根目录（目前 {default_out}；config.json 的 out 或 ZJU_OUT 可改）")
+    p = argparse.ArgumentParser(prog="zju.py", description="学在浙大 / 智云课堂单文件 CLI")
     sp = p.add_subparsers(dest="cmd", required=True)
-
-    x = sp.add_parser("login", help="设置学号并把密码存进 Keychain")
+    x = sp.add_parser("login", help="登录，密码保存在系统凭据库；保留其他配置")
     x.add_argument("username", nargs="?")
-    x.add_argument("--reset", action="store_true", help="重设 Keychain 密码")
+    x.add_argument("--reset", action="store_true", help="重新设置凭据与会话，不删除其他设置")
     x.set_defaults(fn=cmd_login)
+    x = sp.add_parser("lms", help="学在浙大：课件、活动、待办和提交")
+    lp = x.add_subparsers(dest="action", required=True)
 
-    x = sp.add_parser("courses", help="列出学在浙大课程")
+    x = lp.add_parser("courses", help="列出学在浙大课程")
     x.add_argument("--all", action="store_true", help="含往年课程（默认只列最新学年）")
     x.add_argument("--json", action="store_true")
-    x.set_defaults(fn=cmd_courses)
+    x.add_argument("--local", action="store_true", help="完全离线列出资料库课程")
+    x.add_argument("--library", help="资料库，仅与 --local 一起使用")
+    x.set_defaults(fn=cmd_courses, action="courses", platform="lms")
 
-    x = sp.add_parser("sync", help="增量同步课件")
-    x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
-    x.add_argument("--all", action="store_true", help="没指定课程时抓全部学年")
-    x.add_argument("--dry-run", action="store_true")
-    x.add_argument("--videos", action="store_true", help="包括学在浙大的音视频附件（默认跳过）")
-    x.add_argument("-j", "--jobs", type=int, default=4, help="并行下载数（默认 4）")
-    x.add_argument("--max-size", type=int, default=200, metavar="MB", help="单文件上限，超过只列出（默认 200，0 = 不限）")
+    x = lp.add_parser("sync", help="同步指定课程或显式 --all")
+    sync_arguments(x)
+    x.add_argument("--videos", action="store_true", help="包括活动中的音视频附件")
+    x.add_argument("--max-size", type=nonnegative_int, default=200, metavar="MiB")
     x.set_defaults(fn=cmd_sync)
 
-    x = sp.add_parser("todo", help="待办事项")
+    x = lp.add_parser("todo", help="待办事项")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_todo)
 
-    x = sp.add_parser("activities", help="列出课程活动（课件／视频／作业／讨论／测验…）")
+    x = lp.add_parser("activities", help="列出课程活动（课件／视频／作业／讨论／测验…）")
     x.add_argument("course", nargs="*", help="课程 id 或名称片段；省略 = 最新学年所有课程")
     x.add_argument("--all", action="store_true", help="没指定课程时含往年课程")
     x.add_argument("--type", nargs="*", metavar="T", help=f"只列这些类型：{', '.join(ACT_TYPES)}")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_activities)
 
-    x = sp.add_parser("show", help="单一活动详情（说明、附件、作业提交状态、讨论帖数）")
+    x = lp.add_parser("show", help="单一活动详情（说明、附件、作业提交状态、讨论帖数）")
     x.add_argument("activity", type=int)
     x.add_argument("--read", action="store_true", help="下载附件并输出文字（docx/pptx/pdf/doc/txt）")
     x.set_defaults(fn=cmd_show)
@@ -4073,7 +4263,7 @@ def main():
         x.add_argument("--html", action="store_true", help="内容已经是 HTML，不转换")
         x.add_argument("--attach", nargs="*", metavar="FILE", help="附件")
 
-    x = sp.add_parser("forum", help="讨论区：list / read / post / reply")
+    x = lp.add_parser("forum", help="讨论区：list / read / post / reply")
     fp = x.add_subparsers(dest="action", required=True)
     y = fp.add_parser("list", help="列出讨论帖（给讨论活动 id）")
     y.add_argument("id", type=int, help="讨论活动 id（activities --type forum 查）")
@@ -4090,11 +4280,11 @@ def main():
     body_args(y)
     x.set_defaults(fn=cmd_forum)
 
-    x = sp.add_parser("upload", help="上传文件到学在浙大，输出 upload id")
+    x = lp.add_parser("upload", help="上传文件到学在浙大，输出 upload id")
     x.add_argument("files", nargs="+")
     x.set_defaults(fn=cmd_upload)
 
-    x = sp.add_parser("submit", help="交作业（附件＋文字），默认送出前确认")
+    x = lp.add_parser("submit", help="交作业（附件＋文字），默认送出前确认")
     x.add_argument("activity", type=int, help="作业活动 id（activities --type homework 查）")
     x.add_argument("--file", nargs="*", metavar="FILE", help="要交的文件")
     x.add_argument("--upload-id", type=int, nargs="*", help="已用 upload 指令传好的文件 id")
@@ -4105,81 +4295,88 @@ def main():
     x.add_argument("-y", "--yes", action="store_true", help="不确认直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智云课堂：courses / sync / context / search / subs / day / add / rm / tracked")
-    x.set_defaults(fn=cmd_classroom)
+    x = sp.add_parser("classroom", help="智云课堂：同步、资料获取、离线上下文")
     cp = x.add_subparsers(dest="action", required=True)
-    y = cp.add_parser("courses", help="列出全部个人课程及任务数")
-    y.add_argument("--has-tasks", action="store_true", help="只列任务数大于 0 的课程")
-    y.add_argument("--json", action="store_true", help="输出 JSON")
-    y = cp.add_parser("search", help="按关键词搜索智云课程")
-    y.add_argument("arg", nargs="?", help="课程名称关键词")
-    y.add_argument("--teacher", help="教师名称")
-    y = cp.add_parser("subs", help="列出课程堂次")
-    y.add_argument("arg", type=int, help="智云课程 ID")
-    y = cp.add_parser("day", help="列出某天或最近 N 天的个人课堂")
-    y.add_argument("arg", nargs="?", help="日期 YYYY-MM-DD，默认今天")
-    y.add_argument("--days", type=int)
-    for action, help_text in (("add", "追踪课表外的课程"), ("rm", "移除追踪课程")):
+    y = cp.add_parser("courses", help="课程列表；--local 完全离线发现资料库课程")
+    y.add_argument("--local", action="store_true")
+    y.add_argument("--library", help="本地资料库，仅与 --local 一起使用")
+    y.add_argument("--has-tasks", action="store_true", help="远端列表只列任务数大于 0 的课程")
+    y.add_argument("--json", action="store_true")
+    y.set_defaults(fn=cmd_classroom, platform="classroom")
+    y = cp.add_parser("subs", help="堂次列表；--local 或 --course-dir 完全离线")
+    course_path_arguments(y)
+    y.add_argument("--course", type=positive_int)
+    y.add_argument("--local", action="store_true")
+    y.add_argument("--json", action="store_true")
+    y.set_defaults(fn=cmd_classroom_subs)
+    y = cp.add_parser("search", help="搜索远端课程")
+    y.add_argument("arg", nargs="?")
+    y.add_argument("--teacher")
+    y.set_defaults(fn=cmd_classroom)
+    y = cp.add_parser("day", help="某天或截至该日最近 N 天的课堂，含追踪课程")
+    y.add_argument("arg", nargs="?", help="YYYY-MM-DD，默认今天")
+    y.add_argument("--days", type=positive_int, default=1)
+    y.set_defaults(fn=cmd_classroom)
+    for action, help_text in (("add", "追踪课表外课程"), ("rm", "取消追踪课程")):
         y = cp.add_parser(action, help=help_text)
-        y.add_argument("arg", help="智云课程 ID（classroom search 查）")
-        y.add_argument("more", nargs="*", help="其他课程 ID")
-    cp.add_parser("tracked", help="列出追踪中的课程")
-    y = cp.add_parser("context", help="只读检索本地课堂上下文，无需登录或网络",
-                      description="以 --out 下 course.json 定位资料；返回原始转写、PPT 候选及媒体引用，时间轴不自动校准。--out 也可指向具体课程目录。")
-    y.add_argument("--course", type=int, required=True, help="智云课程 ID")
-    y.add_argument("--sub", type=int, required=True, help="智云堂次 ID")
-    y.add_argument("--at", type=parse_frame_time, required=True, help="原始转写时间 HH:MM:SS.sss 或秒数")
-    y.add_argument("--window", type=parse_frame_time, default=20., help="前后窗口秒数，有限非负数（默认 20）；左端裁剪到 0")
-    y.add_argument("--json", action="store_true", help="输出 JSON；相对文件路径以 location.course_dir 为基准")
+        y.add_argument("arg")
+        y.add_argument("more", nargs="*")
+        y.set_defaults(fn=cmd_classroom)
+    cp.add_parser("tracked", help="列出本地追踪设置").set_defaults(fn=cmd_classroom)
+    y = cp.add_parser("context", help="完全离线、只读定位课堂候选上下文；时间轴未校准")
+    course_path_arguments(y)
+    y.add_argument("--course", type=positive_int, help="课程 ID；课程目录已登记时可省略")
+    y.add_argument("--sub", type=positive_int, required=True)
+    y.add_argument("--at", type=parse_frame_time, required=True)
+    y.add_argument("--window", type=parse_frame_time, default=20., help="前后窗口秒数，默认 20")
+    y.add_argument("--json", action="store_true")
     y.set_defaults(fn=cmd_classroom_context)
-    y = cp.add_parser("sync", help="同步个人课程的 PPT、转写及可选录播、音频",
-                      description="所有文件、录播分片和音频请求共用 -j 并发上限；默认下载 PPT 和 Markdown 转写，并维护课程目录下的 course.json。")
-    y.add_argument("course", nargs="*", help="智云课程 ID 或名称片段；省略 = 全部个人课程")
-    y.add_argument("-j", "--jobs", type=int, default=4, help="下载 worker 总数（默认 4）")
-    y.add_argument("--recording", action="store_true", help="同时下载录播 MP4（支持断点续传）")
-    y.add_argument("--recording-audio", action="store_true", help="同时获取 M4A 音频；优先从已下载录播提取")
-    y.add_argument("--dry-run", action="store_true", help="预览资料路径，不下载、不写文件")
-    y.add_argument("--force", action="store_true", help="重新下载已有资料，丢弃录播分片进度")
-    y.add_argument("--format", choices=["md", "txt", "srt"], default="md", help="转写格式（默认 md；md / srt 保留毫秒）")
-    y.add_argument("--dedup", action="store_true", help="合并 PPT 时去除重复截图")
-    y.add_argument("--keep-images", action="store_true", help="保留全部 PPT 原始截图")
-    y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播或音频单文件上限（默认 0 = 不限）")
+    y = cp.add_parser("sync", help="同步指定课程，或显式 --all；默认 PPT 与 Markdown")
+    sync_arguments(y)
+    y.add_argument("--recording", action="store_true")
+    y.add_argument("--recording-audio", action="store_true")
+    y.add_argument("--force", action="store_true", help="重做已登记资料；不覆盖用户自有文件")
+    y.add_argument("--format", choices=["md", "srt", "txt"], default="md")
+    y.add_argument("--dedup", action="store_true")
+    y.add_argument("--keep-images", action="store_true")
+    y.add_argument("--max-size", type=nonnegative_int, default=0, metavar="MiB")
     add_index_cache_arguments(y)
     y.set_defaults(fn=cmd_classroom_sync)
-
-    for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording), ("recording-audio", cmd_recording_audio)):
-        x = sp.add_parser(name, help={"ppt": "智云 PPT → PDF", "transcript": "智云课堂语音转录",
-                                      "recording": "智云录播 → MP4", "recording-audio": "智云录播音轨 → M4A"}[name])
-        x.add_argument("--course", type=int, help="智云课堂 course_id（classroom courses / search 查）")
-        x.add_argument("--sub", type=int, nargs="*", help="只抓这些 sub_id")
-        x.add_argument("--days", type=int, help="不给 --course 时：最近 N 天的课（默认 1 = 今天；含 classroom add 追踪的课）")
-        x.add_argument("--force", action="store_true", help="已存在也重新下载")
+    for name in ("ppt", "transcript", "recording", "recording-audio"):
+        y = cp.add_parser(name, help={"ppt": "PPT 截图及事件映射", "transcript": "课堂转写（默认 Markdown）",
+            "recording": "完整录播，支持断点续传", "recording-audio": "本地优先无损提取音频，否则只下载音轨"}[name])
+        course_path_arguments(y)
+        y.add_argument("--course", type=positive_int)
+        y.add_argument("--sub", type=positive_int, nargs="+")
+        y.add_argument("--days", type=positive_int, help="最近 N 天；未指定课程时默认今天")
+        y.add_argument("--force", action="store_true", help="重做已登记资料，不覆盖用户文件")
+        y.add_argument("--dry-run", action="store_true", help="只预览，不写课程文件或下载媒体")
+        y.add_argument("-j", "--jobs", type=positive_int, default=32 if name == "recording-audio" else 4)
         if name == "ppt":
-            x.add_argument("--keep-images", action="store_true")
-            x.add_argument("--dedup", action="store_true",
-                           help="删掉重复截图（动画逐步出现、边讲边写、翻回前页），每页只留最完整的一张")
+            y.add_argument("--dedup", action="store_true")
+            y.add_argument("--keep-images", action="store_true")
         elif name == "transcript":
-            x.add_argument("--format", choices=["txt", "srt", "md"], default="txt", help="转写格式（默认 txt；md / srt 保留毫秒）")
+            y.add_argument("--format", choices=["md", "srt", "txt"], default="md")
         else:
-            x.add_argument("--dry-run", action="store_true", help="预览待处理音频" if name == "recording-audio" else "只列出待下载录播")
-            x.add_argument("--max-size", type=int, default=0, metavar="MB", help="单文件上限（默认 0 = 不限）")
-            x.add_argument("-j", "--jobs", type=int, default=32 if name == "recording-audio" else 4,
-                           help="音频并发请求数（默认 32 个协程）" if name == "recording-audio" else "每堂录播的并行分片连接数（默认 4）")
-            x.description = ("优先从完整本地录播提取；否则只下载 MP4 音频范围。无需 ffmpeg，不重新编码。"
-                             if name == "recording-audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
+            y.add_argument("--max-size", type=nonnegative_int, default=0, metavar="MiB")
             if name == "recording-audio":
-                add_index_cache_arguments(x)
-        x.set_defaults(fn=fn)
-
-    # 只加载参数定义（不导入 PyAV），其他命令不初始化解码库。
-    add_recording_frame_arguments(sp, cmd_recording_frame)
+                add_index_cache_arguments(y)
+        y.set_defaults(fn=cmd_classroom_material)
+    add_recording_frame_arguments(cp, cmd_recording_frame)
     a = p.parse_args()
-    if a.cmd == "classroom" and a.action == "sync" and (a.jobs < 1 or a.max_size < 0):
-        p.error("--jobs 必须 >= 1，--max-size 必须 >= 0")
-    if a.cmd in ("recording", "recording-audio") and (a.max_size < 0 or a.jobs < 1 or (a.days is not None and a.days < 1)):
-        p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
-    if a.cmd in ("recording", "recording-audio") and a.sub is not None and not a.course:
-        p.error("--sub 需要搭配 --course")
+    if a.cmd == "lms" and a.action == "activities" and a.course and a.all:
+        p.error("activities 的课程选择不能与 --all 混用")
+    if getattr(a, "local", False) and (getattr(a, "all", False) or getattr(a, "has_tasks", False)):
+        p.error("本地课程发现不能与远端 --all / --has-tasks 混用")
+    if getattr(a, "action", None) == "courses" and a.library is not None and not a.local:
+        p.error("courses --library 需要 --local")
+    if getattr(a, "action", None) == "subs" and a.library is not None and not a.local:
+        p.error("subs --library 需要 --local")
+    if getattr(a, "fn", None) == cmd_classroom_material:
+        if a.days is not None and (a.course is not None or a.course_dir is not None):
+            p.error("--days 不能与 --course / --course-dir 混用")
+        if a.sub and a.course is None and a.course_dir is None:
+            p.error("--sub 需要 --course 或 --course-dir")
     if hasattr(a, "index_cache_mb"):
         try:
             index_cache_options(a)
@@ -4187,7 +4384,7 @@ def main():
             p.error(str(error))
     try:
         a.fn(a)
-    except ZjuError as e:
+    except (ZjuError, OSError, ValueError) as e:
         log(f"错误：{e}")
         sys.exit(1)
     except KeyboardInterrupt:

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import av
+from course_fixtures import initialize, register
 import numpy as np
 from PIL import Image
 
@@ -61,19 +62,20 @@ class CourseMetadata(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "output"
+        self.root = Path(self.temp.name) / "library"
         self.course = dict(course_id=1, title="课程", teacher="教师", term="2026秋", type="multi", task_count=2)
         self.sub = dict(course_id=1, course_name="课程", sub_id=11, sub_name="第一堂",
                         lecturer="授课教师", day=dt.date(2026, 10, 1), show="yes")
         self.client = mock.MagicMock()
         self.client.classroom_courses.return_value = [self.course]
         self.client.course_subs.return_value = [self.sub]
-        self.client.subtitle.return_value = []
-        self.client.ppt_events.return_value = []
+        self.client.subtitle.return_value = [dict(BeginSec=1.12, EndSec=2.875, Text="课堂内容")]
+        self.client.ppt_events.return_value = [dict(url="https://example.com/slide", created_sec=1.23, source={})]
+        self.client.get.return_value = SimpleNamespace(ok=True, content=self.image)
         self.client.video_catalogue.return_value = {11: ["https://example.com/1", "https://example.com/2"]}
-        self.args = Namespace(out=str(self.root), course=[], jobs=2, force=False, dry_run=False,
-                              recording=False, recording_audio=False, format="md", dedup=False,
-                              keep_images=False, max_size=0)
+        self.args = Namespace(library=str(self.root), course_dir=None, course=[1], all=False, jobs=2,
+                              force=False, dry_run=False, recording=False, recording_audio=False,
+                              format="md", dedup=False, keep_images=False, max_size=0)
 
     @property
     def directory(self):
@@ -92,225 +94,167 @@ class CourseMetadata(unittest.TestCase):
     def metadata(self, directory=None):
         return json.loads(((directory or self.directory) / "course.json").read_text(encoding="utf-8"))
 
-    def seed(self, *, parts=2):
-        """模拟旧版本留下的完整目录，尚无 course.json。"""
-        records = {}
-        for extension, content in (("md", "# 旧转写\n\n**[00:00:00 → 00:00:02]** 内容\n"),
-                                   ("srt", "1\n00:00:00,000 --> 00:00:02,000\n内容\n"), ("txt", "内容\n")):
-            path = zju.classroom_material_path(self.root, self.sub, "转录", extension)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        pdf = zju.classroom_material_path(self.root, self.sub, "智云PPT", "pdf")
-        pdf.parent.mkdir(parents=True, exist_ok=True)
-        pdf.write_bytes(self.pdf)
-        pdf.with_suffix(".json").write_text(json.dumps(dict(schema_version=1, course_id=1, sub_id=11,
-            pdf_file=pdf.name, events=[dict(created_sec=1.23, source={"url": "https://example.com/?SECRET"})],
-            pages=[])), encoding="utf-8")
+    def seed_media(self, parts=2):
+        initialize(zju, self.directory)
         for part in range(1, parts + 1):
             suffix = f" - {part:02d}" if parts > 1 else ""
-            for kind, extension, content, key in (("音频", "m4a", self.audio, "audio"),
-                                                  ("录播", "mp4", self.video, "video")):
-                path = zju.classroom_material_path(self.root, self.sub, kind, extension, suffix)
+            for kind, extension, content in (("音频", "m4a", self.audio), ("录播", "mp4", self.video)):
+                path = zju.classroom_material_path(self.directory, self.sub, kind, extension, suffix)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
-                records[f"{key}:1:11:{part}"] = dict(path=str(path.relative_to(self.root)), size=len(content),
-                                                     course_id=1, sub_id=11)
-        (self.root / ".zju_manifest.json").write_text(json.dumps(records), encoding="utf-8")
+                register(zju, self.directory, path, self.sub, kind, extension, part=part, part_count=parts)
 
-    def test_first_sync_generates_materials_and_self_description_without_extra_queries(self):
-        self.client.subtitle.return_value = [dict(BeginSec=5025.12, EndSec=5032.875, Text="内容")]
-        self.client.ppt_events.return_value = [dict(url="https://example.com/slide?SECRET", created_sec=1.23,
-                                                  source={"created_sec": 1.23})]
-        self.client.get.return_value = SimpleNamespace(ok=True, content=self.image)
-        self.client.course_subs.return_value = [self.sub, dict(self.sub, sub_id=12, show="no", day=None),
-                                                dict(self.sub, sub_id=13, show=None)]
+    def test_first_sync_incremental_and_metadata_without_repeat_downloads(self):
         self.sync()
         data = self.metadata()
-        self.assertEqual((data["schema_version"], data["source"], data["course_id"]), (1, "zju-classroom", 1))
-        self.assertEqual((data["name"], data["teacher"], data["term"]), ("课程", "教师", "2026秋"))
-        self.assertIsNotNone(dt.datetime.fromisoformat(data["updated_at"]).tzinfo)
-        self.assertEqual(data["lessons_fetch_status"], "ok")
-        lessons = {s["sub_id"]: s for s in data["lessons"]}
-        self.assertEqual(lessons[11]["date"], "2026-10-01")
-        self.assertEqual(lessons[11]["lecturer"], "授课教师")
-        self.assertEqual([lessons[i]["availability"] for i in (11, 12, 13)], ["listed", "unlisted", "unknown"])
-        for lesson in lessons.values():
-            files = lesson["files"]
-            self.assertEqual([len(files[k]) for k in ("transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings")],
-                             [1, 1, 1, 0, 0])
-            for entries in files.values():
-                for entry in entries:
-                    self.assertFalse(Path(entry["path"]).is_absolute())
-                    self.assertTrue((self.directory / entry["path"]).is_file())
-                    self.assertNotIn("\\", entry["path"])
-        self.assertNotIn("SECRET", json.dumps(data))
-        self.client.classroom_courses.assert_called_once_with()
-        self.client.course_subs.assert_called_once_with(1)
-        self.client.video_catalogue.assert_not_called()
+        self.assertEqual((data["schema_version"], data["platform"], data["course_id"]), (2, "classroom", 1))
+        self.assertEqual((data["teacher"], data["term"]), ("教师", "2026秋"))
+        self.assertEqual(set(data["lessons"][0]["files"]), {"transcripts", "ppt_pdfs", "ppt_events", "audio", "recordings"})
+        self.assertTrue((self.directory / ".zju/downloads.json").is_file())
+        self.client.subtitle.reset_mock(); self.client.ppt_events.reset_mock()
+        self.sync()
+        self.client.subtitle.assert_not_called(); self.client.ppt_events.assert_not_called()
+        self.assertFalse((self.root / ".zju_manifest.json").exists())
 
-    def test_existing_directory_backfilled_without_download_with_all_media_combinations(self):
-        self.seed()
-        old_md = self.directory / "转录/第一堂 (11).md"
-        before = old_md.read_bytes(), old_md.stat().st_mtime_ns
-        manifest = (self.root / ".zju_manifest.json").read_bytes()
-        for recording, audio in ((False, False), (True, False), (False, True), (True, True)):
-            with self.subTest(recording=recording, audio=audio):
-                self.args.recording, self.args.recording_audio = recording, audio
-                with mock.patch.object(zju, "download_video", side_effect=AssertionError("重新下载视频")), \
-                        mock.patch.object(zju, "make_audio", side_effect=AssertionError("重新提取音频")):
-                    self.sync()
-                files = self.metadata()["lessons"][0]["files"]
-                self.assertEqual({x["format"] for x in files["transcripts"]}, {"md", "txt", "srt"})
-                for kind in ("audio", "recordings"):
-                    self.assertEqual([x["part"] for x in files[kind]], [1, 2])
-                    self.assertTrue(all(" - 0" in x["path"] for x in files[kind]))
-                self.client.subtitle.assert_not_called()
-                self.client.ppt_events.assert_not_called()
-                self.assertEqual((old_md.read_bytes(), old_md.stat().st_mtime_ns), before)
-                self.assertEqual((self.root / ".zju_manifest.json").read_bytes(), manifest)
+    def test_direct_directory_infers_id_and_keeps_user_files(self):
+        direct = Path(self.temp.name) / "我的课程"
+        direct.mkdir()
+        user = direct / "老师讲义.pdf"; user.write_bytes(b"user material")
+        self.args.library, self.args.course_dir = None, str(direct)
+        self.sync()
+        self.assertTrue((direct / "course.json").exists())
+        self.assertFalse((direct / "课程 (1)").exists())
+        self.args.course = []
+        self.sync()
+        self.assertEqual(user.read_bytes(), b"user material")
+        self.assertEqual(self.metadata(direct)["course_id"], 1)
 
-    def test_incremental_updates_names_and_keeps_omitted_lessons_without_moving_files(self):
-        self.seed(parts=1)
-        old_lesson = dict(self.sub, sub_id=12, sub_name="第二堂", show="no")
-        self.client.course_subs.return_value = [self.sub, old_lesson]
+    def test_moved_and_renamed_course_and_lesson_reuse_registered_paths(self):
+        self.seed_media()
         self.sync()
         before = self.metadata()
-        self.course.update(title="新课程名", teacher="新教师", term="2027春")
-        changed = dict(self.sub, course_name="新课程名", sub_name="更正堂次", lecturer="新授课教师",
-                       day=dt.date(2026, 10, 2), show=None)
-        self.client.course_subs.return_value = [changed, dict(changed, sub_id=13, show="yes")]
-        self.sync()
-        data = self.metadata()
-        self.assertEqual((data["name"], data["teacher"], data["term"]), ("新课程名", "新教师", "2027春"))
-        lessons = {s["sub_id"]: s for s in data["lessons"]}
-        self.assertEqual(set(lessons), {11, 12, 13})
-        self.assertEqual((lessons[11]["name"], lessons[11]["date"], lessons[11]["availability"]),
-                         ("更正堂次", "2026-10-02", "listed"))
-        self.assertEqual(lessons[12], next(s for s in before["lessons"] if s["sub_id"] == 12))
-        self.assertTrue(lessons[11]["files"]["audio"])
-        new = self.metadata(self.root / "新课程名 (1)")
-        self.assertFalse(any(s["files"]["audio"] for s in new["lessons"]))
-        self.assertTrue((self.directory / "音频/第一堂 (11).m4a").is_file())
-
-    def test_failed_lesson_query_preserves_known_information_and_marks_uncertainty(self):
-        self.seed(parts=1)
-        self.sync()
-        before = self.metadata()
-        self.client.course_subs.side_effect = zju.ZjuError("接口暂时失败")
-        self.sync(failure=True)
-        data = self.metadata()
-        self.assertEqual(data["lessons"], before["lessons"])
-        self.assertEqual(data["lessons_checked_at"], before["lessons_checked_at"])
-        self.assertEqual(data["lessons_fetch_status"], "error")
-        # 首次补建也可辨认已存文件，但不由文件名猜日期或下架状态。
-        (self.directory / "course.json").unlink()
-        self.sync(failure=True)
-        lesson = self.metadata()["lessons"][0]
-        self.assertEqual(lesson["availability"], "unknown")
-        self.assertIsNone(lesson["date"])
-        self.assertTrue(lesson["files"]["audio"])
-
-    def test_partial_force_failures_preserve_existing_files_and_do_not_claim_new_downloads(self):
-        self.seed(parts=1)
-        self.sync()
-        before = self.metadata()["lessons"][0]
-        self.client.course_subs.return_value = [self.sub, dict(self.sub, sub_id=12, sub_name="第二堂")]
-        self.client.subtitle.side_effect = zju.ZjuError("转写失败")
-        self.client.ppt_events.side_effect = zju.ZjuError("PPT 失败")
-        self.client.video_catalogue.return_value = {11: ["https://example.com/video"], 12: ["https://example.com/new"]}
-        self.args.force = self.args.recording = self.args.recording_audio = True
-        with mock.patch.object(zju, "download_video", side_effect=zju.ZjuError("视频失败")), \
-                mock.patch.object(zju, "make_audio", side_effect=zju.ZjuError("音频失败")):
-            self.sync(failure=True)
-        lessons = {s["sub_id"]: s for s in self.metadata()["lessons"]}
-        self.assertEqual(lessons[11]["files"], before["files"])
-        self.assertTrue(all(not files for files in lessons[12]["files"].values()))
-        self.assertEqual(lessons[12]["availability"], "listed")
-
-    def test_invalid_unfinished_and_orphan_files_not_reported(self):
-        self.seed()
-        (self.directory / "音频/第一堂 (11) - 01.m4a").write_bytes(self.audio[:-1])
-        records_path = self.root / ".zju_manifest.json"
-        records = json.loads(records_path.read_text())
-        records["video:1:11:2"]["size"] += 1
-        records_path.write_text(json.dumps(records))
-        for relative, content in (("录播/第一堂 (11) - 03.mp4.part", self.video),
-                                  ("录播/.第一堂 (11) - 04.mp4", self.video),
-                                  ("音频/第一堂 (11) - 03.m4a", b""),
-                                  ("转录/第一堂 (11).txt", b"\xff"),
-                                  ("智云PPT/错误 (12).pdf", b"<html>error</html>")):
-            (self.directory / relative).write_bytes(content)
-        events = json.loads((self.directory / "智云PPT/第一堂 (11).json").read_text())
-        events.update(sub_id=12, pdf_file="错误 (12).pdf")
-        (self.directory / "智云PPT/错误 (12).json").write_text(json.dumps(events))
-        self.sync()
-        lessons = {s["sub_id"]: s for s in self.metadata()["lessons"]}
-        files = lessons[11]["files"]
-        self.assertEqual([f["part"] for f in files["audio"]], [2])
-        self.assertEqual([f["part"] for f in files["recordings"]], [1])
-        self.assertEqual({f["format"] for f in files["transcripts"]}, {"md", "srt"})
-        self.assertFalse(any(lessons.get(12, {}).get("files", {}).values()))
-
-    def test_dry_run_does_not_create_or_modify_metadata_or_other_files(self):
-        self.args.dry_run = self.args.recording = self.args.recording_audio = True
-        self.sync()
-        self.assertFalse(self.root.exists())
-        self.seed()
-        self.args.dry_run = False
-        self.sync()
-        snapshot = {p.relative_to(self.root): (p.read_bytes(), p.stat().st_mtime_ns)
-                    for p in self.root.rglob("*") if p.is_file()}
-        self.args.dry_run = True
-        self.sync()
-        self.assertEqual({p.relative_to(self.root): (p.read_bytes(), p.stat().st_mtime_ns)
-                          for p in self.root.rglob("*") if p.is_file()}, snapshot)
-
-    def test_multiple_courses_and_output_roots_are_isolated_even_if_one_query_fails(self):
-        other = dict(self.course, course_id=2, title="另一课程")
-        other_sub = dict(self.sub, course_id=2, course_name="另一课程")
-        self.client.classroom_courses.return_value = [self.course, other]
-        self.client.course_subs.side_effect = lambda cid: [self.sub] if cid == 1 else [other_sub]
-        self.client.subtitle.return_value = [dict(BeginSec=0, EndSec=1, Text="内容")]
-        for root in (self.root, self.root.parent / "other-output"):
-            self.args.out = str(root)
+        moved = Path(self.temp.name) / "另一块磁盘" / "任意名称"
+        moved.parent.mkdir(); self.directory.rename(moved)
+        self.args.library, self.args.course_dir, self.args.course = None, str(moved), []
+        self.args.recording = self.args.recording_audio = True
+        self.course["title"] = "改名课程"
+        self.sub.update(course_name="改名课程", sub_name="改名堂次")
+        self.client.subtitle.reset_mock();self.client.ppt_events.reset_mock()
+        with mock.patch.object(zju, "download_video", side_effect=AssertionError("不应下载")), \
+                mock.patch.object(zju, "make_audio", side_effect=AssertionError("不应提取")):
             self.sync()
-            for cid, name in ((1, "课程"), (2, "另一课程")):
-                directory = root / f"{name} ({cid})"
-                data = self.metadata(directory)
-                self.assertEqual(data["course_id"], cid)
-                entry = data["lessons"][0]["files"]["transcripts"][0]
-                self.assertTrue((directory / entry["path"]).is_file())
-        def subs(cid):
-            if cid == 1:
-                raise zju.ZjuError("课程一失败")
-            return [other_sub, dict(other_sub, sub_id=12)]
-        self.client.course_subs.side_effect = subs
-        self.sync(failure=True)
-        self.assertEqual(len(self.metadata(Path(self.args.out) / "另一课程 (2)")["lessons"]), 2)
+        self.assertEqual(self.metadata(moved)["name"], "改名课程")
+        self.assertEqual(self.metadata(moved)["lessons"][0]["files"], before["lessons"][0]["files"])
+        self.client.subtitle.assert_not_called(); self.client.ppt_events.assert_not_called()
+        source, part = zju.recording_frame_source(None, Namespace(course=1, sub=11, part=2, offline=True), moved)
+        self.assertTrue(source.is_file());self.assertEqual(part, 2)
+        self.assertFalse(self.directory.exists())
 
-    def test_metadata_atomic_write_failure_keeps_old_bytes_and_cleans_temp(self):
-        self.seed()
+    def test_course_rename_in_library_reuses_original_directory(self):
+        self.sync();self.sub.update(course_name="新名字")
         self.sync()
-        path = self.directory / "course.json"
-        before = path.read_bytes()
-        replace = zju.os.replace
-        def fail(source, dest):
-            if Path(dest) == path:
-                raise OSError("模拟磁盘写入失败")
-            return replace(source, dest)
-        self.course["teacher"] = "新教师"
-        with mock.patch.object(zju.os, "replace", side_effect=fail):
-            self.sync(failure=True)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertFalse(list(self.directory.glob(".part-*")))
+        self.assertEqual(self.metadata()["name"], "新名字")
+        self.assertEqual(len(list(self.root.glob('*/course.json'))), 1)
 
-    def test_invalid_existing_metadata_is_not_overwritten(self):
-        self.seed()
-        path = self.directory / "course.json"
-        for content in ("{", "[]", json.dumps(dict(schema_version=1, source="zju-classroom", course_id=2))):
-            path.write_text(content, encoding="utf-8")
-            self.sync(failure=True)
-            self.assertEqual(path.read_text(encoding="utf-8"), content)
+    def test_multiple_courses_and_duplicate_identity_conflict(self):
+        self.args.course = [1, 2]
+        self.client.classroom_courses.return_value = [self.course, dict(self.course, course_id=2)]
+        self.client.course_subs.side_effect = lambda cid: [dict(self.sub, course_id=cid)]
+        self.sync()
+        self.assertTrue((self.root / "课程 (2)/course.json").is_file())
+        import shutil
+        shutil.copytree(self.directory, self.root / "副本")
+        self.sync(failure=True)
+        self.assertTrue((self.root / "副本/course.json").is_file())
+
+    def test_user_file_collision_is_not_overwritten_even_with_force(self):
+        initialize(zju, self.directory)
+        path = zju.classroom_material_path(self.directory, self.sub, "转录", "md")
+        path.parent.mkdir();path.write_text("user content", encoding="utf-8")
+        self.args.force = True
+        self.sync(failure=True)
+        self.assertEqual(path.read_text(), "user content")
+        self.assertEqual(self.metadata()["lessons"][0]["files"]["transcripts"], [])
+
+    def test_dry_run_does_not_create_directories_or_change_existing_files(self):
+        self.args.dry_run = True
+        self.sync();self.assertFalse(self.root.exists())
+        self.args.dry_run = False;self.sync()
+        before = {p.relative_to(self.root):p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        self.args.dry_run = True;self.args.force = True;self.sync()
+        self.assertEqual(before, {p.relative_to(self.root):p.read_bytes() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_partial_failure_preserves_known_lessons_and_materials(self):
+        self.seed_media(parts=1);self.sync()
+        before = self.metadata()
+        self.client.course_subs.side_effect = zju.ZjuError("API failure")
+        self.sync(failure=True)
+        self.assertEqual(self.metadata()["lessons"], before["lessons"])
+        self.assertEqual(self.metadata()["lessons_fetch_status"], "error")
+        self.client.course_subs.side_effect = None
+        self.client.course_subs.return_value = [self.sub, dict(self.sub, sub_id=12)]
+        self.client.subtitle.side_effect = zju.ZjuError("subtitle failure")
+        self.sync(failure=True)
+        self.assertEqual(self.metadata()["lessons"][0]["files"], before["lessons"][0]["files"])
+        self.assertEqual(self.metadata()["lessons"][1]["files"]["transcripts"], [])
+
+    def test_single_material_commands_refresh_metadata(self):
+        args = Namespace(**vars(self.args));args.course = 1;args.sub = [11];args.days = None
+        args.action = "transcript"
+        with mock.patch.object(zju, "Zju", return_value=self.client), mock.patch.object(zju, "load_config", return_value={}):
+            zju.cmd_classroom_material(args)
+            self.assertTrue(self.metadata()["lessons"][0]["files"]["transcripts"])
+            args.action = "ppt";zju.cmd_classroom_material(args)
+            self.assertTrue(self.metadata()["lessons"][0]["files"]["ppt_events"])
+
+    def test_missing_corrupt_and_pending_files_are_not_reported_complete(self):
+        self.seed_media(parts=2);self.sync()
+        state = zju.DownloadState(self.directory)
+        records = list(state.data.items())
+        audio = [(k,r) for k,r in records if r.get('kind') == 'audio']
+        (self.directory/audio[0][1]['path']).unlink()
+        (self.directory/audio[1][1]['path']).write_bytes(b'broken')
+        state.put('unfinished', dict(path='录播/incomplete.mp4', status='pending', kind='recordings', sub_id=11, part=3))
+        self.sync()
+        self.assertFalse(self.metadata()['lessons'][0]['files']['audio'])
+        self.assertEqual(len(self.metadata()['lessons'][0]['files']['recordings']),2)
+
+    def test_pending_video_state_moves_with_resume_files(self):
+        self.args.recording=True
+        self.client.video_catalogue.return_value={11:['https://example.com/video']}
+        original=[]
+        def interrupted(client,url,dest,limit,jobs,**kw):
+            original.append(dest)
+            dest.parent.mkdir(parents=True,exist_ok=True)
+            dest.with_name('.'+dest.name+'.part').write_bytes(b'validated fragment fixture')
+            raise zju.ZjuError('connection interrupted')
+        with mock.patch.object(zju,'download_video',side_effect=interrupted): self.sync(failure=True)
+        state=zju.DownloadState(self.directory)
+        self.assertEqual(state.get('video:1:11:1')['status'],'pending')
+        self.assertEqual(self.metadata()['lessons'][0]['files']['recordings'],[])
+        moved=Path(self.temp.name)/'moved';self.directory.rename(moved)
+        self.args.library=None;self.args.course_dir=str(moved);self.args.course=[]
+        self.sub['sub_name']='renamed lesson'
+        def resume(client,url,dest,limit,jobs,**kw):
+            self.assertFalse(kw['restart'])
+            self.assertEqual(dest.name,original[0].name)
+            partial=dest.with_name('.'+dest.name+'.part')
+            self.assertEqual(partial.read_bytes(),b'validated fragment fixture')
+            dest.write_bytes(self.video);partial.unlink()
+        with mock.patch.object(zju,'download_video',side_effect=resume):self.sync()
+        self.assertEqual(zju.DownloadState(moved).get('video:1:11:1')['status'],'complete')
+        self.assertEqual(len(self.metadata(moved)['lessons'][0]['files']['recordings']),1)
+
+    def test_metadata_write_failure_retains_previous_file(self):
+        self.sync();before=(self.directory/'course.json').read_bytes()
+        replace = zju.os.replace
+        def fail(source, target):
+            if Path(target).resolve() == (self.directory/'course.json').resolve():raise OSError('failure')
+            return replace(source,target)
+        with mock.patch.object(zju.os,'replace',side_effect=fail): self.sync(failure=True)
+        self.assertEqual((self.directory/'course.json').read_bytes(),before)
+        self.assertFalse(list(self.directory.glob('.part-*')))
+
 
 
 class TranscriptPrecision(unittest.TestCase):
@@ -337,6 +281,7 @@ class TranscriptPrecision(unittest.TestCase):
             path.parent.mkdir(parents=True)
             old = "# 课程 堂次\n\n**[00:00:01 → 00:00:02]** 旧内容  \n"
             path.write_text(old, encoding="utf-8")
+            register(zju, root, path, sub, "转录", "md")
             before = path.stat().st_mtime_ns
             client = mock.MagicMock()
             client.subtitle.return_value = [dict(BeginSec=1.12, EndSec=2.875, Text="新内容")]

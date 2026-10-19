@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+from course_fixtures import initialize, register
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
@@ -71,7 +72,8 @@ class PPTEvents(unittest.TestCase):
             root = Path(d)
             pdf = zju.classroom_material_path(root, sub, "智云PPT", "pdf")
             pdf.parent.mkdir(parents=True)
-            pdf.write_bytes(b"old PDF without mapping")
+            pdf.write_bytes(b"damaged registered PDF without mapping")
+            register(zju, root, pdf, sub, "智云PPT", "pdf")
             zju.ppt_one(client, args, root, sub)
             self.assertTrue(pdf.read_bytes().startswith(b"%PDF-"))
             mapping_file = pdf.with_suffix(".json")

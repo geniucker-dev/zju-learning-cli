@@ -2,348 +2,215 @@
 
 [简体中文](README.md) | 繁體中文
 
-學在浙大（courses.zju.edu.cn）與智雲課堂（classroom.zju.edu.cn）的輕量命令列工具：同步課件、把智雲課堂的 PPT 截圖合併成 PDF（可去除重複截圖）、匯出課堂語音轉錄、查待辦。
+學在浙大與智雲課堂的獨立、跨平台單檔 CLI。使用 uv、PEP 723 和 Python wheel；只需分發 `zju.py`，不需安裝專案套件或系統 FFmpeg。
 
-它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但沒辦法寫進腳本、排程或讓 AI agent 呼叫；這個專案把它的 API 邏輯改寫成輕量 Python CLI，補上增量同步、並行下載、PPT 去重，也修了幾個上游的邊界狀況。
+## 安裝與登入
 
-## 功能
-
-| 指令 | 作用 |
-| --- | --- |
-| `zju login` | 設定學號，密碼存進系統憑證庫（macOS Keychain、Windows 認證管理員；其他系統走 [keyring](https://pypi.org/project/keyring/)） |
-| `zju courses [--all]` | 課程列表（預設只列最新學年） |
-| `zju sync [課程...]` | 增量同步課件到 `<輸出目錄>/<課程>/` |
-| `zju todo` | 待辦事項，依截止時間排序（本地時區） |
-| `zju activities [課程…] [--type forum homework …]` | 列出所有活動（課件、影片、作業、討論、網頁、連結、測驗），附狀態與截止時間 |
-| `zju show <活動id> [--read]` | 活動詳情：說明、附件、完成條件；作業顯示自己的提交狀態，討論顯示帖數及自己的發帖／回帖紀錄；`--read` 下載附件並印出文字（docx/pptx/pdf/doc，貼圖標成 [圖]） |
-| `zju forum list <討論id> [--mine] [--full]` / `forum read <topic>` | 列出討論帖（`--mine` 只列自己的發帖與回帖）／讀帖與回覆 |
-| `zju forum post <討論id> --title … --body …` / `forum reply <topic> --body …` | 發帖／回帖，可 `--body-file`、`--attach` 附件 |
-| `zju upload 檔案…` | 上傳檔案到學在浙大，印出 upload id |
-| `zju submit <作業id> --file … [--body …] [--draft] [-y]` | 交作業；預設送出前確認，已截止會擋下 |
-| `./zju.py classroom courses [--has-tasks] [--json]` | 智雲個人課程，顯示課程 ID、學期、教師與任務數 |
-| `./zju.py classroom sync [課程...] [-j 4] [--recording] [--recording-audio]` | 同步智雲個人課程的 PPT 與轉錄，可選錄播、音訊 |
-| `./zju.py classroom context --course <cid> --sub <sid> --at <時間> [--json]` | 完全離線、唯讀檢索本地課堂候選上下文 |
-| `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
-| `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
-| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課，含追蹤中的課 |
-| `./zju.py classroom add\|rm <course_id>...` | 追蹤或移除課表外課程；`--days` 也包含追蹤課程，目錄為 `課名 老師 (課程ID)` |
-| `./zju.py classroom tracked` | 列出追蹤中的課程 |
-| `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程> (<id>)/智云PPT/<堂> (<sub_id>).pdf` |
-| `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程> (<id>)/转录/<堂> (<sub_id>).txt\|srt\|md` |
-| `./zju.py recording --course <id> \| --days N [-j 4]` | 智雲錄播 → `<課程> (<id>)/录播/<堂> (<sub_id>).mp4`，多連線分片下載 |
-| `./zju.py recording-audio --course <id> \| --days N [-j 32]` | 優先從本地錄播提取音軌，否則只下載音訊 → `<課程> (<id>)/音频/<堂> (<sub_id>).m4a` |
-| `./zju.py recording-frame --course <id> --sub <id> --at HH:MM:SS [--json]` | 按需提取真實影片影格，本地優先、遠端限量 Range 讀取；預設系統暫存目錄 |
-
-
-## 安裝
-
-需要 [uv](https://docs.astral.sh/uv/) 與 Python >=3.10（uv 可管理 Python）。相依套件寫在檔頭（PEP 723），第一次執行時 uv 會自動安裝。只需 `zju.py`，可單獨複製到任意目錄使用。
+需要 [uv](https://docs.astral.sh/uv/)；Python >=3.10 可由 uv 管理。首次執行自動安裝檔頭宣告的依賴。
 
 ```bash
 git clone https://github.com/geniucker-dev/zju-learning-cli.git
 cd zju-learning-cli
-./zju.py login
+uv run --script zju.py login
 ```
 
-沒有 uv 的話：`pip install requests httpx img2pdf pillow keyring numpy 'av>=16,<18'`，再用 `python zju.py ...` 執行。
+macOS/Linux 也可直接執行 `./zju.py login`。本文的 `./zju.py …` 在 Windows 使用 `uv run --script zju.py …`，不需建立軟連結。雙擊 `zju_login.command` / `zju_login.bat` 執行 `login --reset`，重設憑據和會話，**保留資料庫及追蹤課程設定**。
 
-影片影格解碼使用 [PyAV](https://pyav.basswood.io/docs/stable/) 的跨平台 wheel。wheel 可內建 FFmpeg 編解碼函式庫，使用者**不必安裝或呼叫系統 ffmpeg / ffprobe**；其他命令不會初始化影片解碼函式庫。常見 macOS、Windows、Linux 的 Python 版本有預編譯 wheel；沒有對應 wheel 的平台需要自行處理函式庫建置，不會退回呼叫外部程式。
+密碼保存在系統憑證庫（macOS Keychain，其他平台使用 keyring），亦支援 `ZJU_USER` / `ZJU_PASS`。設定與會話預設位於 `~/.config/zju-learning/`，可用 `ZJU_STATE_DIR` 覆寫整個狀態目錄。憑據不放進課程目錄。
 
-也可以不開終端機，直接雙擊登入腳本（每次都會清掉上一次的學號、密碼和 cookie，重新登入）：
+## 命令分組
 
-- macOS：`zju_login.command`，在 Finder 雙擊會開一個終端機視窗。用 git clone 的可以直接雙擊；下載 zip 的會被 Gatekeeper 擋下，先執行一次 `chmod +x zju_login.command && xattr -c zju_login.command`。
-- Windows：`zju_login.bat`，需要 Python 啟動器 `py -3.11`，並先用 pip 裝好上面的相依套件。
+| 命令 | 用途 |
+| --- | --- |
+| `login [學號] [--reset]` | 認證及憑據 |
+| `lms courses [--all] [--json]` | 學在浙大課程；預設最新學年，JSON 與文字篩選一致 |
+| `lms sync ID…` / `lms sync --all` | 增量同步指定課程或全部個人課程 |
+| `lms todo [--json]` | 待辦 |
+| `lms activities [課程…] [--all] [--type …] [--json]` | 活動清單 |
+| `lms show 活動ID [--read]` | 詳情；`--read` 取得附件並擷取文字 |
+| `lms forum list/read/post/reply …` | 查詢討論區、發文及回覆 |
+| `lms upload 檔案…` | 上傳附件 |
+| `lms submit 活動ID --file 檔案… [-y] [--draft]` | 交作業；預設確認，截止時阻擋 |
+| `classroom courses [--has-tasks] [--json]` | 智雲個人課程；ID 與 LMS 不同 |
+| `classroom search 關鍵字 [--teacher 教師]` | 搜尋遠端課程 |
+| `classroom subs --course ID [--json]` | 遠端堂次 |
+| `classroom day [YYYY-MM-DD] [--days N]` | 截至該日最近 N 天課堂 |
+| `classroom add/rm ID…`、`classroom tracked` | 追蹤課表外課程，不改變儲存名稱 |
+| `classroom sync ID…` / `classroom sync --all` | PPT PDF、事件 JSON、Markdown，可選影音 |
+| `classroom ppt/transcript/recording/recording-audio` | 個別取得資料，同時更新課程中繼資料 |
+| `classroom context` | 完全離線的近似上下文定位 |
+| `classroom recording-frame` | 本機優先，遠端 Range 按需取幀 |
 
-## 使用
+所有智雲資料命令都在 `classroom` 下。批次同步必須指定 ID 或明確 `--all`，不接受名稱片段作為同步 ID。個別命令支援 `--course ID --sub ID…` 或 `--days N`，未選課程時預設今天。`--days` 與課程選擇互斥，`--sub` 必須搭配課程 ID 或課程目錄。詳細參數見各命令 `--help`。
 
-```bash
-zju sync --dry-run                 # 先看會下載什麼、總共多大
-zju sync                           # 最新學年全部課程
-zju sync 微积分 123456              # 指定課程（名稱片段或 id，id 用 zju courses 查）
-zju sync --videos --max-size 0     # 連影音和大檔一起抓
-zju sync -j 8                      # 並行數（預設 4）
+## 路徑與設定
 
-zju classroom day --days 7
-zju ppt --days 1 --dedup           # 今天所有課的 PPT，重複截圖只留最完整的一張
-zju transcript --days 1 --format md
-```
+- `--library DIR`：多門課程目錄的直接父目錄。
+- `--course-dir DIR`：單門課程的實際目錄，直接包含 `course.json`。
+- `--output FILE` / `--output-dir DIR` / `--frame TIME=FILE`：截圖輸出位置。
 
-輸出目錄的優先順序：`--out` > 環境變數 `ZJU_OUT` > `~/.config/zju-learning/config.json` 的 `"out"` > `~/ZJU-Courses`。
+參數放在對應子命令後。`--library` 和 `--course-dir` 互斥；顯式路徑按原樣使用，不追加平台父目錄。身份為 `(platform, course_id)`，目錄名稱只供顯示。
 
-`sync --videos` 下載學在浙大活動的影音附件；`./zju.py recording` 下載智雲課堂的課堂錄播，兩者來源不同。
-
-程式提示與說明使用簡體中文。智雲資料統一保存在 `<課程名> (<course_id>)` 下，按 `智云PPT`、`转录`、`录播`、`音频` 分類，檔名為 `<堂次名> (<sub_id>).副檔名`。`--keep-images` 保留的截圖也使用含堂次 ID 的子目錄。課程名和轉錄內容保留平台原文；不辨識或遷移舊目錄。
-
-排程範例（cron，每天 22:00）：
-
-```cron
-0 22 * * * ~/.local/bin/zju sync && ~/.local/bin/zju ppt --days 1 && ~/.local/bin/zju transcript --days 1
-```
-
-退出碼：`0` 成功；`1` 設定、登入或 API 錯誤；`2` 部分檔案或堂次失敗（其餘照常完成）。
-
-## 跟 ZLA 的差異
-
-### PPT 時間事件映射
-
-每堂 PPT 除 PDF 外也產生同名 `.json`，無論是否啟用 `--dedup` 都保留截圖事件。`events` 保存每張原始截圖的 `created_sec`、原始接口資料、圖片 SHA-256、對應 `pdf_page` 及代表它的 `representative_event_index`；`pages` 保存每頁的代表事件和全部關聯事件。事件編號從 0 開始，PDF 頁碼從 1 開始。
-
-動畫補全與翻回舊頁的事件仍保留，多個事件可對應同一 PDF 頁。`relationship: represented` 表示由保留頁面代表，不保證當時畫面完全相同；移除的空白過場標記為 `blank`，頁碼為 `null`。全部截圖為空白時沿用既有行為，全部輸出為 PDF 頁。缺少或無效時間為 `null`，不按頁碼或截圖間隔推算。時間是截圖觀測點，並非頁面顯示區間；與音軌起點的對齊尚未驗證（`audio_alignment: unverified`）。
-
-預設記錄原圖身份但不保存圖片；加 `--keep-images` 保留全部原圖，`image_file` 為相對 JSON 所在目錄的路徑。已有 PDF 缺少同名 JSON 時會重新產生該堂 PDF 並補建映射；兩者齊全才略過。`--force` 可重新產生 PDF 與映射。
-
-### 智雲課程同步
-
-預設同步全部個人錄播課程的所有堂次，下載 PPT（PDF）與 Markdown 轉錄；也可用課程 ID 或名稱片段選課。`--recording` 同時下載錄播，`--recording-audio` 同時取得音訊。`-j` / `--jobs` 是整個同步的 worker 總數（預設 4）：每張 PPT 截圖、每份轉錄各佔一個 worker，錄播的每個分片各佔一個 worker，不再額外開錄播分片執行緒池。轉錄、PPT、錄播依序處理並重用同一個執行緒池。音訊於這些步驟完成後處理，遠端音訊請求也遵循 `-j` 上限（同步預設 4）；單獨 `recording-audio` 命令預設 32。搭配 `--recording --recording-audio` 時直接從剛下載的錄播提取音軌。
-
-使用統一資料目錄與增量跳過規則，錄播繼續支援跨次執行的斷點續傳。`--force` 重新下載資料並丟棄錄播分片進度；`--format txt|srt|md` 選擇轉錄格式，`--dedup` 去除重複 PPT 截圖，`--keep-images` 保留全部截圖，`--max-size MB` 限制錄播單檔大小（0 為不限）。
-
-`--dry-run` 不下載、不寫檔：PPT 與轉錄依現有檔案及堂次預覽路徑，標記為待檢查的資料可能尚未發布；錄播讀取目錄後預覽。單項失敗仍繼續處理其他資料，最終退出碼為 2。
-
-每次非預覽同步都會在 `<out>/<課程名稱> (<course_id>)/course.json` 原子更新課程中繼資料；即使資料全部增量略過，也會替既有目錄補建。它重用本次查詢的課程與堂次資訊，不額外請求 API，不改變資料配置。精簡範例（其他資料陣列可為空）：
+預設資料庫為 `~/ZJU-Courses/classroom`、`~/ZJU-Courses/lms`。`config.json` 可設定：
 
 ```json
 {
-  "schema_version": 1,
-  "source": "zju-classroom",
-  "course_id": 123,
-  "name": "範例課程",
-  "teacher": "教師",
-  "term": "2026秋",
-  "updated_at": "2026-10-20T02:00:00+00:00",
-  "lessons_fetch_status": "ok",
-  "lessons_checked_at": "2026-10-20T02:00:00+00:00",
-  "lessons": [{
-    "sub_id": 456,
-    "name": "第一堂",
-    "date": "2026-10-01",
-    "lecturer": "授課教師",
-    "availability": "listed",
-    "last_seen_at": "2026-10-20T02:00:00+00:00",
-    "files": {
-      "transcripts": [{"format": "md", "path": "转录/第一堂 (456).md"}],
-      "ppt_pdfs": [{"path": "智云PPT/第一堂 (456).pdf"}],
-      "ppt_events": [{"path": "智云PPT/第一堂 (456).json"}],
-      "audio": [{"part": 1, "path": "音频/第一堂 (456) - 01.m4a"}],
-      "recordings": []
-    }
-  }]
+  "libraries": {
+    "classroom": "~/ZJU-Courses/classroom",
+    "lms": "~/ZJU-Courses/lms"
+  }
 }
 ```
 
-所有資料路徑相對於 `course.json`，移動整個課程目錄後仍可使用。`type`、`task_count` 也會記錄既有課程資訊；未知資訊為 `null`。`availability` 僅表示接口的上架狀態：`listed` / `unlisted` / `unknown`，不表示一定有錄播或轉錄。`last_seen_at` 表示最後一次從堂次 API 看到該堂次的時間。本次遺漏的舊堂次繼續保留；堂次查詢失敗時保留舊資訊，`lessons_fetch_status` 為 `error`，`lessons_checked_at` 保留上次成功時間。下載部分失敗仍核對既有檔案，不把失敗當作下架。課程或堂次改名不移動舊檔，舊課程目錄也會更新中繼資料，各目錄僅引用自身資料。
+優先順序：命令顯式目錄 > 對應平台 `libraries` 設定 > 預設目錄。使用絕對路徑或 `~`。舊 `--out`、`ZJU_OUT`、設定 `out`、根目錄 Manifest 不屬於本版規範，沒有相容或自動遷移。
 
-檔案引用包含目錄內既有的所有支援格式，與本次是否啟用影音下載無關；多段影音逐項記錄從 1 開始的 `part`。僅列出非空且通過格式檢查的最終檔案，並核對既有影音清單大小；PDF 事件 JSON 還需有有效的配套 PDF。未完成檔、暫存檔、缺失或明顯損壞的檔案不列入，也不保存憑證或播放網址。檢查不進行整段媒體解碼，無法保證發現任意媒體內容損壞。`course.json` 使用獨立寫鎖與原子替換，寫入失敗保留舊版；已有中繼資料損壞或身份不符時回報失敗並保留原檔，供使用者檢查。`.zju_manifest.json` 的下載狀態管理保持不變。`--dry-run` 不建立或更新中繼資料。
-
-Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23.120 → 00:01:38.875]** 內容`，與 SRT 一樣保留到毫秒（四捨五入並處理進位）；SRT 使用標準逗號分隔毫秒，Markdown 使用小數點。整數時間補 `.000`，不推算 API 未提供的更高精度。已有 `.md` 仍按原規則增量略過，不轉換或重建；需要更新時使用獨立 `./zju.py --out <輸出目錄> transcript --course <課程ID> --format md --force`，可避免重抓 PPT、錄播與音軌。
-
-接口標記為已下架（`show: "no"`）的堂次，錄播與音軌會顯示「已下架，跳過」，不計為失敗；PPT 與轉錄仍按資料可用性處理。
+### 集中式資料庫
 
 ```bash
-./zju.py classroom sync -j 8
-./zju.py classroom sync 89418 --recording -j 8
-./zju.py classroom sync 人工智能 --dry-run --recording
+./zju.py classroom sync 89253 89418 --library ~/ZJU-Courses/classroom --recording-audio -j 32
+./zju.py classroom sync --all
+./zju.py lms sync 123456 --library ~/ZJU-Courses/lms
+./zju.py lms sync --all --videos --max-size 0
 ```
 
-### 本地課堂上下文
+```text
+ZJU-Courses/
+├── classroom/
+│   ├── 課程A (89253)/
+│   └── 課程B (89418)/
+└── lms/
+    └── 課程C (lms-123456)/
+```
 
-`classroom context` 從同步目錄的 `course.json` 依課程及堂次 ID 查找資料，不登入、不請求 API、不下載或修改檔案，也不初始化媒體解碼器。`--out` 可以是同步根目錄，或直接是包含 `course.json` 的課程目錄；只掃描根目錄及其直接課程子目錄。同一課程 ID 有多個歷史目錄時會報錯，需將 `--out` 指向具體課程目錄，不按顯示名稱或更新時間猜測。
+只檢查資料庫直接子目錄的 `course.json`。同一 ID 已有唯一目錄就重用，改名只更新中繼資料。多個相同 ID 副本會報錯，需顯式 `--course-dir`；不遞迴掃描磁碟或選擇「最新」副本。
+
+### 自己的課程資料夾內放智雲子目錄
 
 ```bash
-./zju.py --out "/path/to/Class/现代控制理论" classroom context \
-  --course 89253 --sub 2038852 --at 01:23:45.120 --window 20 --json
-# 省略 --json 輸出可讀摘要；--window 0 只查詢指定時間點。
-./zju.py --out "/path/to/課程目錄" classroom context --course 89253 --sub 2038852 --at 5025.12
+./zju.py classroom sync 89253 --course-dir "/path/to/Class/現代控制理論/智雲課堂" --recording-audio
+./zju.py classroom sync --course-dir "/path/to/Class/現代控制理論/智雲課堂" --recording-audio
 ```
 
-時間接受 `HH:MM:SS[.sss]` 或非負秒數，視窗預設前後各 20 秒，左端裁剪到 0。查詢閉區間內所有相交轉錄，支援毫秒、舊版整秒及僅有起點的 Markdown；保留文字及原始時間，不自動修正偏移。零時長按時間點比對，結束早於開始或缺少結束時間時僅按起點比對；超過 300 秒的段及重疊段保留並標記。TXT/SRT 仍提供檔案引用，但不解析上下文。
-
-PPT 回傳視窗內事件，以及視窗之前最近、之後最近的事件（同時刻的多個事件均保留）。無時間事件另列於 `untimed_events`；空白、動畫去重和翻回同頁的事件不合併。保留事件編號、代表事件、關係及 PDF 頁碼；映射不一致時不提供可用頁碼。`created_sec` 是觀測時間，**不推斷頁面的精確顯示起止區間**。
-
-`--json` stdout 只有一個 JSON 物件，主要欄位為 `schema_version`、`course`、`lesson`、`location`、`query`、`transcript`、`ppt`、`audio`、`video`、`recording_frame_hint`、`warnings`。檔案 `path` / `file` / `pdf_path` 都相對於 `location.course_dir`，呼叫方拼接該目錄即可讀取；移動課程目錄後重新執行即可。精簡示意：
-
-```json
-{
-  "schema_version": 1,
-  "query": {"at_sec": 5025.12, "window_sec": 20, "start_sec": 5005.12, "end_sec": 5045.12, "alignment": "unverified"},
-  "transcript": {"status": "ok", "segments": [{"file": "转录/课堂.md", "line": 3, "begin_sec": 5020.0, "end_sec": 5030.5, "text": "原始轉錄內容", "flags": []}]},
-  "audio": {"status": "missing", "parts": [], "classroom_time_mapping": "unknown", "duration_status": "not_recorded"}
-}
-```
-
-`missing` 表示中繼資料未登記資料，或具體引用檔案已缺失；`invalid` / `unavailable` / `unsafe_path` 分別表示格式或身份損壞、不可用、路徑越界。資料分組有部分可用內容時為 `partial`。`no_matches` 表示附近沒有匹配；PPT 只有相鄰事件時為 `neighbors_only`，只有無時間事件時為 `untimed_only`，只有 PDF 缺事件表時為 `missing_events`。僅有 TXT/SRT 時轉錄為 `unsupported_format`。課程身份錯誤、中繼資料無效或目錄歧義回傳非零退出碼；資料缺失或部分不可用仍回傳帶狀態的結果。不輸出原始 PPT API 中繼資料或播放網址；絕對、越界及指向課程外的符號連結路徑不讀取。
-
-影音僅檢查最終檔案容器結構，不完整解碼，無法發現任意媒體內容損壞。現有 `course.json` 沒有可靠媒體時長，因此 `duration_sec` / `time_range_sec` 為 `null`；不以檔案大小或轉錄結尾推算。多段檔案逐項回傳 `part`，不累計時長、不自動選擇所屬段。`recording_frame_hint` 只提供尚未校準的候選視窗及本地已知分段；遠端是否可用仍為 `unchecked`，本命令不呼叫取幀。轉錄與實際媒體可能相差數秒或更多，預設視窗不保證涵蓋正確內容；呼叫方需結合相鄰 PPT、語音及實際畫面確認。
-
-### 智雲錄播下載
-
-預設列出智雲「我的課程」中的全部課程，包括任務數為 0 的課程；`--has-tasks` 只列任務數大於 0 的課程。任務數與網頁一致，不代表一定有可下載錄播。`--json` 輸出 `course_id`、`title`、`teacher`、`term`、`type` 與 `task_count`。這些課程 ID 可用於 `classroom subs`、`ppt`、`transcript`、`recording` 與 `recording-audio`；頂層 `courses` 列出的則是學在浙大的 ID。
-
-可直接執行 `./zju.py`，不必建立符號連結。使用智雲課程 ID（與學在浙大不同）：
+### 直接與講義、作業混放
 
 ```bash
-./zju.py classroom courses
-./zju.py classroom courses --has-tasks
-./zju.py classroom courses --json
-./zju.py classroom search 人工智能
-./zju.py classroom subs 89418
-./zju.py recording --course 89418 --dry-run       # 只列待下載影片，不下載、不寫檔
-./zju.py recording --course 89418 --sub 2019095   # 指定堂次
-./zju.py recording --course 89418 -j 8           # 整門課；每個影片最多 8 個連線
-./zju.py recording --days 7                     # 最近 7 天自己的課堂
-./zju.py recording --course 89418 --max-size 4096 # 單檔上限 4096MB；預設 0 = 不限
+./zju.py classroom sync 89253 --course-dir "/path/to/Class/現代控制理論" --recording-audio
 ```
 
-預設每個影片使用 4 個連線，以 32MiB 分片平行下載，顯示進度及平均速度。逐個下載影片，分片失敗最多嘗試 3 次；伺服器不支援 Range 時回退到單連線。檢查每片的回應範圍、總大小、實際位元組數及最終 MP4 檔頭，全部成功才替換目標檔並寫入下載清單。伺服器提供 ETag 或 Last-Modified 時，使用 If-Range 防止混合不同版本。
+首次初始化需明確 ID；已有 `course.json` 可省略，若同時指定則必須相符。一個 `--course-dir` 只能對應一門課。未登記的講義、作業等使用者檔案不會自動接管、刪除或覆寫，即使有 `--force` 也一樣。
 
-已下載且大小符合清單的檔案會略過；暫無回放的堂次略過，下次重新查詢。多段回放網址分別存成帶編號的 MP4。目錄與檔名含課程、堂次 ID，避免同名覆蓋。目前支援直接 MP4，不支援 HLS。`--out` 放在子命令前，例如 `./zju.py --out ~/ZJU-Courses recording --course 89418`。
+寫入命令不從目前目錄猜測目標。唯讀查詢和取幀可識別目前目錄自身的 `course.json`，顯式路徑優先。整個課程目錄可以移動、複製或重新命名。
 
-**影片預設支援跨次執行的斷點續傳。** 中斷或失敗時，在影片旁保留隱藏的 `.影片名.mp4.part` 資料檔與 `.影片名.mp4.part.json` 進度檔。重新執行相同命令（輸出目錄不變）即可繼續，`-j` 可調整；只補抓未完成或校驗損壞的分片，未完成的單片從頭下載。每片完成後將資料寫入磁碟，再原子儲存進度及 SHA-256；下次校驗已完成分片。全部完成才替換 MP4，並清除資料和進度檔。隱藏的 `.影片名.mp4.download.lock` 小鎖檔保留，以阻止多個程序同時下載同一影片。
+## 課程與下載狀態
 
-續傳前核對遠端 ETag（或 Last-Modified）、總長度與來源；遠端版本變更、本地進度損壞或資料檔缺失時重新下載。網址簽名參數更新不影響續傳，仍須通過遠端版本核對。伺服器不支援 Range 或無可用版本標記時，從頭下載。`--force` 明確丟棄已有分片並重抓；不加 `--force` 才沿用進度。課件、PPT 與轉錄下載行為不變。
+實際資料子目錄沿用簡體命名，兩個語言版本使用相同格式：
 
-目錄接口及網址提取參考 Cold_Ink 的 [智云课堂批量下载](https://greasyfork.org/scripts/514465)（MIT）；本專案依實際接口相容字串與列表網址，使用 Python 串流分片下載。
+```text
+課程目錄/
+├── course.json
+├── .zju/downloads.json
+├── 智云PPT/堂次名稱 (堂次ID).pdf、同名.json
+├── 转录/堂次名稱 (堂次ID).md
+├── 音频/堂次名稱 (堂次ID).m4a
+└── 录播/堂次名稱 (堂次ID).mp4
+```
 
-### 智雲音訊
+多段影音使用 ` - 01`、` - 02` 後綴；狀態明確記錄 `part`、`part_count`，不從名稱猜身份。LMS 附件使用 `附件/原名 (upload_id).副檔名`，同名課程和附件均以 ID 隔離。
 
-無需安裝 `ffmpeg` 或其他影音工具。程式直接讀取 MP4 索引、複製第一條音軌並重建 M4A，不重新編碼：
+`course.json` 版本為 2，含 `platform`（`classroom` / `lms`）、`course_id`、`name`、`updated_at`。智雲另記教師、學期、堂次與已存在資料引用；LMS 記附件及已知學期欄位。所有資料引用相對課程目錄，使用 `/`。
+
+`.zju/downloads.json` 版本為 1，包含平台、課程 ID 和 `entries`，區分 `pending` 與 `complete`，記錄路徑、大小、類別、堂次/附件 ID、格式或分段資訊。只有完成且通過大小與格式檢查的智雲資料才進入公開中繼資料；不掃描目錄接管使用者檔案，不儲存播放簽名 URL 或憑據。
+
+同步和個別資料命令都會更新課程中繼資料；API 遺漏或暫時失敗不刪除既有堂次。顯示名稱改變不改變已登記路徑。原子更新失敗保留原檔並報錯。
+
+課程寫入有跨程序鎖；下載狀態在鎖內重讀、合併、原子替換。資料庫首次登記有短期配置鎖。鎖檔會保留，`.zju/` 和工具鎖檔屬於保留位置。**這是單機檔案鎖，不是雲端硬碟的跨設備分散式鎖；請勿兩台電腦同時寫同一課程。**
+
+`--dry-run` 不下載媒體、不寫課程資料或狀態；線上查詢仍可能更新使用者會話。錄播中斷保留 `.part`、`.part.json`，下次驗證來源及分片 SHA-256 後續傳。`--force` 重做已登記資料並丟棄錄播分片進度；不會自動轉換舊 Markdown。
+
+## PPT、轉寫、音頻與錄播
 
 ```bash
-./zju.py recording-audio --course 89418 --sub 2019095
-./zju.py recording-audio --course 89418                  # 預設 32 個協程並行
-./zju.py recording-audio --days 7 -j 8
-./zju.py recording-audio --course 89418 --dry-run
-./zju.py classroom sync 89418 --recording-audio -j 32
-./zju.py classroom sync 89418 --recording --recording-audio -j 8
+./zju.py classroom ppt --course 89253 --sub 2038852 --dedup --keep-images
+./zju.py classroom transcript --course 89253 --format srt
+./zju.py classroom transcript --course-dir /path/to/course --format md --force
+./zju.py classroom recording --course 89253 -j 4
+./zju.py classroom recording-audio --course 89253 -j 32
+./zju.py classroom recording-audio --days 7
 ```
 
-優先使用統一目錄中已完成的錄播；未完成的 `.part` 不算完整影片。沒有影片時，讀取遠端 MP4 索引並只下載音軌範圍。每批最多 360 個音訊分片，Range 請求頭接近 8KiB 時自動縮小批次。音軌範圍請求固定直連，不讀取環境代理，也不回退到代理。
+轉寫一律預設 Markdown，格式如 `**[01:23:45.120 → 01:23:52.875]** 內容`；SRT 使用逗號分隔毫秒，TXT 可顯式選取。有效且已登記的檔案增量略過。
 
-輸出為 `<輸出目錄>/<課程名稱> (<course_id>)/音频/<堂次名稱> (<sub_id>).m4a`，多段回放分別編號。已完成音訊會略過；`--force` 重新提取或下載，`--max-size MB` 限制最終音訊大小。成功後才原子替換輸出並更新清單，失敗或中斷會清理暫存資料，保留舊檔案；音訊暫不支援跨次執行的續傳。
+PPT JSON 保留每個原始事件的 `created_sec`、從 0 起算的事件編號、從 1 起算的 PDF 頁碼、代表事件與去重關係。動畫、返回同頁及空白事件不丟失；時間是觀測點，不是精確顯示區間。`--keep-images` 保留並登記原始截圖。
 
-支援有完整音軌索引的直接 MP4；沒有音軌、HLS、分片 MP4或不支援多範圍請求的伺服器會報錯，不自動下載整個影片。本地提取不受遠端 Range 支援情況影響。
+音頻沿用非同步 HTTP Multi-Range 取得壓縮音軌並重建 M4A，不重新編碼；完整本機錄播優先。錄播沿用 Range 分片及斷點續傳；伺服器不支援 Range 時完整下載可退回單連線，**按需取幀不會退回完整下載**。
 
-### 按需提取錄播影片影格
+同步 `-j` 預設 4，單項音頻預設 32，各階段遵循所設並行上限。`--max-size` 為單一輸出檔案的 MiB 上限，0 不限。LMS 預設 200 MiB、略過影音附件；`--videos` 開啟 LMS 影音附件，不等同智雲錄播。
 
-新增 `./zju.py recording-frame`，供使用者或 Agent 臨時查看黑板、推導與操作畫面，不加入 `classroom sync` 預設資料。優先使用路徑及大小符合原下載清單的完整本地 MP4，本地命中時不需要認證或課程查詢，否則以 HTTP Range 讀取遠端；`.part` 不視為完整影片。全域 `--out` 只用來尋找本地錄播，不控制影格輸出位置。
+## 完全離線的發現與上下文
 
 ```bash
-# 預設建立獨立系統暫存目錄，列出每張圖片的完整絕對路徑
-./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45
-
-# 單張完整路徑，自動建立父目錄；支援相對路徑、中文和 PNG
-./zju.py recording-frame --course 89253 --sub 2038840 --at 5025.125 --output "./images/板書.png"
-
-# 多個時間點共用同一容器、讀取快取與解碼上下文
-./zju.py recording-frame --course 89253 --sub 2038840 \
-  --at 01:23:40 --at 01:23:45 --at 01:23:50 --output-dir "./images/課堂"
-
-# 逐張指定完整路徑，只在第一個 = 處分隔
-./zju.py recording-frame --course 89253 --sub 2038840 \
-  --frame "01:23:40=./before/板書.jpg" --frame "01:23:45=./after/板書 = 完整.png"
-
-# 前後各 10 秒，每隔 2 秒；越過影片邊界的部分裁剪，始終包含中心時間
-./zju.py recording-frame --course 89253 --sub 2038840 \
-  --at 01:23:45 --around 10 --interval 2 --output-dir ./sequence
-
-# 多段錄播必須指定分段；Agent 使用 JSON，stdout 不混入進度或診斷
-./zju.py recording-frame --course 89253 --sub 2038840 --part 1 --at 01:23:45 --json
+./zju.py classroom courses --local --library /path/to/library --json
+./zju.py lms courses --local --library /path/to/lms-library --json
+./zju.py classroom subs --course-dir /path/to/course --json
+./zju.py classroom subs --local --library /path/to/library --course 89253 --json
+./zju.py classroom context --course-dir /path/to/course \
+  --sub 2038852 --at 01:23:45.120 --window 20 --json
 ```
 
-時間接受 `HH:MM:SS`、`HH:MM:SS.sss` 或浮點秒數，必須非負且小於影片長度。`--at` 是所選 MP4 分段內的相對時間，**不假定**已與轉錄 BeginSec、PPT created_sec 或音軌時間對齊。單段自動選取，多段省略 `--part` 會報錯。依 PTS 取得該時刻正在顯示的影格（兩影格之間取前一張），並記錄真正的 `actual_time_sec`；從之前的關鍵影格開始解碼，支援 B 影格重排、常見可變影格率與非零串流起點。
+不登入、不呼叫 API、不初始化解碼器、不修改資料。顯式目錄查詢和 `--help` 不受全域設定損壞影響。重複身份、損壞中繼資料或路徑歧義明確報錯；拒絕絕對、`..` 與越界符號連結資料引用。
 
-`--output` 只可搭配單個 `--at`；`--output-dir` 可搭配單張、批次或時間窗口；可重複的 `--frame` 不能與 `--at`、`--output`、`--output-dir` 或窗口選項混用。同次呼叫不可重複指定同一完整路徑。Windows 可使用引號包圍 `"01:23:45=C:\課程\板書.jpg"`，路徑的空格、中文與 `=` 會保留。
+JSON 含 `schema_version`、`course`、`lesson`、`location`、`query`、`transcript`、`ppt`、`audio`、`video`、`recording_frame_hint`、`warnings`。資料路徑相對 `location.course_dir`。
 
-所有模式預設最多請求 **100 幀**，可用 `--max-frames 200` 明確調整，必須為正整數。重複 `--at` / `--frame` 每項均輸出圖片，因此逐項計數；視窗先裁剪負時間，以奈秒精度合併取樣點，重疊視窗不重複輸出，始終包含中心點。在認證、讀取影片與建立圖片前檢查數量；視窗計數在影片尾端裁剪之前進行，最終輸出可能更少。
+轉寫以閉區間比對，預設前後 20 秒，支援毫秒、整秒與只有起點的 Markdown，異常長段、重疊、逆序時間另行標記。TXT/SRT 只提供引用。PPT 回傳視窗內及相鄰事件，無時間事件單列，不強行選唯一頁。
 
-預設用 `tempfile.mkdtemp()` 建立 `zju-frames-<隨機字串>` 系統暫存目錄，不寫死 `/tmp`。**程式結束後圖片與中繼資料仍存在**，呼叫方分析後自行刪除；系統之後也可能清理。明確指定位置時只寫入該位置，不另存到課程同步目錄。自動檔名例如 `89253_2038840_p01_01-23-45-000.jpg`，包含課程、堂次、分段與時間。JPEG 預設品質 95、原解析度，使用 `--quality 1…100` 調整；自動命名可用 `--format png`，完整路徑則依 `.jpg` / `.jpeg` / `.png` 副檔名選擇。
+`missing`、`invalid`、`unavailable`、`unsafe_path`、`partial`、`no_matches` 等狀態區分缺失、損壞及附近無內容。未記錄時長為 `null`；轉寫與錄播可能有數秒以上偏差，分段與整堂課的映射未知，候選窗口**未校準**，不自動修正或累加分段時長。
 
-每張圖片旁有 `<圖片名>.json`，記錄來源身分、請求/實際時間、timebase、編碼、尺寸、路徑與圖片 SHA-256，以及產生請求的網路、耗時、輸出數量與暫存目錄標記。只有來源、時間、編碼設定與圖片校驗都一致時才重用快取。本地身分包括大小、奈秒修改/變更時間及 inode；遠端使用無簽名資源路徑摘要、總大小與強 ETag，不保存簽名 URL、Cookie 或 Authorization。Last-Modified 僅用於本次讀取的一致性檢查，無法證明跨次內容相同：缺少強 ETag 時仍可取幀，但不會重用之前的截圖；完整路徑已有圖片時須用 `--force` 或另選路徑。預設暫存目錄不提供跨次快取；指定同一目錄或完整路徑可重用有效快取。自動檔名衝突時加入 `_1` 等後綴；完整路徑已有其他內容或快取失效則報錯。`--force` 重新編碼並允許覆寫。圖片與 JSON 先在目標目錄的暫存子目錄中完整寫入，再加系統鎖發布。寫入失敗時清理本次新建結果；`--force` 發布失敗則恢復被替換的原檔。雜湊及中繼資料必須一致才視為有效快取。目錄保留小型隱藏 `.frame.lock` 檔，系統在程序結束時釋放鎖。兩份檔案不是檔案系統交易，斷電或強制終止可能留下不匹配的一對檔案，下次不會將其視為有效快取。
-
-`--json` 回傳單一物件，單張與批次結構相同。`frames[]` 包含 `requested_time_sec`、`actual_time_sec`、`path` / `output_path`、`cache_hit` 及上述影格資料。請求層級有 `temporary`、`output_dir`（逐張路徑模式為 null）、`frame_count`、`network.requests`、`network.bytes_received`、`elapsed_sec` 及解碼統計。所有圖片路徑可直接讀取。診斷寫入 stderr，失敗回傳非零退出碼。網路統計只計媒體 HTTP 回應本文，不含登入/API 請求或 HTTP 標頭；耗時從提取開始計算，不含課程查詢與登入。
-
-遠端固定直連，預設嚴格限制 **64 MiB**，索引、重複讀取與失敗重試均計入；以 `--max-fetch-mb 128` 調整，不允許無上限。媒體以 1 MiB 區塊隨機讀取；已確認的 moov 索引範圍內最多合併 4 塊請求，預算不足時使用單塊；讀取快取最多 8 MiB，不把完整 MP4 放入記憶體。只接受正確的 206 / Content-Range、長度及一致的強 ETag 或 Last-Modified；200、授權失敗、重新導向、沒有版本標識/固定 Content-Length 或影片變更都報錯，不退回完整下載。支援 moov 位於頭部或尾部的普通 MP4；HLS、直播、缺少時長/索引或 wheel 不支援的編碼會報錯。長 GOP 或大索引可能需提高流量上限。
-
-普通 `--at` / `--frame` 請求的全部圖片快取有效時，直接回傳，不開啟 MP4 或初始化解碼器；遠端仍需一次 Range 探測驗證來源身分。缺少請求時長紀錄的舊快取會退回讀取索引；視窗或部分命中也沿用正常流程。
-
-`recording-audio`、`recording-frame` 和 `classroom sync --recording-audio` **預設共用原始 MP4 索引快取**。音訊產生的快取可供截圖使用，反過來也一樣；音訊仍透過非同步 Multi-Range 下載並直接重封裝，不重新編碼。
-
-macOS / Linux 的預設目錄為 `${XDG_CACHE_HOME:-~/.cache}/zju-learning/`，Windows 為 `%LOCALAPPDATA%\zju-learning\cache\`。環境變數為空、相對路徑或無效時，分別退回 `~/.cache/zju-learning/`、`~/AppData/Local/zju-learning/cache/`。**這是穩定的索引目錄；預設截圖仍在每次獨立建立的系統暫存目錄，程序結束後保留。** 優先使用完整本地 MP4 時不建立索引快取。
-
-三個命令都可覆寫快取位置、調整容量或關閉快取：
+## 按需取幀
 
 ```bash
-./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 \
-  --index-cache-dir "~/.cache/zju-learning" --index-cache-mb 256 --json
-./zju.py recording-audio --course 89253 --sub 2038840 --index-cache-dir "~/.cache/zju-learning"
-./zju.py classroom sync 89253 --recording-audio --index-cache-dir "~/.cache/zju-learning"
-./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 --no-index-cache --json
+./zju.py classroom recording-frame --course-dir /path/to/course --sub 2038852 --at 01:23:45.120 --json
+./zju.py classroom recording-frame --course 89253 --sub 2038852 --at 5025.12 --output /path/to/board.jpg
+./zju.py classroom recording-frame --course 89253 --sub 2038852 --at 01:23:40 --at 01:23:45 --output-dir /path/to/frames
+./zju.py classroom recording-frame --course 89253 --sub 2038852 \
+  --frame "01:23:40=/path/to/before.jpg" --frame "01:23:45=/another/path/after.png"
+./zju.py classroom recording-frame --course 89253 --sub 2038852 --part 1 --at 01:23:45 --around 10 --interval 2 --json
 ```
 
-後續呼叫使用相同快取位置即可跨程序雙向重用；相容舊版指定目錄下的有效快取。檔案位於指定目錄的 `zju-frame-index-v1/` 下，圖片仍遵循原輸出路徑規則。每次遠端 Range 探測確認強 ETag、來源身分及大小後才重用索引；簽名變更不影響相同來源版本，弱 ETag / Last-Modified 則退回正常讀取。課程權限、堂次下架狀態及錄播目錄仍會查詢。只儲存完整 `moov`，不儲存媒體片段、播放 URL 或認證資料，也不額外下載資料來填滿快取。
+`--offline` 禁止遠端回退。多段需指定 `--part`，`--at` 為所選 MP4 內相對時間，不能當成已校準的轉寫/PPT 時間。
 
-`--index-cache-mb` 為正整數，總容量預設 **256 MiB**，包含索引檔案中繼資料及寫入中的暫存檔；較舊項目按存取時間淘汰，單個超過 **64 MiB** 的索引不持久快取。中繼資料與讀取的資料塊均驗證 SHA-256；損壞、遺失、無法寫入或容量不足時正常退回網路讀取。寫入者使用跨程序系統鎖，衝突時跳過本次持久化，不等待另一程序的網路請求；已有項目仍可讀取。索引完整後原子發布，異常退出的暫存檔由下次取得鎖的呼叫清理。不再需要時可刪除此命名空間目錄。
+PyAV wheel 內可包含 FFmpeg 函式庫，無需系統 ffmpeg/ffprobe。以真實 PTS 選擇顯示幀，支援 B 幀、VFR、非零起點及批次資源重用。遠端嚴格驗證 206、範圍與來源版本，`--max-fetch-mb` 預設 64 MiB，`--max-frames` 預設 100，不預先下載完整影片。
 
-索引快取的本地讀取不計入 `network.bytes_received`；網路探測與回退讀取仍受 `--max-fetch-mb` 限制。`cache_hit` 繼續表示**圖片**快取命中；`--force` 重新產生圖片，但仍可使用已驗證索引。`--no-index-cache` 不讀寫持久索引，與 `--index-cache-dir` 互斥；不刪除已有快取。音訊的 `--max-size` 繼續限制輸出檔案大小，不作為網路預算；截圖流量預算不變。
+預設原解析度 JPEG，品質 95（`--quality`），亦支援 PNG。未指定輸出時建立獨立系統暫存目錄，檔名含課程、堂次、分段、時間，程序結束後仍保留，由呼叫端或系統清理，不複製到課程或索引快取。
 
-`recording-frame` 使用既有智雲 token 直接請求業務介面，省去學在浙大預檢。認證失效時最多重新登入並重試一次；仍被拒絕則明確報錯。其他命令沿用原認證流程。
+有效截圖快取可重用；自動檔名衝突時另命名，明確完整路徑衝突報錯，`--force` 才覆寫截圖。圖片與 JSON sidecar 共同驗證。`--json` stdout 只有單一物件，提供真實路徑、要求/實際時間、來源、網路請求數、位元組與耗時，診斷在 stderr。
 
-離線測試使用 PyAV 產生影片，不需要學校帳號或外部 FFmpeg：
+## 共享 MP4 索引快取
+
+音頻與取幀預設共享原始完整 `moov`，不快取 M4A 重寫索引、媒體片段或完整 MP4。
+
+- macOS/Linux：`${XDG_CACHE_HOME:-~/.cache}/zju-learning/`
+- Windows：`%LOCALAPPDATA%\zju-learning\cache\`；環境路徑無效時回退使用者目錄的 `AppData/Local`。
+- `--index-cache-dir DIR` 覆寫，`--no-index-cache` 關閉；`--index-cache-mb 256` 設定總容量，預設 256 MiB。
+
+跨次重用需強 ETag 與同一來源身份，不保存簽名參數。版本變更、損壞、無寫入權或鎖衝突安全退回網路。Last-Modified 只作單次一致性驗證，不充當跨次強身份。刪除索引快取不影響下載完成狀態。
+
+## 驗證與界線
 
 ```bash
-uv run --with requests --with httpx --with img2pdf --with pillow --with keyring --with numpy --with 'av>=16,<18' \
-  python -m unittest discover -s tests
+uv run --python 3.12 --with requests --with httpx --with img2pdf --with pillow \
+  --with keyring --with numpy --with 'av>=16,<18' python -m unittest discover -s tests
 ```
 
-### 其他改進
+測試使用 Python wheel 產生媒體及本機 HTTP，不需系統 FFmpeg 或學校帳號。CI 設定包含 Windows、macOS、Linux，實際結果以運行記錄為準。
 
-- **增量同步**：以 `.zju_manifest.json` 記錄 upload id，而不是比對檔名和大小；老師換了新版（新 id）才會重抓。
-- **下載完整性**：先寫 `.part-*`，核對 `Content-Length` 後才 rename；空檔、截斷、伺服器回的 HTML 錯誤頁都不會被記成已下載。
-- **並行下載**：課件預設 4 檔同時，PPT 截圖 8 張同時；每條執行緒有自己的 session，共用 cookie jar。遇到 429/503 會照 `Retry-After` 退讓。
-- **PPT 去重**（`--dedup`）：智雲是對投影畫面定時截圖，同一頁會因動畫逐步出現、老師邊講邊寫、翻回前面而被截很多次。一頁的筆畫若全都還在後面那頁（或之前留下的某頁）裡就刪掉，所以動畫只留跑完的那張、手寫只留寫完的那張，註記不會丟。用局部對比找筆畫，白底、黑底、底圖紋理、教學影片都適用；實測三堂課 73→68、81→48、176→99 頁，逐頁核對無誤刪。`--keep-images` 仍保留全部原圖。
-- **預設直連**，連不上才改走系統 proxy；連線 timeout 6 秒，排程時不會卡死。只有冪等請求會自動重試，登入 POST 不會被重送。
-- **學年判斷**：學校常常不把舊課程標成已結束（`is_closed`），因此改用 `academic_year_id` 找最新學年。
-- **同名課程**（不同教學班）分開存放；同一課程裡的同名檔一律加上 id，命名不受 API 回傳順序影響。
-- 預設跳過影音檔和 200MB 以上的檔案（通常是軟體安裝包、專題壓縮檔），`--dry-run` 會列出總大小。
+退出碼：0 成功；1 設定、認證、中繼資料或執行錯誤；2 參數錯誤或批次部分失敗（由 stderr 區分）；130 使用者中斷。
 
-修掉的上游邊界狀況：
+本版沒有舊命令、舊設定、舊 Manifest 相容或自動遷移。既有資料由使用者於倉庫外單獨搬移並建立新身份及完成記錄；僅複製媒體不會自動登記，不需因容器格式變化重新下載或轉碼。不提供自動時間軸校準、全域註冊、背景服務、Skill 或 MCP。
 
-- 智雲 `search-ppt` 不遵守 `per_page`：常常第 1 頁就回傳全部，下一頁再重複一次。ZLA 假設每頁最多 100 張，超過 100 頁的課會一直重試然後失敗；這裡改成依序去重。
-- 轉錄 API 對「還沒有語音資料」回傳 `code=10002`，現在當成「無轉錄」處理，不再中止整批。
-- **明文傳送登入憑證**：智雲 PPT 截圖網址是 `http://`，而 `.zju.edu.cn` 的 SSO cookie（包括 `iPlanetDirectoryPro`）沒有設 `Secure`，照常下載就會把登入憑證用明文送出。這裡把學校主機的網址升級成 HTTPS，而且所有 `http://` 請求都不帶 Cookie 和 Authorization。
-- `courses.zju.edu.cn` 與 `identity.zju.edu.cn` 只支援 1024-bit DHE／靜態 RSA，OpenSSL 3 預設拒絕連線（`DH_KEY_TOO_SMALL`）。`SECLEVEL=1` 只套用在這兩台，其他主機維持預設的 TLS 設定。
-- 智雲的 `_token` cookie 設在 `.zju.edu.cn` 父網域，而不是 `classroom.zju.edu.cn`。
+## 安全、致謝與授權
 
-## 附件下載來源
+Cookie 以受權限保護的 JSON 放在使用者狀態目錄，明文 HTTP 不傳送 Cookie/Authorization，無遙測。資料版權屬授課教師及學校，請遵守平台規範，不公開散布課程材料。
 
-`sync` 對每個附件依優先序嘗試以下來源，採用第一個能回檔的：
+本專案由 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant) 的認證和平台 API 邏輯發展而來，保留 MIT 版權聲明。錄播介面參考 Cold_Ink 的[智雲課堂批量下載](https://greasyfork.org/scripts/514465)；附件存取參考 [ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader)、[xzzd-pro](https://github.com/xzzd-pro/xzzd-pro)。
 
-1. `/api/uploads/reference/{rid}/blob`：常規下載
-2. `/api/uploads/{id}/blob`：原始檔案
-3. `/api/uploads/{id}/blob?refer_id={活動id}&refer_type=learning_activity`：reference 參數與官方網頁前端下載鈕送出的相同（`classroom` 活動用 `classroom_activity`、考試不帶）；部分活動的附件只有此來源提供，來源標記 `排程原檔`
-4. `/api/uploads/reference/document/{rid}/url?preview=true`：預覽器轉出的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 採用的方式）
-
-**排程尚未開放的活動**（`is_started=false`）通常由來源 3 照常下載；若所有來源都回 403，該檔案標記 `[未開放]（開放時間）`，不算失敗，開放後下次 `sync` 會自動抓。
-
-## 安全性
-
-- 密碼只存在系統憑證庫。macOS 由系統 `security`、Windows 由 Python `getpass` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
-- 登入時密碼先用 CAS 提供的公鑰加密再送出，跟網頁登入的做法相同。
-- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。快取位置可用環境變數 `ZJU_STATE_DIR` 覆寫。
-- Cookie 只會透過 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 請求一律不帶。沒有任何遙測。
-- TLS 驗證失敗會直接報錯，不會自動重試或改走 proxy，避免把中間人攻擊誤當成網路不穩。
-
-## 免責聲明
-
-在 macOS 和 Windows 上實測過；Linux 理論上可以使用，但沒有測試過。
-
-僅供個人學習使用。課件的著作權屬於授課教師與學校，請勿散布下載的內容；使用時請遵守學校的相關規定，不要高頻或大量抓取。學校的 API 沒有公開文件，隨時可能改版。
-
-## 致謝
-
-- [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（MIT）：登入流程、學在浙大與智雲課堂的 API 呼叫都移植自它的 `src-tauri/src/zju_assist.rs`。本專案沿用 MIT 授權並保留其版權聲明，見 [LICENSE](LICENSE)。
-- [eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)（MIT）、[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader)、[xzzd-pro/xzzd-pro](https://github.com/xzzd-pro/xzzd-pro)：參考了關閉下載時的端點做法（沒有複製程式碼）。
-
-## 授權
-
-[MIT](LICENSE)
+[MIT License](LICENSE)

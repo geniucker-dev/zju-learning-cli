@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import av
+from course_fixtures import initialize, register
 import httpx
 import numpy as np
 from PIL import Image
@@ -682,8 +683,7 @@ class Frames(unittest.TestCase):
         path = zju.classroom_material_path(self.dest, sub, "录播", "mp4")
         path.parent.mkdir(parents=True)
         path.write_bytes(self.small.read_bytes())
-        man = zju.Manifest(self.dest)
-        man.put("video:89253:2038840:1", dict(size=path.stat().st_size, path=str(path.relative_to(self.dest))))
+        register(zju, self.dest, path, sub, "录播", "mp4")
         self.assertEqual(zju.recording_frame_source(z, a, self.dest), (path, 1))
         z.course_subs.assert_not_called()
         z.video_catalogue.assert_not_called()
@@ -695,7 +695,7 @@ class Frames(unittest.TestCase):
         # 仅下载了多段中的一段仍不能猜测；明确选段可直接离线使用。
         multi = path.with_name(path.stem + " - 02.mp4")
         multi.write_bytes(self.small.read_bytes())
-        man.put("video:89253:2038840:2", dict(size=multi.stat().st_size, path=str(multi.relative_to(self.dest))))
+        register(zju, self.dest, multi, sub, "录播", "mp4", part=2, part_count=2)
         z.reset_mock()
         self.assertEqual(zju.recording_frame_source(z, args(part=2), self.dest), (multi, 2))
         z.course_subs.assert_not_called()
@@ -709,7 +709,7 @@ from unittest import mock
 from pathlib import Path
 import zju
 with mock.patch.object(zju, 'recording_frame_source', return_value=(Path(sys.argv[1]), 1)):
-    sys.argv = ['zju.py', '--out', sys.argv[2], 'recording-frame', '--course', '89253', '--sub', '2038840', '--at', '1.25', '--json']
+    sys.argv = ['zju.py', 'classroom', 'recording-frame', '--library', sys.argv[2], '--course', '89253', '--sub', '2038840', '--at', '1.25', '--json']
     zju.main()
 """
         outputs = []
@@ -736,15 +736,14 @@ with mock.patch.object(zju, 'recording_frame_source', return_value=(Path(sys.arg
         subprocess.run([sys.executable, "-I", "-c", code, str(script)], cwd=isolated, check=True, capture_output=True)
         source = self.dest / "local.mp4"
         source.write_bytes(self.small.read_bytes())
-        manifest = {"video:89253:2038840:1": {"path": source.name, "size": source.stat().st_size}}
-        (self.dest / ".zju_manifest.json").write_text(json.dumps(manifest))
+        register(zju, self.dest, source, dict(course_id=89253, sub_id=2038840), "录播", "mp4")
         uv = shutil.which("uv")
         runner = [uv, "run", "--script", str(script)] if uv else [sys.executable, "-I", str(script)]
         env = dict(os.environ, ZJU_STATE_DIR=str(self.dest / "state"), PYTHONIOENCODING="utf-8")
         env.pop("PYTHONPATH", None)
         for option in ("--help", "recording-frame"):
             options = ([option] if option == "--help" else
-                       ["--out", str(self.dest), option, "--course", "89253", "--sub", "2038840",
+                       ["classroom", option, "--course-dir", str(self.dest), "--course", "89253", "--sub", "2038840",
                         "--at", "1.25", "--output", str(self.dest / "isolated.jpg"), "--json"])
             run = subprocess.run(runner + options, cwd=isolated, env=env, capture_output=True, text=True, check=True)
             if option == "recording-frame":

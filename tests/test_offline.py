@@ -2,6 +2,7 @@
 import importlib.util
 import tempfile
 import unittest
+from course_fixtures import initialize, register, minimal_mp4
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -97,14 +98,15 @@ class Offline(unittest.TestCase):
             self.assertIs(pool, pools[-1])
             futures = [pool.submit(transfer, b"fragment") for _ in range(5)]
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"".join(f.result() for f in futures))
+            [f.result() for f in futures]
+            dest.write_bytes(minimal_mp4())
 
         for jobs in (1, 3):
             active = peak = 0
             pools.clear()
             with tempfile.TemporaryDirectory() as d:
                 root = Path(d) / "output"
-                args = Namespace(out=str(root), course=["1", "课程"], dry_run=False, force=False,
+                args = Namespace(library=str(root), course_dir=None, all=False, course=[1], recording_audio=False, dry_run=False, force=False,
                                  recording=True, jobs=jobs, max_size=0, format="md", dedup=False,
                                  keep_images=False)
                 with patch.object(zju, "Zju", return_value=client), \
@@ -129,16 +131,16 @@ class Offline(unittest.TestCase):
                     client.ppt_events.assert_not_called()
                     self.assertEqual(download.call_count, 3)
                 # 默认不下载录播；预览也不创建目录或调用材料下载。
-                args.out = str(Path(d) / "preview")
+                args.library = str(Path(d) / "preview")
                 args.dry_run, args.recording = True, False
                 with patch.object(zju, "Zju", return_value=client), \
                         patch.object(zju, "ppt_one") as ppt, patch.object(zju, "transcript_one") as transcript, \
                         patch.object(zju, "recording_subs") as recording:
                     zju.cmd_classroom_sync(args)
-                    ppt.assert_not_called()
-                    transcript.assert_not_called()
+                    self.assertTrue(all(c.args[1].dry_run for c in ppt.call_args_list))
+                    self.assertTrue(all(c.args[1].dry_run for c in transcript.call_args_list))
                     recording.assert_not_called()
-                    self.assertFalse(Path(args.out).exists())
+                    self.assertFalse(Path(args.library).exists())
                     args.dry_run = False
                     zju.cmd_classroom_sync(args)
                     recording.assert_not_called()
@@ -150,7 +152,7 @@ class Offline(unittest.TestCase):
         client.classroom_courses.return_value = [{"course_id": 1, "title": "课程", "type": "multi"}]
         client.course_subs.return_value = [dict(course_id=1, sub_id=1, course_name="课程", sub_name="第一堂")]
         with tempfile.TemporaryDirectory() as d:
-            args = Namespace(out=d, course=[], dry_run=False, force=False, jobs=1, recording=True,
+            args = Namespace(library=d, course_dir=None, all=True, course=[], recording_audio=False, dry_run=False, force=False, jobs=1, recording=True,
                              format="md", dedup=False, keep_images=False, max_size=0)
             with patch.object(zju, "Zju", return_value=client), \
                     patch.object(zju, "transcript_one", side_effect=zju.ZjuError("转写失败")), \
@@ -482,23 +484,23 @@ class Offline(unittest.TestCase):
         client.video_catalogue.return_value = {2: ["https://example.com/a.mp4"], 3: []}
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "output"
-            args = Namespace(out=str(root), dry_run=True, force=False, max_size=0, jobs=4)
+            args = Namespace(library=None, course_dir=str(root), course=1, sub=None, days=None, action="recording", dry_run=True, force=False, max_size=0, jobs=4)
             with patch.object(zju, "Zju", return_value=client), patch.object(zju, "resolve_subs", return_value=subs), \
                     patch.object(zju, "download_video") as download:
-                zju.cmd_recording(args)
+                zju.cmd_classroom_material(args)
                 download.assert_not_called()
                 self.assertFalse(root.exists())
                 self.assertEqual(client.video_catalogue.call_count, 1)
                 args.dry_run = False
-                def save(z, u, dest, limit, jobs, *, restart=False):
+                def save(z, u, dest, limit, jobs, *, restart=False, pool=None):
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(b"mp4")
+                    dest.write_bytes(minimal_mp4())
                 download.side_effect = save
-                zju.cmd_recording(args)
-                zju.cmd_recording(args)
+                zju.cmd_classroom_material(args)
+                zju.cmd_classroom_material(args)
                 self.assertEqual(download.call_count, 1)
                 args.force = True
-                zju.cmd_recording(args)
+                zju.cmd_classroom_material(args)
                 self.assertEqual(download.call_count, 2)
                 self.assertTrue(download.call_args.kwargs["restart"])
 
@@ -624,9 +626,9 @@ class Offline(unittest.TestCase):
         sub = dict(course_id=1, sub_id=2, course_name="课/程", sub_name="第:一堂")
         for kind, ext in (("智云PPT", "pdf"), ("转录", "md"), ("录播", "mp4"), ("音频", "m4a")):
             self.assertEqual(zju.classroom_material_path(root, sub, kind, ext),
-                             root / "课_程 (1)" / kind / f"第_一堂 (2).{ext}")
+                             root / kind / f"第_一堂 (2).{ext}")
         self.assertEqual(zju.classroom_material_path(root, sub, "录播", "mp4", " - 01"),
-                         root / "课_程 (1)/录播/第_一堂 (2) - 01.mp4")
+                         root / "录播/第_一堂 (2) - 01.mp4")
 
 
 if __name__ == "__main__":

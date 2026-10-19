@@ -71,7 +71,7 @@ class ClassroomContext(unittest.TestCase):
                           ppt_pdfs=[dict(path="PPT/讲义.pdf")], ppt_events=[dict(path="PPT/讲义.json")],
                           audio=[dict(path="音频/讲课.m4a", part=1)], recordings=[dict(path="视频/讲课.mp4", part=1)])
         self.lesson = dict(sub_id=11, name="第一堂", date="2026-10-01", lecturer="教师", availability="listed", files=self.files)
-        self.course = dict(schema_version=1, source="zju-classroom", course_id=1, name="课程新名称",
+        self.course = dict(schema_version=2, platform="classroom", course_id=1, name="课程新名称",
                            teacher="教师", term="2026秋", lessons=[self.lesson])
         self.save_metadata()
         self.put("资料/任意名字.md", "# 标题\n\n**[00:00:05 → 00:00:10]** 旧版秒级\n"
@@ -90,7 +90,7 @@ class ClassroomContext(unittest.TestCase):
         self.save_mapping()
         self.put("音频/讲课.m4a", self.audio)
         self.put("视频/讲课.mp4", self.video)
-        self.args = Namespace(out=str(self.root), course=1, sub=11, at=20., window=2., json=True)
+        self.args = Namespace(library=str(self.root), course_dir=None, course=1, sub=11, at=20., window=2., json=True)
 
     def put(self, relative, content):
         path = self.directory / relative
@@ -249,12 +249,12 @@ class ClassroomContext(unittest.TestCase):
         shutil.copytree(self.directory, second)
         with self.assertRaisesRegex(zju.ZjuError, "多个本地目录"):
             self.query()
-        result = self.query(out=str(second))
+        result = self.query(library=None, course_dir=str(second))
         self.assertEqual(result["location"]["course_dir"], str(second.resolve()))
         self.assertEqual(result["transcript"]["segments"][0]["file"], "资料/任意名字.md")
 
     def test_corrupt_metadata_identity_and_duplicate_lessons(self):
-        for update in (dict(source="other"), dict(schema_version=2), dict(lessons={}),
+        for update in (dict(platform="other"), dict(schema_version=999), dict(lessons={}),
                        dict(lessons=[self.lesson, self.lesson]), dict(lessons=[])):
             with self.subTest(update=update):
                 original = dict(self.course)
@@ -264,7 +264,7 @@ class ClassroomContext(unittest.TestCase):
                     self.query()
                 self.course = original
         self.put("course.json", "{broken")
-        with self.assertRaisesRegex(zju.ZjuError, "不可用元数据 1"):
+        with self.assertRaisesRegex(zju.ZjuError, "元数据不可用"):
             self.query()
 
     def test_other_course_is_not_selected_and_broken_sibling_is_reported(self):
@@ -273,7 +273,8 @@ class ClassroomContext(unittest.TestCase):
         (sibling / "course.json").write_text(json.dumps(dict(self.course, course_id=2)), encoding="utf-8")
         self.assertEqual(self.query()["course"]["course_id"], 1)
         (sibling / "course.json").write_text("broken", encoding="utf-8")
-        self.assertIn("invalid_course_metadata", {w["code"] for w in self.query()["warnings"]})
+        with self.assertRaisesRegex(zju.ZjuError, "元数据不可用"):
+            self.query()
 
     def test_paths_cannot_escape_even_with_windows_syntax_or_symlinks(self):
         bad = ["../outside.md", str(self.root / "outside.md"), "C:\\private\\data.md", "C:relative.md",
@@ -329,7 +330,7 @@ class ClassroomContext(unittest.TestCase):
                     for p in self.root.rglob("*") if p.is_file()}
         before = snapshot()
         out = io.StringIO()
-        argv = [str(SCRIPT), "--out", str(self.root), "classroom", "context", "--course", "1", "--sub", "11",
+        argv = [str(SCRIPT), "classroom", "context", "--library", str(self.root), "--course", "1", "--sub", "11",
                 "--at", "00:00:20.120", "--window", "0", "--json"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(zju, "load_config", return_value={}), \
                 mock.patch.object(zju, "Zju", side_effect=AssertionError("不应认证")), \
@@ -352,7 +353,7 @@ class ClassroomContext(unittest.TestCase):
         standalone = self.root / "standalone"
         standalone.mkdir()
         shutil.copy2(SCRIPT, standalone / "zju.py")
-        base = [sys.executable, str(standalone / "zju.py"), "--out", str(self.root), "classroom", "context",
+        base = [sys.executable, str(standalone / "zju.py"), "classroom", "context", "--library", str(self.root),
                 "--course", "1", "--sub", "11", "--json"]
         env = dict(os.environ, ZJU_STATE_DIR=str(self.root / "no-account"), PYTHONUTF8="1")
         result = subprocess.run(base + ["--at", "20"], capture_output=True, text=True, encoding="utf-8", env=env)

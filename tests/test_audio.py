@@ -18,6 +18,7 @@ from unittest import mock
 
 import httpx
 import av
+from course_fixtures import initialize, register, minimal_mp4
 import numpy as np
 
 spec = importlib.util.spec_from_file_location("zju_audio_tests", Path(__file__).resolve().parents[1] / "zju.py")
@@ -260,14 +261,14 @@ url,mode,out,*options=sys.argv[1:]
 if mode=='frame':
  zju.Zju=lambda **kw:None
  zju.recording_frame_source=lambda *a:(url,1)
- sys.argv=['zju.py','recording-frame','--course','1','--sub','2','--at','1.25',
+ sys.argv=['zju.py','classroom','recording-frame','--course','1','--sub','2','--at','1.25',
            '--output-dir',out,'--json',*options]
 else:
  client=mock.Mock()
  client.video_catalogue.return_value={2:[url]}
  zju.Zju=lambda:client
  zju.resolve_subs=lambda z,a:[dict(course_id=1,sub_id=2,course_name='course',sub_name='lesson')]
- sys.argv=['zju.py','--out',out,'recording-audio','--course','1','--sub','2','-j','3',*options]
+ sys.argv=['zju.py','classroom','recording-audio','--course-dir',out,'--course','1','--sub','2','-j','3',*options]
 zju.main()
 '''
         result = subprocess.run([sys.executable, "-c", code, url, mode, str(out), *map(str, options)],
@@ -420,7 +421,7 @@ zju.main()
 
 class AudioCommands(unittest.TestCase):
     def args(self, root, **kw):
-        args = Namespace(out=str(root), max_size=0, force=False, dry_run=False, jobs=32)
+        args = Namespace(library=str(root), course_dir=None, all=True, max_size=0, force=False, dry_run=False, jobs=32)
         for key, value in kw.items():setattr(args, key, value)
         return args
 
@@ -428,16 +429,17 @@ class AudioCommands(unittest.TestCase):
         sub = dict(course_id=1, sub_id=2, course_name="课程", sub_name="第一堂")
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            video = root / "课程 (1)/录播/第一堂 (2).mp4"
+            video = root / "录播/第一堂 (2).mp4"
             video.parent.mkdir(parents=True)
-            video.write_bytes(b"complete video")
+            video.write_bytes(minimal_mp4())
+            register(zju, root, video, sub, "录播", "mp4")
             client = mock.Mock()
             def make(url, source, dest, jobs, limit, **cache):
                 self.assertIsNone(url)
                 self.assertEqual(source, video)
                 self.assertEqual(jobs, 32)
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(b"audio")
+                dest.write_bytes(minimal_mp4())
             args = self.args(root)
             with mock.patch.object(zju, "make_audio", side_effect=make) as make_mock:
                 self.assertEqual(zju.audio_subs(client, args, root, [sub]), 0)
@@ -450,7 +452,7 @@ class AudioCommands(unittest.TestCase):
                 zju.audio_subs(client, args, root, [sub])
                 self.assertEqual(make_mock.call_count, 2)
             client.video_catalogue.assert_not_called()
-            self.assertTrue((root / "课程 (1)/音频/第一堂 (2).m4a").is_file())
+            self.assertTrue((root / "音频/第一堂 (2).m4a").is_file())
 
     def test_multiple_parts_partial_recording_and_no_write_dry_run(self):
         sub = dict(course_id=1, sub_id=2, course_name="课程", sub_name="第一堂")
@@ -463,13 +465,14 @@ class AudioCommands(unittest.TestCase):
                 zju.audio_subs(client, args, root, [sub])
                 make.assert_not_called()
                 self.assertFalse(root.exists())
-            video = root / "课程 (1)/录播/第一堂 (2) - 01.mp4"
+            video = root / "录播/第一堂 (2) - 01.mp4"
             video.parent.mkdir(parents=True)
-            video.write_bytes(b"existing")
+            video.write_bytes(minimal_mp4())
+            register(zju, root, video, sub, "录播", "mp4", part=1, part_count=2)
             args.dry_run = False
             def save(url, source, dest, jobs, limit, **cache):
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(b"audio")
+                dest.write_bytes(minimal_mp4())
             with mock.patch.object(zju, "make_audio", side_effect=save) as make:
                 zju.audio_subs(client, args, root, [sub])
                 self.assertEqual(make.call_args_list[0].args[1], video)
@@ -535,12 +538,12 @@ class AudioCommands(unittest.TestCase):
 
     def test_audio_cli_defaults_and_invalid_options(self):
         import sys
-        with mock.patch.object(zju, "cmd_recording_audio") as command, mock.patch.object(zju, "load_config", return_value={}):
-            with mock.patch.object(sys, "argv", ["zju.py", "recording-audio", "--course", "1"]):
+        with mock.patch.object(zju, "cmd_classroom_material") as command, mock.patch.object(zju, "load_config", return_value={}):
+            with mock.patch.object(sys, "argv", ["zju.py", "classroom", "recording-audio", "--course", "1"]):
                 zju.main()
             self.assertEqual(command.call_args.args[0].jobs, 32)
             for options in (["-j", "0"], ["--max-size", "-1"], ["--sub", "2"]):
-                with mock.patch.object(sys, "argv", ["zju.py", "recording-audio", *options]):
+                with mock.patch.object(sys, "argv", ["zju.py", "classroom", "recording-audio", *options]):
                     with self.assertRaises(SystemExit) as error:
                         zju.main()
                     self.assertEqual(error.exception.code, 2)
@@ -559,8 +562,8 @@ class AudioCommands(unittest.TestCase):
                 zju.cmd_classroom_sync(args)
                 self.assertEqual(audio.call_args.args[1].jobs, 3)
                 self.assertTrue((root / "课程 (1)/course.json").is_file())
-                args.out = str(root / "preview")
+                args.library = str(root / "preview")
                 args.dry_run = True
                 zju.cmd_classroom_sync(args)
                 self.assertTrue(audio.call_args.args[1].dry_run)
-                self.assertFalse(Path(args.out).exists())
+                self.assertFalse(Path(args.library).exists())

@@ -50,15 +50,15 @@ class IndexCache(unittest.TestCase):
                      SimpleNamespace(index_cache_dir="chosen", no_index_cache=True)):
             with self.assertRaises(zju.ZjuError):
                 zju.index_cache_options(args)
-        for command, prefix, handler in (("recording-audio", [], "cmd_recording_audio"),
+        for command, prefix, handler in (("recording-audio", [], "cmd_classroom_material"),
                                          ("recording-frame", ["--course", "1", "--sub", "2", "--at", "1"], "cmd_recording_frame"),
-                                         ("classroom", ["sync", "--recording-audio"], "cmd_classroom_sync")):
+                                         ("sync", ["1", "--recording-audio"], "cmd_classroom_sync")):
             with mock.patch.object(zju, handler) as fn, mock.patch.object(zju, "load_config", return_value={}):
-                with mock.patch.object(sys, "argv", ["zju.py", command, *prefix, "--no-index-cache"]):
+                with mock.patch.object(sys, "argv", ["zju.py", "classroom", command, *prefix, "--no-index-cache"]):
                     zju.main()
                 self.assertTrue(fn.call_args.args[0].no_index_cache)
                 for option in (["--index-cache-mb", "0"], ["--index-cache-dir", "x", "--no-index-cache"]):
-                    with mock.patch.object(sys, "argv", ["zju.py", command, *prefix, *option]), self.assertRaises(SystemExit) as error:
+                    with mock.patch.object(sys, "argv", ["zju.py", "classroom", command, *prefix, *option]), self.assertRaises(SystemExit) as error:
                         zju.main()
                     self.assertEqual(error.exception.code, 2)
 
@@ -205,7 +205,7 @@ sys.stdin.read(1)
 from unittest import mock
 import zju
 with mock.patch.object(zju,'recording_frame_source',return_value=(sys.argv[1],1)):
- sys.argv=['zju.py','recording-frame','--course','1','--sub','2','--at',sys.argv[2],
+ sys.argv=['zju.py','classroom','recording-frame','--course','1','--sub','2','--at',sys.argv[2],
            '--index-cache-dir',sys.argv[3],'--output-dir',sys.argv[4],'--json']
  zju.main()
 """
@@ -259,7 +259,7 @@ class FrameAuthentication(unittest.TestCase):
             {"id": 2, "sub_title": "lesson", "show": "no"}]}}}}}
         with mock.patch.object(c.s, "request", side_effect=[self.response(), self.response(data=detail)]) as request:
             with tempfile.TemporaryDirectory() as root, self.assertRaisesRegex(zju.FrameError, "下架"):
-                zju.recording_frame_source(c, fixture.args(course=1, sub=2), Path(root))
+                zju.recording_frame_source(c, fixture.args(course=1, sub=2), None)
         self.assertEqual(request.call_count, 2)
         c.login.assert_not_called()
         c.courses_alive.assert_not_called()
@@ -313,7 +313,7 @@ class FrameAuthentication(unittest.TestCase):
         with mock.patch.object(c.s, "request", side_effect=replies) as request, \
                 mock.patch.object(zju, "get_credentials", return_value=("test", "password")), \
                 tempfile.TemporaryDirectory() as root:
-            result = zju.recording_frame_source(c, fixture.args(course=1, sub=2), Path(root))
+            result = zju.recording_frame_source(c, fixture.args(course=1, sub=2), None)
         self.assertEqual(result, ("https://video.example/part.mp4", 1))
         self.assertEqual(request.call_count, 4)
         c.login.assert_called_once()
