@@ -56,7 +56,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import AsyncExitStack, ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
@@ -1186,21 +1186,105 @@ async def audio_parallel(items, jobs, fn):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def default_index_cache_dir() -> Path:
+    """用户级缓存；XDG/LOCALAPPDATA 必须为有效绝对路径，否则使用 home 回退。"""
+    windows = sys.platform == "win32"
+    value = os.environ.get("LOCALAPPDATA" if windows else "XDG_CACHE_HOME", "")
+    try:
+        base = Path(value).expanduser()
+        valid = bool(value.strip()) and "\0" not in value and base.is_absolute()
+    except (OSError, RuntimeError, ValueError):
+        valid = False
+    if not valid:
+        base = Path.home() / ("AppData/Local" if windows else ".cache")
+    return base / ("zju-learning/cache" if windows else "zju-learning")
+
+
+def add_index_cache_arguments(p):
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--index-cache-dir", help="共享 MP4 索引缓存目录；默认用户缓存目录/zju-learning（Windows 为 zju-learning/cache）")
+    group.add_argument("--no-index-cache", action="store_true", help="关闭跨调用 MP4 索引缓存；仍正常按需读取")
+    p.add_argument("--index-cache-mb", type=int, default=256, help="共享索引缓存总容量 MiB（默认 256，正整数）")
+
+
+def index_cache_options(a):
+    size = getattr(a, "index_cache_mb", 256)
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ZjuError("--index-cache-mb 必须是正整数")
+    directory = getattr(a, "index_cache_dir", None)
+    if directory == "":
+        raise ZjuError("--index-cache-dir 不能为空")
+    disabled = getattr(a, "no_index_cache", False)
+    if disabled and directory is not None:
+        raise ZjuError("--no-index-cache 不能与 --index-cache-dir 混用")
+    return dict(index_cache_dir=None if disabled else directory or default_index_cache_dir(),
+                index_cache_bytes=size * 2**20)
+
+
+def mp4_resource(url):
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        raise ZjuError("录播必须使用无内嵌凭据的 HTTP(S) URL")
+    # 不保存签名查询，也不把学校认证交给媒体客户端。
+    return hashlib.sha256(f"{parts.scheme}://{parts.netloc}{parts.path}".encode()).hexdigest()
+
+
+def mp4_validator(headers, previous=None):
+    etag, modified = headers.get("ETag"), headers.get("Last-Modified")
+    strong = etag and re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', etag)
+    validator = (("ETag", etag) if strong else
+                 ("Last-Modified", modified) if modified else None)
+    if not validator:
+        raise ZjuError("服务器未提供强 ETag 或 Last-Modified，无法确认视频版本一致性")
+    if previous is not None and validator != previous:
+        raise ZjuError("远端视频版本已变化，停止读取；请重新运行")
+    return validator
+
+
+def mp4_identity(url, total, validator):
+    identity = dict(resource_sha256=mp4_resource(url), size=total, validator=list(validator))
+    if validator[0] != "ETag":
+        # Last-Modified 仅验证本次 Range，不能证明跨调用内容相同。
+        identity["invocation"] = os.urandom(16).hex()
+    return identity
+
+
+_DEFAULT_INDEX_CACHE = object()
+
+
+def open_mp4_index_cache(directory, limit, identity):
+    if directory is None or identity["validator"][0] != "ETag":
+        return None
+    try:
+        if directory is _DEFAULT_INDEX_CACHE:
+            directory = default_index_cache_dir()
+        return MP4IndexCache(directory, limit, identity)
+    except (OSError, RuntimeError, ValueError) as error:
+        log(f"[索引缓存] 不可用（{type(error).__name__}），继续正常 Range 读取")
+        return None
+
+
 class AudioRanges:
     def __init__(self, client, url):
+        mp4_resource(url)
         self.client, self.url = client, url
         self.total = None
         self.validator = None
         self.received = 0
+        self.index_cache = None
 
     async def get(self, ranges):
+        if self.index_cache and len(ranges) == 1:
+            cached = self.index_cache.read(*ranges[0])
+            if cached is not None:
+                return cached
         headers = {"Range": "bytes=" + ",".join(f"{a}-{b}" for a, b in ranges),
                    "Accept-Encoding": "identity"}
         if self.validator:
-            headers["If-Range"] = self.validator
+            headers["If-Range"] = self.validator[1]
         for attempt in range(3):
             try:
-                async with self.client.stream("GET", self.url, headers=headers) as r:
+                async with self.client.stream("GET", self.url, headers=headers, follow_redirects=False) as r:
                     if r.status_code != 206:
                         raise ZjuError(f"音频范围请求失败 HTTP {r.status_code}（不下载整个视频）")
                     if r.headers.get("Content-Encoding", "identity") != "identity":
@@ -1210,14 +1294,7 @@ class AudioRanges:
                         if not match:
                             raise ZjuError("录播范围探测失败")
                         self.total = int(match[1])
-                        etag = r.headers.get("ETag", "")
-                        self.validator = (etag if etag and not etag.startswith("W/")
-                                          else r.headers.get("Last-Modified"))
-                    elif self.validator:
-                        current = (r.headers.get("ETag") if self.validator.startswith('"')
-                                   else r.headers.get("Last-Modified"))
-                        if current and current != self.validator:
-                            raise ZjuError("录播在音频下载期间发生变化")
+                    self.validator = mp4_validator(r.headers, self.validator)
                     maximum = sum(b - a + 1 for a, b in ranges) + len(ranges) * 1024 + 8192
                     body = bytearray()
                     async for block in r.aiter_bytes():
@@ -1258,23 +1335,29 @@ class AudioRanges:
                     if parsed.keys() != expected.keys():
                         raise ZjuError("音频多范围响应缺少分片")
                     return b"".join(parsed[a] for a, _ in ranges)
-            except (httpx.HTTPError, ZjuError) as e:
+            except httpx.HTTPError as e:
                 if attempt == 2:
-                    if isinstance(e, ZjuError):
-                        raise
                     raise ZjuError(f"音频网络请求失败（{type(e).__name__}）") from e
                 await asyncio.sleep(0.5 * 2**attempt)
 
 
-async def download_audio_ranges(url: str, raw: Path, jobs: int, limit: int | None) -> AudioIndex:
+async def download_audio_ranges(url: str, raw: Path, jobs: int, limit: int | None, *,
+                                index_cache_dir=_DEFAULT_INDEX_CACHE,
+                                index_cache_bytes=256 * 2**20) -> AudioIndex:
     # 不读取环境代理，也不回退；DNS 辅助线程最多两个，音频请求全部由协程处理。
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
-    async with httpx.AsyncClient(http2=False, trust_env=False, proxy=None, follow_redirects=True,
-                                 headers={"User-Agent": UA}, timeout=httpx.Timeout(60, connect=6),
-                                 limits=httpx.Limits(max_connections=jobs, max_keepalive_connections=jobs)) as client:
+    async with AsyncExitStack() as stack:
+        client = await stack.enter_async_context(httpx.AsyncClient(
+            http2=False, trust_env=False, proxy=None, follow_redirects=False,
+            headers={"User-Agent": UA}, timeout=httpx.Timeout(60, connect=6),
+            limits=httpx.Limits(max_connections=jobs, max_keepalive_connections=jobs)))
         source = AudioRanges(client, url)
         first = await source.get([(0, 15)])
-        offset, ftyp, moov = 0, None, None
+        source.index_cache = open_mp4_index_cache(
+            index_cache_dir, index_cache_bytes, mp4_identity(url, source.total, source.validator))
+        if source.index_cache:
+            stack.callback(source.index_cache.close)
+        offset, ftyp, moov, chunks = 0, None, None, None
         for _ in range(128):
             header = first if offset == 0 else await source.get([(offset, min(offset + 15, source.total - 1))])
             if len(header) < 8:
@@ -1300,9 +1383,14 @@ async def download_audio_ranges(url: str, raw: Path, jobs: int, limit: int | Non
                 count = min(jobs, 8, max(1, size // 16))
                 step = (size + count - 1) // count
                 chunks = [None] * count
+                if source.index_cache:
+                    source.index_cache.capture((offset, offset + size), offset, header)
 
                 async def grab_index(i):
-                    chunks[i] = await source.get([(offset + i * step, min(offset + (i + 1) * step - 1, offset + size - 1))])
+                    start = offset + i * step
+                    chunks[i] = await source.get([(start, min(start + step - 1, offset + size - 1))])
+                    if source.index_cache:
+                        source.index_cache.capture((offset, offset + size), start, chunks[i])
 
                 await audio_parallel(range(count), count, grab_index)
                 moov = b"".join(chunks)[width:]
@@ -1410,14 +1498,16 @@ def extract_audio(source: Path, dest: Path, raw: Path, limit: int | None = None)
 
 
 def make_audio(url: str | None, video: Path | None, dest: Path, jobs: int = 32,
-               limit: int | None = None):
+               limit: int | None = None, *, index_cache_dir=_DEFAULT_INDEX_CACHE,
+               index_cache_bytes=256 * 2**20):
     with download_lock(dest, "音频"), tempfile.TemporaryDirectory(prefix=".zju-audio-", dir=dest.parent) as temp:
         temp = Path(temp)
         raw, output = temp / "payload.bin", temp / "output.m4a"
         if video is None:
             if not url:
                 raise ZjuError("没有可下载的录播")
-            index = asyncio.run(download_audio_ranges(url, raw, jobs, limit))
+            index = asyncio.run(download_audio_ranges(url, raw, jobs, limit,
+                                index_cache_dir=index_cache_dir, index_cache_bytes=index_cache_bytes))
             index.assemble(raw, output)
         else:
             extract_audio(video, output, raw, limit)
@@ -2363,7 +2453,7 @@ def audio_subs(z: Zju, a, root: Path, subs: list[dict]) -> int:
                 continue
             try:
                 log(f"[{action}] {dest.relative_to(root)}")
-                make_audio(url, video, dest, a.jobs, limit)
+                make_audio(url, video, dest, a.jobs, limit, **index_cache_options(a))
                 man.put(key, {"path": str(dest.relative_to(root)), "size": dest.stat().st_size,
                               "course_id": cid, "sub_id": sid,
                               "source": "local" if video is not None else "remote",
@@ -2504,8 +2594,7 @@ def add_recording_frame_arguments(sp, fn):
     p.add_argument("--format", choices=("jpg", "png"), default="jpg", help="自动命名的图片格式；完整路径按扩展名选择")
     p.add_argument("--max-fetch-mb", type=float, default=64, help="远端实际响应体读取上限 MiB（默认 64，必须 > 0）")
     p.add_argument("--max-frames", type=int, default=100, help="请求输出帧数上限（默认 100，正整数）；窗口重叠去重，视频尾裁剪前计数")
-    p.add_argument("--index-cache-dir", help="可选 MP4 索引缓存目录；默认不持久缓存，只有强 ETag 才复用")
-    p.add_argument("--index-cache-mb", type=int, default=256, help="索引缓存总容量 MiB（默认 256，正整数；仅搭配缓存目录生效）")
+    add_index_cache_arguments(p)
     p.add_argument("--force", action="store_true", help="覆盖已有图片及元数据，忽略图片缓存（已验证索引仍可用）")
     p.add_argument("--json", action="store_true", help="stdout 只输出一个 JSON 对象，诊断信息在 stderr")
     p.set_defaults(fn=fn)
@@ -2520,11 +2609,10 @@ def validate_frame_args(a):
         raise FrameError("--max-fetch-mb 必须是有限正数")
     if isinstance(a.max_frames, bool) or not isinstance(a.max_frames, int) or a.max_frames < 1:
         raise FrameError("--max-frames 必须是正整数")
-    cache_mb = getattr(a, "index_cache_mb", 256)
-    if isinstance(cache_mb, bool) or not isinstance(cache_mb, int) or cache_mb < 1:
-        raise FrameError("--index-cache-mb 必须是正整数")
-    if getattr(a, "index_cache_dir", None) == "":
-        raise FrameError("--index-cache-dir 不能为空")
+    try:
+        index_cache_options(a)
+    except ZjuError as error:
+        raise FrameError(str(error)) from None
     if a.output == "" or a.output_dir == "":
         raise FrameError("输出路径不能为空")
     if a.frame and (a.output or a.output_dir or a.around is not None or a.interval is not None):
@@ -2585,7 +2673,7 @@ def recording_frame_times(a):
     return [(t, None) for t in sorted(points)]
 
 
-class FrameIndexCache:
+class MP4IndexCache:
     """只存完整 moov；固定头 + 按 MiB 校验的索引正文，原子发布，写者非阻塞互斥。
 
     读者不持锁等待网络。写者从首次索引数据到发布期间持锁，其他写者直接跳过；
@@ -2797,11 +2885,12 @@ class FrameRangeReader(io.RawIOBase):
     cache_size = 8 * 1024 * 1024
 
     def __init__(self, url, max_bytes=64 * 2**20, *, client=None,
-                 index_cache_dir=None, index_cache_bytes=256 * 2**20):
+                 index_cache_dir=_DEFAULT_INDEX_CACHE, index_cache_bytes=256 * 2**20):
         super().__init__()
-        parts = urlsplit(url)
-        if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
-            raise FrameError("录播必须使用无内嵌凭据的 HTTP(S) URL")
+        try:
+            mp4_resource(url)
+        except ZjuError as error:
+            raise FrameError(str(error)) from None
         self.url = url
         self.client = client or httpx.Client(timeout=httpx.Timeout(30, connect=15), trust_env=False,
                                              follow_redirects=False, headers={"Accept-Encoding": "identity"})
@@ -2815,16 +2904,9 @@ class FrameRangeReader(io.RawIOBase):
         self.last_error = None
         try:
             self._fetch(0, 15)
-            # 不保存可过期的签名查询；身份只包含不可逆的资源路径摘要及服务端版本。
-            resource = f"{parts.scheme}://{parts.netloc}{parts.path}"
-            self.identity = {"resource_sha256": hashlib.sha256(resource.encode()).hexdigest(),
-                             "size": self.total, "validator": list(self.validator)}
+            self.identity = mp4_identity(url, self.total, self.validator)
             self.cache_reusable = self.validator[0] == "ETag"
-            if not self.cache_reusable:
-                # Last-Modified 只用于本次 If-Range/响应校验，不能证明跨次内容相同。
-                self.identity["invocation"] = os.urandom(16).hex()
-            elif index_cache_dir is not None:
-                self.index_cache = FrameIndexCache(index_cache_dir, index_cache_bytes, self.identity)
+            self.index_cache = open_mp4_index_cache(index_cache_dir, index_cache_bytes, self.identity)
         except BaseException:
             self.close()
             raise
@@ -2878,14 +2960,10 @@ class FrameRangeReader(io.RawIOBase):
                     expected_end = min(end, total - 1)
                     if lo != start or hi != expected_end or hi < lo or (self.total is not None and total != self.total):
                         raise FrameError("Content-Range 与请求不符，或远端视频大小已变化")
-                    etag, modified = r.headers.get("ETag"), r.headers.get("Last-Modified")
-                    strong = etag and re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', etag)
-                    validator = (("ETag", etag) if strong else
-                                 ("Last-Modified", modified) if modified else None)
-                    if not validator:
-                        raise FrameError("服务器未提供强 ETag 或 Last-Modified，无法确认视频版本一致性")
-                    if self.validator is not None and validator != self.validator:
-                        raise FrameError("远端视频版本已变化，停止读取；请重新运行")
+                    try:
+                        validator = mp4_validator(r.headers, self.validator)
+                    except ZjuError as error:
+                        raise FrameError(str(error)) from None
                     if r.headers.get("Content-Encoding", "identity").lower() != "identity":
                         raise FrameError("Range 响应使用了不支持的内容编码")
                     length = hi - lo + 1
@@ -3278,8 +3356,7 @@ def extract_recording_frames(a, source, part, *, client=None):
             else:
                 reader = stack.enter_context(FrameRangeReader(
                     source, int(a.max_fetch_mb * 2**20), client=client,
-                    index_cache_dir=getattr(a, "index_cache_dir", None),
-                    index_cache_bytes=getattr(a, "index_cache_mb", 256) * 2**20))
+                    **index_cache_options(a)))
                 handle, source_type, identity = reader, "remote", reader.identity
             plans = None
             # 已有输出且所有精确时间均命中时，只验证来源/图片，不打开 MP4 索引。
@@ -3524,6 +3601,7 @@ def main():
     y.add_argument("--dedup", action="store_true", help="合并 PPT 时去除重复截图")
     y.add_argument("--keep-images", action="store_true", help="保留全部 PPT 原始截图")
     y.add_argument("--max-size", type=int, default=0, metavar="MB", help="录播或音频单文件上限（默认 0 = 不限）")
+    add_index_cache_arguments(y)
     y.set_defaults(fn=cmd_classroom_sync)
 
     for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript), ("recording", cmd_recording), ("recording-audio", cmd_recording_audio)):
@@ -3546,6 +3624,8 @@ def main():
                            help="音频并发请求数（默认 32 个协程）" if name == "recording-audio" else "每堂录播的并行分片连接数（默认 4）")
             x.description = ("优先从完整本地录播提取；否则只下载 MP4 音频范围。无需 ffmpeg，不重新编码。"
                              if name == "recording-audio" else "默认沿用已完成分片，重新执行即可续传；--force 丢弃分片并从头下载。")
+            if name == "recording-audio":
+                add_index_cache_arguments(x)
         x.set_defaults(fn=fn)
 
     # 只加载参数定义（不导入 PyAV），其他命令不初始化解码库。
@@ -3557,6 +3637,11 @@ def main():
         p.error("--max-size 必须 >= 0，--jobs 和 --days 必须 >= 1")
     if a.cmd in ("recording", "recording-audio") and a.sub is not None and not a.course:
         p.error("--sub 需要搭配 --course")
+    if hasattr(a, "index_cache_mb"):
+        try:
+            index_cache_options(a)
+        except ZjuError as error:
+            p.error(str(error))
     try:
         a.fn(a)
     except ZjuError as e:

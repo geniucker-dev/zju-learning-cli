@@ -2,6 +2,10 @@
 import asyncio
 import importlib.util
 import hashlib
+import json
+import os
+import subprocess
+import sys
 from fractions import Fraction
 import tempfile
 import threading
@@ -22,6 +26,35 @@ spec.loader.exec_module(zju)
 
 
 class RangeResponses(unittest.TestCase):
+    def test_shared_version_checks_missing_changed_weak_and_redirect(self):
+        for second in ({"ETag": '"v2"'}, {}, {"ETag": 'W/"v1"'},
+                       {"Last-Modified": "Thu, 01 Jan 2026 00:00:00 GMT"}):
+            async def run():
+                calls = []
+                def respond(request):
+                    calls.append(request)
+                    return httpx.Response(206, content=b"x" * 16,
+                        headers={"Content-Range": "bytes 0-15/100", **({"ETag": '"v1"'} if len(calls) == 1 else second)})
+                async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+                    source = zju.AudioRanges(client, "https://example.com/video?SECRET")
+                    await source.get([(0, 15)])
+                    with self.assertRaises(zju.ZjuError) as error:
+                        await source.get([(0, 15)])
+                    self.assertNotIn("SECRET", str(error.exception))
+                    self.assertEqual(len(calls), 2)  # 永久版本错误不应重试。
+                    self.assertEqual(calls[-1].headers["If-Range"], '"v1"')
+            asyncio.run(run())
+        async def redirect():
+            calls = []
+            def respond(request):
+                calls.append(request)
+                return httpx.Response(302, headers={"Location": "https://unexpected.invalid/SECRET"})
+            async with httpx.AsyncClient(transport=httpx.MockTransport(respond), follow_redirects=True) as client:
+                with self.assertRaisesRegex(zju.ZjuError, "302"):
+                    await zju.AudioRanges(client, "https://example.com/video").get([(0, 15)])
+            self.assertEqual(len(calls), 1)
+        asyncio.run(redirect())
+
     def test_multipart_preserves_binary_crlf_and_orders_parts(self):
         payload = (b'\r\n--test\r\nContent-Range: bytes 20-21/100\r\n\r\nab'
                    b'\r\n--test\r\nContent-Range: bytes 10-13/100\r\n\r\n12\r\n'
@@ -29,7 +62,7 @@ class RangeResponses(unittest.TestCase):
 
         async def run():
             transport = httpx.MockTransport(lambda request: httpx.Response(
-                206, headers={"Content-Type": 'multipart/byteranges; boundary="test"'}, content=payload))
+                206, headers={"Content-Type": 'multipart/byteranges; boundary="test"', "ETag": '"fixture"'}, content=payload))
             async with httpx.AsyncClient(transport=transport) as client:
                 reader = zju.AudioRanges(client, "https://example.com/video")
                 reader.total = 100
@@ -141,6 +174,7 @@ class AudioHTTP(unittest.TestCase):
         cls.active = cls.peak = cls.requests = 0
         cls.lock = threading.Lock()
         cls.change_version = False
+        cls.validators = {"ETag": '"fixture"'}
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -168,7 +202,8 @@ class AudioHTTP(unittest.TestCase):
                     self.send_response(206)
                     self.send_header("Content-Type", mime)
                     self.send_header("Content-Length", str(len(body)))
-                    self.send_header("ETag", '"changed"' if cls.change_version and number > 1 else '"fixture"')
+                    for key, value in cls.validators.items():
+                        self.send_header(key, '"changed"' if cls.change_version and number > 1 else value)
                     if len(ranges) == 1:
                         self.send_header("Content-Range", f"bytes {a}-{b}/{len(data)}")
                     self.end_headers()
@@ -191,9 +226,16 @@ class AudioHTTP(unittest.TestCase):
         cls.temp.cleanup()
 
     def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.cache = Path(temp.name) / "cache"
+        patch = mock.patch.object(zju, "default_index_cache_dir", return_value=self.cache)
+        patch.start()
+        self.addCleanup(patch.stop)
         type(self).data = self.video.read_bytes()
         type(self).peak = type(self).requests = 0
         type(self).change_version = False
+        type(self).validators = {"ETag": '"fixture"'}
 
     def audio_hash(self, file):
         h = hashlib.sha256()
@@ -201,6 +243,132 @@ class AudioHTTP(unittest.TestCase):
             for packet in container.demux(audio=0):
                 h.update(bytes(packet))
         return h.digest()
+
+    def audio_signature(self, file):
+        with av.open(str(file)) as c:
+            s = c.streams.audio[0]
+            packets = [(bytes(p), p.pts, p.dts, p.duration, p.time_base)
+                       for p in c.demux(s) if p.size]
+            return packets, s.duration, s.time_base, s.codec_context.extradata, s.codec_context.sample_rate
+
+    def child(self, mode, url, out, *options):
+        # 两个独立 CLI 进程，只替换学校查询，保留真正的媒体请求与命令参数处理。
+        code = '''import sys
+from unittest import mock
+import zju
+url,mode,out,*options=sys.argv[1:]
+if mode=='frame':
+ zju.Zju=lambda **kw:None
+ zju.recording_frame_source=lambda *a:(url,1)
+ sys.argv=['zju.py','recording-frame','--course','1','--sub','2','--at','1.25',
+           '--output-dir',out,'--json',*options]
+else:
+ client=mock.Mock()
+ client.video_catalogue.return_value={2:[url]}
+ zju.Zju=lambda:client
+ zju.resolve_subs=lambda z,a:[dict(course_id=1,sub_id=2,course_name='course',sub_name='lesson')]
+ sys.argv=['zju.py','--out',out,'recording-audio','--course','1','--sub','2','-j','3',*options]
+zju.main()
+'''
+        result = subprocess.run([sys.executable, "-c", code, url, mode, str(out), *map(str, options)],
+                              cwd=Path(zju.__file__).parent, capture_output=True, text=True,
+                              encoding="utf-8",
+                              env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1",
+                                       XDG_CACHE_HOME=str(self.cache.parent), LOCALAPPDATA=str(self.cache.parent)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def test_bidirectional_index_reuse_across_cli_processes_and_exact_audio_timeline(self):
+        for source in (self.video, self.tail, self.wide):
+            type(self).data = source.read_bytes()
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                for first in ("audio", "frame"):
+                    cache = root / (first + "-cache")
+                    self.child(first, self.url + "?sign=SECRET1", root / (first + "-first"),
+                               "--index-cache-dir", cache)
+                    entries = list(cache.rglob("*.idx"))
+                    self.assertEqual(len(entries), 1)
+                    m = next(p for n, p in zju.mp4_boxes(type(self).data) if n == b"moov")
+                    stored = entries[0].read_bytes()
+                    self.assertEqual(stored[zju.MP4IndexCache.header_size + 8:], m)
+                    self.assertNotIn(b"SECRET", stored[:zju.MP4IndexCache.header_size])
+                    second = "frame" if first == "audio" else "audio"
+                    # 禁止重新下载 moov，证明两个进程通过同一个原始索引双向复用。
+                    index = zju.MP4IndexCache(cache, 256 * 2**20,
+                            zju.mp4_identity(self.url, len(type(self).data), ("ETag", '"fixture"')))
+                    self.assertIsNotNone(index.entry)
+                    if second == "audio":
+                        old = type(self).requests
+                        self.child("audio", self.url + "?sign=SECRET2", root / "audio-second",
+                                   "--index-cache-dir", cache)
+                        warm_requests = type(self).requests - old
+                        old = type(self).requests
+                        self.child("audio", self.url, root / "audio-cold", "--no-index-cache")
+                        self.assertGreater(type(self).requests - old, warm_requests)
+                    else:
+                        warm = json.loads(self.child("frame", self.url + "?sign=SECRET2", root / "frame-second",
+                                          "--index-cache-dir", cache).stdout)
+                        cold = json.loads(self.child("frame", self.url, root / "frame-cold", "--no-index-cache").stdout)
+                        self.assertLess(warm["network"]["bytes_received"], cold["network"]["bytes_received"])
+                        a, b = warm["frames"][0], cold["frames"][0]
+                        self.assertEqual(a["actual_time_sec"], 1.2)
+                        self.assertEqual(zju.file_hash(Path(a["path"])), zju.file_hash(Path(b["path"])))
+                    for audio in root.rglob("*.m4a"):
+                        self.assertEqual(self.audio_signature(audio), self.audio_signature(source))
+                    index.close()
+                    # 破坏缓存正文后仍能恢复；视频帧与本地相同，音频包与时间线完全一致。
+                    with entries[0].open("r+b") as f:
+                        f.seek(zju.MP4IndexCache.header_size + 20)
+                        f.write(b"bad")
+                    out = root / (first + "-recovered.m4a")
+                    zju.make_audio(self.url, None, out, jobs=3, index_cache_dir=cache)
+                    self.assertEqual(self.audio_signature(out), self.audio_signature(source))
+
+    def test_default_cache_override_disabled_weak_version_and_unwritable_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            # CLI 不传缓存参数也会持久缓存，截图输出仍是独立目录。
+            self.child("audio", self.url, root / "default-audio")
+            expected = self.cache.parent / "zju-learning"
+            if sys.platform == "win32":
+                expected /= "cache"
+            self.assertEqual(len(list(expected.rglob("*.idx"))), 1)
+            self.assertFalse(list((root / "default-audio").rglob("*.idx")))
+            self.child("frame", self.url, root / "disabled", "--no-index-cache")
+            self.assertFalse(list((root / "disabled").rglob("*.idx")))
+            file = root / "not-directory"
+            file.write_text("untouched")
+            zju.make_audio(self.url, None, root / "unwritable.m4a", index_cache_dir=file)
+            self.assertEqual(file.read_text(), "untouched")
+            for headers in ({"ETag": 'W/"weak"', "Last-Modified": "Thu, 01 Jan 2026 00:00:00 GMT"},
+                            {"Last-Modified": "Thu, 01 Jan 2026 00:00:00 GMT"}):
+                type(self).validators = headers
+                cache = root / "weak"
+                zju.make_audio(self.url, None, root / "weak.m4a", index_cache_dir=cache)
+                self.assertFalse(cache.exists())
+            # 同大小、同 Last-Modified 的不同版本不能复用旧 moov。
+            type(self).validators = {"ETag": '"new"'}
+            zju.make_audio(self.url, None, root / "new.m4a", index_cache_dir=expected)
+            self.assertEqual(len(list(expected.rglob("*.idx"))), 2)
+
+    def test_index_download_interruption_cleans_pending_and_recovers(self):
+        original = zju.AudioRanges.get
+        async def stop(reader, ranges):
+            if reader.index_cache and reader.index_cache.writer:
+                raise asyncio.CancelledError()
+            return await original(reader, ranges)
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / "audio.m4a"
+            with mock.patch.object(zju.AudioRanges, "get", stop):
+                with self.assertRaises(asyncio.CancelledError):
+                    zju.make_audio(self.url, None, out, index_cache_dir=self.cache)
+            self.assertFalse(out.exists())
+            self.assertFalse(list(self.cache.rglob("*.idx")))
+            self.assertFalse(list(self.cache.rglob(".pending")))
+            zju.make_audio(self.url, None, out, index_cache_dir=self.cache)
+            self.assertEqual(self.audio_signature(out), self.audio_signature(self.video))
+            self.assertEqual(len(list(self.cache.rglob("*.idx"))), 1)
 
     def test_local_and_remote_audio_match_for_head_and_tail_index(self):
         for source in (self.video, self.tail, self.wide):
@@ -244,7 +412,7 @@ class AudioHTTP(unittest.TestCase):
             self.assertFalse(list(Path(d).glob(".zju-audio-*")))
             type(self).requests = 0
             type(self).change_version = True
-            with self.assertRaisesRegex(zju.ZjuError, "发生变化"):
+            with self.assertRaisesRegex(zju.ZjuError, "版本已变化"):
                 zju.make_audio(self.url, None, out, jobs=2)
             self.assertEqual(out.read_bytes(), b"existing")
             self.assertFalse(list(Path(d).glob(".zju-audio-*")))
@@ -264,7 +432,7 @@ class AudioCommands(unittest.TestCase):
             video.parent.mkdir(parents=True)
             video.write_bytes(b"complete video")
             client = mock.Mock()
-            def make(url, source, dest, jobs, limit):
+            def make(url, source, dest, jobs, limit, **cache):
                 self.assertIsNone(url)
                 self.assertEqual(source, video)
                 self.assertEqual(jobs, 32)
@@ -299,7 +467,7 @@ class AudioCommands(unittest.TestCase):
             video.parent.mkdir(parents=True)
             video.write_bytes(b"existing")
             args.dry_run = False
-            def save(url, source, dest, jobs, limit):
+            def save(url, source, dest, jobs, limit, **cache):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(b"audio")
             with mock.patch.object(zju, "make_audio", side_effect=save) as make:

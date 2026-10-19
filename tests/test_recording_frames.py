@@ -139,6 +139,9 @@ class Frames(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.dest = Path(self.tmp.name).resolve()
+        patch = mock.patch.object(zju, "default_index_cache_dir", return_value=self.dest / "index-cache")
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def run_frames(self, source=None, **kw):
         kw.setdefault("output_dir", str(self.dest))
@@ -260,7 +263,7 @@ class Frames(unittest.TestCase):
             path.write_bytes(content)
             start = len(header) + (len(media) if tail else 0)
             stop = start + len(index)
-            with server(path, "deferred-count") as (url, state), rf.FrameRangeReader(url) as reader:
+            with server(path, "deferred-count") as (url, state), rf.FrameRangeReader(url, index_cache_dir=None) as reader:
                 reader.cache_size = 4 * block
                 reader.read(32768)  # 记录 mdat 后 moov 的已知边界。
                 reader.seek(start)

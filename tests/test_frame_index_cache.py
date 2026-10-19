@@ -25,13 +25,42 @@ class IndexCache(unittest.TestCase):
         self.moov = zju.mp4_box(b"moov", zju.mp4_box(b"free", b"i" * 400000))
 
     def cache(self, identity=None, limit=2**20):
-        c = zju.FrameIndexCache(self.root / "cache", limit, identity or self.identity)
+        c = zju.MP4IndexCache(self.root / "cache", limit, identity or self.identity)
         self.addCleanup(c.close)
         return c
 
     def seed(self, cache):
         cache.capture((32, 32 + len(self.moov)), 32, self.moov)
         self.assertIsNotNone(cache.entry)
+
+    def test_default_directory_environment_fallback_and_cli_controls(self):
+        for platform in ("darwin", "linux", "win32"):
+            variable = "LOCALAPPDATA" if platform == "win32" else "XDG_CACHE_HOME"
+            suffix = Path("zju-learning/cache" if platform == "win32" else "zju-learning")
+            with mock.patch.object(sys, "platform", platform), mock.patch.dict(os.environ, {variable: str(self.root)}):
+                self.assertEqual(zju.default_index_cache_dir(), self.root / suffix)
+                self.assertEqual(zju.index_cache_options(SimpleNamespace())["index_cache_dir"], self.root / suffix)
+                for invalid in ("", "relative/path", " "):
+                    with mock.patch.dict(os.environ, {variable: invalid}):
+                        fallback = Path.home() / ("AppData/Local" if platform == "win32" else ".cache")
+                        self.assertEqual(zju.default_index_cache_dir(), fallback / suffix)
+        self.assertIsNone(zju.index_cache_options(SimpleNamespace(no_index_cache=True))["index_cache_dir"])
+        self.assertEqual(zju.index_cache_options(SimpleNamespace(index_cache_dir="chosen"))["index_cache_dir"], "chosen")
+        for args in (SimpleNamespace(index_cache_mb=0), SimpleNamespace(index_cache_dir=""),
+                     SimpleNamespace(index_cache_dir="chosen", no_index_cache=True)):
+            with self.assertRaises(zju.ZjuError):
+                zju.index_cache_options(args)
+        for command, prefix, handler in (("recording-audio", [], "cmd_recording_audio"),
+                                         ("recording-frame", ["--course", "1", "--sub", "2", "--at", "1"], "cmd_recording_frame"),
+                                         ("classroom", ["sync", "--recording-audio"], "cmd_classroom_sync")):
+            with mock.patch.object(zju, handler) as fn, mock.patch.object(zju, "load_config", return_value={}):
+                with mock.patch.object(sys, "argv", ["zju.py", command, *prefix, "--no-index-cache"]):
+                    zju.main()
+                self.assertTrue(fn.call_args.args[0].no_index_cache)
+                for option in (["--index-cache-mb", "0"], ["--index-cache-dir", "x", "--no-index-cache"]):
+                    with mock.patch.object(sys, "argv", ["zju.py", command, *prefix, *option]), self.assertRaises(SystemExit) as error:
+                        zju.main()
+                    self.assertEqual(error.exception.code, 2)
 
     def test_cache_options_validate_before_any_source_access_and_windows_lock(self):
         for value in (0, -1, 1.5, True):
@@ -95,7 +124,7 @@ class IndexCache(unittest.TestCase):
         # 用户指定不可写/非目录路径时，缓存失败不影响正常网络读取。
         file = self.root / "not-a-directory"
         file.write_bytes(b"untouched")
-        c = zju.FrameIndexCache(file, 2**20, self.identity)
+        c = zju.MP4IndexCache(file, 2**20, self.identity)
         c.capture((32, 32 + len(self.moov)), 32, self.moov)
         c.close()
         self.assertEqual(file.read_bytes(), b"untouched")
@@ -103,7 +132,7 @@ class IndexCache(unittest.TestCase):
     def test_cross_process_lock_and_crash_recovery(self):
         code = """import json,sys
 import zju
-c=zju.FrameIndexCache(sys.argv[1], 1048576, json.loads(sys.argv[2]))
+c=zju.MP4IndexCache(sys.argv[1], 1048576, json.loads(sys.argv[2]))
 data=zju.mp4_box(b'moov', zju.mp4_box(b'free', b'i'*400000))
 c.capture((32,32+len(data)),32,data[:100])
 print('locked',flush=True)
@@ -150,7 +179,7 @@ sys.stdin.read(1)
                 # 缓存正文损坏时，经过真实 Range 回退仍得到相同索引。
                 cache_file = reader.index_cache.path
                 with cache_file.open("r+b") as f:
-                    f.seek(zju.FrameIndexCache.header_size + 100)
+                    f.seek(zju.MP4IndexCache.header_size + 100)
                     f.write(b"BAD")
                 with zju.FrameRangeReader(url, index_cache_dir=self.root / "range-cache") as reader:
                     reader.read(32)
@@ -169,7 +198,7 @@ sys.stdin.read(1)
                     self.assertIsNone(reader.index_cache)
                 self.assertFalse((self.root / "weak-cache").exists())
         for p in (self.root / "range-cache").rglob("*.idx"):
-            self.assertNotIn(b"SECRET", p.read_bytes()[:zju.FrameIndexCache.header_size])
+            self.assertNotIn(b"SECRET", p.read_bytes()[:zju.MP4IndexCache.header_size])
 
     def test_real_decode_across_processes_and_local_priority(self):
         code = """import sys

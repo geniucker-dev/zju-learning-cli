@@ -200,18 +200,25 @@ Markdown 轉錄每段包含開始與結束時間，例如 `**[00:01:23 → 00:01
 
 普通 `--at` / `--frame` 請求的全部圖片快取有效時，直接回傳，不開啟 MP4 或初始化解碼器；遠端仍需一次 Range 探測驗證來源身分。缺少請求時長紀錄的舊快取會退回讀取索引；視窗或部分命中也沿用正常流程。
 
-預設不持久快取索引。若經常在不同 CLI 呼叫中查看同一錄播的新時間點，可明確指定獨立快取目錄：
+`recording-audio`、`recording-frame` 和 `classroom sync --recording-audio` **預設共用原始 MP4 索引快取**。音訊產生的快取可供截圖使用，反過來也一樣；音訊仍透過非同步 Multi-Range 下載並直接重封裝，不重新編碼。
+
+macOS / Linux 的預設目錄為 `${XDG_CACHE_HOME:-~/.cache}/zju-learning/`，Windows 為 `%LOCALAPPDATA%\zju-learning\cache\`。環境變數為空、相對路徑或無效時，分別退回 `~/.cache/zju-learning/`、`~/AppData/Local/zju-learning/cache/`。**這是穩定的索引目錄；預設截圖仍在每次獨立建立的系統暫存目錄，程序結束後保留。** 優先使用完整本地 MP4 時不建立索引快取。
+
+三個命令都可覆寫快取位置、調整容量或關閉快取：
 
 ```bash
 ./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 \
   --index-cache-dir "~/.cache/zju-learning" --index-cache-mb 256 --json
+./zju.py recording-audio --course 89253 --sub 2038840 --index-cache-dir "~/.cache/zju-learning"
+./zju.py classroom sync 89253 --recording-audio --index-cache-dir "~/.cache/zju-learning"
+./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 --no-index-cache --json
 ```
 
-後續呼叫使用相同 `--index-cache-dir` 即可重用。檔案位於指定目錄的 `zju-frame-index-v1/` 下，圖片仍遵循原輸出路徑規則。每次遠端 Range 探測確認強 ETag、來源身分及大小後才重用索引；簽名變更不影響相同來源版本，弱 ETag / Last-Modified 則退回正常讀取。課程權限、堂次下架狀態及錄播目錄仍會查詢。只儲存完整 `moov`，不儲存媒體片段、播放 URL 或認證資料，也不額外下載資料來填滿快取。
+後續呼叫使用相同快取位置即可跨程序雙向重用；相容舊版指定目錄下的有效快取。檔案位於指定目錄的 `zju-frame-index-v1/` 下，圖片仍遵循原輸出路徑規則。每次遠端 Range 探測確認強 ETag、來源身分及大小後才重用索引；簽名變更不影響相同來源版本，弱 ETag / Last-Modified 則退回正常讀取。課程權限、堂次下架狀態及錄播目錄仍會查詢。只儲存完整 `moov`，不儲存媒體片段、播放 URL 或認證資料，也不額外下載資料來填滿快取。
 
 `--index-cache-mb` 為正整數，總容量預設 **256 MiB**，包含索引檔案中繼資料及寫入中的暫存檔；較舊項目按存取時間淘汰，單個超過 **64 MiB** 的索引不持久快取。中繼資料與讀取的資料塊均驗證 SHA-256；損壞、遺失、無法寫入或容量不足時正常退回網路讀取。寫入者使用跨程序系統鎖，衝突時跳過本次持久化，不等待另一程序的網路請求；已有項目仍可讀取。索引完整後原子發布，異常退出的暫存檔由下次取得鎖的呼叫清理。不再需要時可刪除此命名空間目錄。
 
-索引快取的本地讀取不計入 `network.bytes_received`；網路探測與回退讀取仍受 `--max-fetch-mb` 限制。`cache_hit` 繼續表示**圖片**快取命中；`--force` 重新產生圖片，但仍可使用已驗證索引。沒有指定快取目錄、優先使用本地 MP4 時，不建立索引快取。
+索引快取的本地讀取不計入 `network.bytes_received`；網路探測與回退讀取仍受 `--max-fetch-mb` 限制。`cache_hit` 繼續表示**圖片**快取命中；`--force` 重新產生圖片，但仍可使用已驗證索引。`--no-index-cache` 不讀寫持久索引，與 `--index-cache-dir` 互斥；不刪除已有快取。音訊的 `--max-size` 繼續限制輸出檔案大小，不作為網路預算；截圖流量預算不變。
 
 `recording-frame` 使用既有智雲 token 直接請求業務介面，省去學在浙大預檢。認證失效時最多重新登入並重試一次；仍被拒絕則明確報錯。其他命令沿用原認證流程。
 

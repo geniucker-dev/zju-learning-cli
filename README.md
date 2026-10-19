@@ -200,18 +200,25 @@ Markdown 转写的每段带开始和结束时间，例如 `**[00:01:23 → 00:01
 
 普通 `--at` / `--frame` 请求的全部图片缓存有效时，直接返回，不打开 MP4 或初始化解码器；远端仍需一次 Range 探测验证来源身份。缺少请求时长记录的旧缓存会回退到读取索引；窗口或部分命中也沿用正常流程。
 
-默认不持久缓存索引。若经常在不同 CLI 调用中查看同一录播的新时间点，可明确指定一个独立缓存目录：
+`recording-audio`、`recording-frame` 和 `classroom sync --recording-audio` **默认共用原始 MP4 索引缓存**。音频生成的缓存可供截图使用，反过来也一样；音频仍通过异步 Multi-Range 下载并直接重封装，不重新编码。
+
+默认缓存目录在 macOS / Linux 为 `${XDG_CACHE_HOME:-~/.cache}/zju-learning/`，Windows 为 `%LOCALAPPDATA%\zju-learning\cache\`。环境变量为空、相对路径或无效时，分别回退到 `~/.cache/zju-learning/`、`~/AppData/Local/zju-learning/cache/`。**这是稳定的索引目录；默认截图仍在每次独立创建的系统临时目录，退出后保留。** 本地完整 MP4 命中时不创建索引缓存。
+
+三个命令均可覆盖缓存位置、调整容量或关闭缓存：
 
 ```bash
 ./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 \
   --index-cache-dir "~/.cache/zju-learning" --index-cache-mb 256 --json
+./zju.py recording-audio --course 89253 --sub 2038840 --index-cache-dir "~/.cache/zju-learning"
+./zju.py classroom sync 89253 --recording-audio --index-cache-dir "~/.cache/zju-learning"
+./zju.py recording-frame --course 89253 --sub 2038840 --at 01:23:45 --no-index-cache --json
 ```
 
-后续调用使用同一 `--index-cache-dir` 即可复用。文件存放在指定目录的 `zju-frame-index-v1/` 下，图片仍遵循原输出路径规则。只有每次远端 Range 探测确认了强 ETag、资源身份和大小，才会复用索引；签名变化不影响相同来源版本，弱 ETag / Last-Modified 则回退正常读取。课程权限、堂次下架状态及录播目录仍会查询。缓存只保存完整 `moov`，不保存媒体片段、播放 URL 或认证信息，也不会额外下载数据来填满缓存。
+后续调用使用同一缓存位置即可跨进程双向复用；旧版指定目录下的有效缓存继续兼容。文件存放在指定目录的 `zju-frame-index-v1/` 下，图片仍遵循原输出路径规则。只有每次远端 Range 探测确认了强 ETag、资源身份和大小，才会复用索引；签名变化不影响相同来源版本，弱 ETag / Last-Modified 则回退正常读取。课程权限、堂次下架状态及录播目录仍会查询。缓存只保存完整 `moov`，不保存媒体片段、播放 URL 或认证信息，也不会额外下载数据来填满缓存。
 
 `--index-cache-mb` 为正整数，总容量默认 **256 MiB**，包含索引文件元数据及写入中的暂存文件；较旧条目按访问时间淘汰，单个超过 **64 MiB** 的索引不持久缓存。元数据及所读数据块均经过 SHA-256 校验，损坏、缺失、无法写入或容量不足时正常回退。写者使用跨进程系统锁，冲突时跳过本次持久化，不等待另一进程的网络请求；已有条目仍可读取。索引完整后原子发布，异常退出的暂存文件由下次取得锁的调用清理。无需缓存时可以删除此命名空间目录。
 
-索引缓存的本地读取不计入 `network.bytes_received`；网络探测和回退读取仍受 `--max-fetch-mb` 限制。`cache_hit` 继续表示**图片**缓存命中；`--force` 重新生成图片，但仍可使用已验证的索引。没有指定缓存目录、本地 MP4 优先命中时，不创建索引缓存。
+索引缓存的本地读取不计入 `network.bytes_received`；网络探测和回退读取仍受 `--max-fetch-mb` 限制。`cache_hit` 继续表示**图片**缓存命中；`--force` 重新生成图片，但仍可使用已验证的索引。`--no-index-cache` 不读写持久索引，与 `--index-cache-dir` 互斥；不会删除已有缓存。音频 `--max-size` 继续限制输出文件大小，不作为网络预算；截图流量预算不变。
 
 `recording-frame` 使用现有智云 token 直接请求业务接口，省去学在浙大预检。认证失效时最多重新登录并重试一次；仍被拒绝则明确报错。其他命令沿用原认证流程。
 
