@@ -63,6 +63,8 @@ def args(**kw):
 @contextlib.contextmanager
 def server(path, mode="normal"):
     state = argparse.Namespace(mode=mode, requests=0, sent=0, ranges=[], headers=[], version='"v1"')
+    # 确定性模拟：客户端收到响应后，服务端仍未更新发送统计。
+    accounting_gate = threading.Event() if mode == "deferred-count" else None
     size = path.stat().st_size
 
     class Handler(BaseHTTPRequestHandler):
@@ -93,17 +95,23 @@ def server(path, mode="normal"):
                 data = data[:len(data) // 2]
             try:
                 self.wfile.write(data)
+                if accounting_gate is not None:
+                    accounting_gate.wait()
                 state.sent += len(data)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
     state.modified = "Mon, 19 Oct 2026 00:00:00 GMT"
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    # server_close() 必须等待请求处理线程，退出上下文后统计才是最终值。
+    httpd.daemon_threads = False
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
         yield f"http://127.0.0.1:{httpd.server_port}/video.mp4?signature=SECRET", state
     finally:
+        if accounting_gate is not None:
+            accounting_gate.set()
         httpd.shutdown()
         httpd.server_close()
         thread.join()
@@ -181,8 +189,6 @@ class Frames(unittest.TestCase):
                 self.assertEqual(opened.call_count, 1)
                 self.assert_frame(r, t - .05)
                 self.assertEqual(r["decode"]["seeks"], 1)
-                self.assertEqual(r["network"]["requests"], state.requests)
-                self.assertEqual(r["network"]["bytes_received"], state.sent)
                 self.assertTrue(all("Cookie" not in h and "Authorization" not in h for h in state.headers))
                 self.assertTrue(all(h.get("If-Range") == '"v1"' for h in state.headers[1:]))
                 if fixture == self.large:
@@ -190,6 +196,8 @@ class Frames(unittest.TestCase):
                     self.assertTrue(any(lo > fixture.stat().st_size // 2 for lo, hi in state.ranges))
                 for f in r["frames"]:
                     self.assertNotIn("SECRET", rf.sidecar(Path(f["path"])).read_text())
+            self.assertEqual(r["network"]["requests"], state.requests)
+            self.assertEqual(r["network"]["bytes_received"], state.sent)
 
     def test_bad_range_truncated_changed_and_budget(self):
         for mode, message in [("bad", "Content-Range"), ("short", "不完整"), ("change", "版本已变化")]:
@@ -199,7 +207,7 @@ class Frames(unittest.TestCase):
         with server(self.large) as (url, state):
             with self.assertRaisesRegex(rf.FrameError, "上限"):
                 self.run_frames(url, max_fetch_mb=.01)
-            self.assertLessEqual(state.sent, .01 * 2**20)
+        self.assertLessEqual(state.sent, .01 * 2**20)
         with server(self.large) as (url, state), rf.FrameRangeReader(url, 2**20 + 16) as reader:
             self.assertEqual(len(reader.read(1)), 1)
             reader.seek(2**20)
@@ -252,7 +260,7 @@ class Frames(unittest.TestCase):
             path.write_bytes(content)
             start = len(header) + (len(media) if tail else 0)
             stop = start + len(index)
-            with server(path) as (url, state), rf.FrameRangeReader(url) as reader:
+            with server(path, "deferred-count") as (url, state), rf.FrameRangeReader(url) as reader:
                 reader.cache_size = 4 * block
                 reader.read(32768)  # 记录 mdat 后 moov 的已知边界。
                 reader.seek(start)
@@ -266,13 +274,14 @@ class Frames(unittest.TestCase):
                                ({0} | set(range(start // block * block, stop, block))))
                 self.assertEqual(reader.bytes_received, expected + 16)
                 self.assertLessEqual(sum(map(len, reader.cache.values())), reader.cache_size)
-                self.assertEqual(reader.bytes_received, state.sent)
                 # 回读被淘汰的块时，不重新下载其后仍在缓存中的索引块。
                 first_cached = min(reader.cache)
                 before = reader.bytes_received
                 reader.seek(first_cached - block)
                 reader.read(1)
                 self.assertEqual(reader.bytes_received - before, block)
+            # 客户端读完不代表处理请求的线程已更新统计；关闭服务后才核对。
+            self.assertEqual(reader.bytes_received, state.sent)
             with server(path) as (url, _), rf.FrameRangeReader(url, 3 * block + 16) as reader:
                 reader.read(32768)
                 reader.seek(start)
