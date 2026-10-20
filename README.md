@@ -1,22 +1,80 @@
-# zju-learning-cli
+# ZJU LearnPilot
 
 简体中文 | [繁體中文](README.zh-TW.md)
 
-学在浙大与智云课堂的独立、跨平台单文件 CLI。使用 uv、PEP 723 和 Python wheel；只需分发 `zju.py`，不需要安装项目包或系统 FFmpeg。
+面向浙江大学课程的学习助手：作为 Agent Skill，结合本地转写、课件与录播画面学习知识点；作为独立 CLI，查询和同步学在浙大、智云课堂资料。两种方式使用同一份程序，互不依赖。
 
-## 安装与登录
+## 必需环境
 
-需要 [uv](https://docs.astral.sh/uv/)；Python >=3.10 可由 uv 管理。首次运行自动安装文件头声明的依赖。
+安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，并确保终端可运行 `uv --version`。uv 根据脚本内的 PEP 723 声明管理 Python >=3.10 与 Python wheel；首次使用需要下载运行环境和依赖。无需手工安装 Python 包、系统 FFmpeg 或 ffprobe。缺少 uv 时直接入口会提示安装，不切换系统 Python。
+
+Bun / Node.js 只用于下面相应的 Skill 安装器，CLI 运行不需要它们。macOS、Windows、Linux 使用同一份脚本。
+
+## 方式一：安装 Agent Skill（内含完整 CLI）
+
+使用 [Vercel skills](https://github.com/vercel-labs/skills)：
 
 ```bash
-git clone https://github.com/geniucker-dev/zju-learning-cli.git
-cd zju-learning-cli
+bunx skills add geniucker-dev/zju-learnpilot --skill zju-learnpilot -g
+# 没有 Bun、已有 Node.js 时也可用 npx skills add …
+```
+
+按安装器提示选择 Agent。去掉 `-g` 安装到当前项目；只给 Codex 安装可追加 `--agent codex`。Agent 加载 Skill 后可提出：
+
+- “帮我学习现代控制理论的能控性，优先用已有课程资料。”
+- “解释这个课程目录中某堂课 01:23:45 附近的推导。”
+- “列出我的本地课程；把我选择的课程同步下来，包含录播音频。”
+
+Skill 先搜索本地转写，再用 `classroom context` 定位原文与候选 PPT，必要时少量取帧。回答引用堂次、时间和页码，区分课程内容与 AI 补充。PPT 与媒体时间未精确校准，多段录播不猜所属分段。远端查询/下载需要登录；上传、提交作业和发帖须获得明确授权。
+
+安装一次即可获得 `scripts/zju.py`，不必再克隆仓库或下载 CLI。安装器**不会自动创建全局 `zju` 命令**。从安装器报告的 Skill 目录直接运行：
+
+```bash
+uv run --script "/实际安装目录/zju-learnpilot/scripts/zju.py" --help
+```
+
+例如 Vercel skills 的 Codex 用户级安装使用 `~/.agents/skills/zju-learnpilot/`：
+
+```bash
+uv run --script "$HOME/.agents/skills/zju-learnpilot/scripts/zju.py" classroom courses --local --json
+```
+
+上例 `$HOME` 同样适用于 PowerShell；其他 Agent/安装器的路径可能不同，应以实际安装结果为准。Skill 自身相对定位脚本，不依赖这个示例路径或当前工作目录。
+
+### 其他安装器与更新
+
+- **[OpenSkills](https://github.com/numman-ali/openskills)**：`npx openskills install geniucker-dev/zju-learnpilot -g`。默认用户级目录是 `~/.claude/skills`；不加 `-g` 为项目级，`--universal` 使用 `.agent/skills`。在需要的 Agent 项目中执行 `npx openskills sync`，选择本 Skill，向该项目的 `AGENTS.md` 写入发现信息。更新用 `npx openskills update zju-learnpilot`。
+- **Codex 原生 Skill 安装器**：让 Codex 的 `$skill-installer` 安装 `https://github.com/geniucker-dev/zju-learnpilot/tree/main/skills/zju-learnpilot`。通常位于 `~/.codex/skills/zju-learnpilot`，安装后按提示重新加载/重启 Agent。原生安装器拒绝覆盖同名目录；更新前备份并移除该 Skill 的旧安装副本，再重新安装，不清空其他 Skills。
+- **标准目录分发**：将完整 `skills/zju-learnpilot/` 放入宿主支持的 Skill 目录；不要只复制 `SKILL.md`。遵循 [Agent Skills 规范](https://agentskills.io/specification)，附带 `scripts/`、`references/` 和 `LICENSE`。
+
+Vercel skills 可重新运行同一条 `add` 命令更新，也提供 `skills update`。更新应整体替换 Skill，使说明与内附 CLI 同步。课程资料和认证保存在 Skill 外；不要把资料放进安装目录。各安装器对路径、发现和更新的处理不同，不假定其共享全局注册或 PATH 命令。
+
+## 方式二：独立 CLI（无需 Agent / Skill 安装器）
+
+```bash
+git clone https://github.com/geniucker-dev/zju-learnpilot.git
+cd zju-learnpilot
+uv run --script zju.py --help
 uv run --script zju.py login
 ```
 
-macOS/Linux 也可直接 `./zju.py login`。本文的 `./zju.py …` 在 Windows 使用 `uv run --script zju.py …`，无需创建软链接。双击 `zju_login.command` / `zju_login.bat` 会运行 `login --reset`，重新设置凭据和会话，**保留资料库及追踪课程设置**。
+macOS/Linux 也可直接 `./zju.py login`。本文下文的 `./zju.py …` 在 Windows 使用 `uv run --script zju.py …`，无需软链接。现有仓库目录可以保留原名称，已有调用根目录 `./zju.py` 的同步脚本和 CLI 参数不变。
 
-密码保存在系统凭据库（macOS Keychain，其他平台使用 keyring）；也支持 `ZJU_USER` / `ZJU_PASS`。配置和会话位于 `~/.config/zju-learning/`，可用 `ZJU_STATE_DIR` 指定整个状态目录。不要将凭据放进课程目录。
+```text
+zju-learnpilot/
+├── zju.py                         # 薄入口，只转交给下列脚本
+├── skills/zju-learnpilot/
+│   ├── SKILL.md
+│   ├── scripts/zju.py             # 唯一 CLI 实现及 PEP 723 依赖
+│   ├── references/                # 按需读取的学习与课程操作说明
+│   ├── agents/openai.yaml         # Codex 展示信息，其他 Agent 可忽略
+│   └── LICENSE
+└── tests/
+```
+
+根目录入口需要保留上述仓库布局；Skill 内的 `scripts/zju.py` 本身仍是可单独复制运行的完整单文件 CLI，直接 `uv run --script /path/to/zju.py …` 即可。两种入口均由 uv 管理环境，不需要安装项目包。
+
+双击 `zju_login.command` / `zju_login.bat` 会执行 `login --reset`，重新设置凭据和会话，**保留资料库及追踪课程设置**。密码保存在系统凭据库（macOS Keychain，其他平台使用 keyring）；也支持 `ZJU_USER` / `ZJU_PASS`。配置和会话仍位于 `~/.config/zju-learning/`，`ZJU_STATE_DIR` 可指定整个状态目录。品牌变更不会迁移配置、认证、缓存、课程目录或改变 JSON 格式；不要将凭据放进课程目录。
 
 ## 命令分组
 
@@ -216,12 +274,12 @@ uv run --python 3.12 --with requests --with httpx --with img2pdf --with pillow \
 
 退出码：0 成功；1 配置、认证、元数据或运行错误；2 参数错误或批量部分失败（以 stderr 诊断区分）；130 用户中断。没有资料与下载失败有不同提示，部分失败会继续处理其他项目。
 
-这是发布前的新规范，不提供旧 CLI、旧配置或旧 Manifest 兼容和自动迁移。原资料须由用户在仓库外单独迁移并建立新的课程身份及完成记录；仅复制媒体文件不会自动登记为工具资料。无需因为容器格式变化而重下或转码。本程序不提供时间轴自动校准、全局目录注册、后台服务、Skill 或 MCP。
+这是发布前的新规范，不提供旧 CLI、旧配置或旧 Manifest 兼容和自动迁移。原资料须由用户在仓库外单独迁移并建立新的课程身份及完成记录；仅复制媒体文件不会自动登记为工具资料。无需因为容器格式变化而重下或转码。本程序不提供时间轴自动校准、全局目录注册、后台服务或 MCP。
 
 ## 安全与致谢
 
 Cookie 以受权限保护的 JSON 保存在用户状态目录；明文 HTTP 不发送 Cookie/Authorization。没有遥测。资料版权属于授课教师与学校，请遵守平台规则，不公开传播课程材料。
 
-本项目由 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant) 的认证与平台 API 逻辑发展而来，保留 MIT 版权声明。录播目录接口参考 Cold_Ink 的[智云课堂批量下载](https://greasyfork.org/scripts/514465)；附件访问方式参考 [eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader)、[xzzd-pro/xzzd-pro](https://github.com/xzzd-pro/xzzd-pro)。
+本项目从 [8eoyw/zju-learning-cli](https://github.com/8eoyw/zju-learning-cli) 发展而来，认证与平台 API 逻辑源自 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)，保留原有 MIT 版权声明。录播目录接口参考 Cold_Ink 的[智云课堂批量下载](https://greasyfork.org/scripts/514465)；附件访问方式参考 [eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader)、[xzzd-pro/xzzd-pro](https://github.com/xzzd-pro/xzzd-pro)。
 
 [MIT License](LICENSE)

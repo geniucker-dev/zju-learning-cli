@@ -17,7 +17,7 @@ from course_fixtures import initialize, register
 import numpy as np
 from PIL import Image
 
-spec = importlib.util.spec_from_file_location("zju_metadata_tests", Path(__file__).resolve().parents[1] / "zju.py")
+spec = importlib.util.spec_from_file_location("zju_metadata_tests", Path(__file__).resolve().parents[1] / "skills/zju-learnpilot/scripts/zju.py")
 zju = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(zju)
 

@@ -8,7 +8,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-spec = importlib.util.spec_from_file_location("zju_upstream_tests", Path(__file__).resolve().parents[1] / "zju.py")
+spec = importlib.util.spec_from_file_location("zju_upstream_tests", Path(__file__).resolve().parents[1] / "skills/zju-learnpilot/scripts/zju.py")
 zju = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(zju)
 

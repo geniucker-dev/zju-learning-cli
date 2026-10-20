@@ -1,0 +1,4 @@
+interface:
+  display_name: "ZJU LearnPilot"
+  short_description: "结合浙大课程转写、课件与录播画面学习知识点，并查询和同步课程资料"
+  default_prompt: "使用 $zju-learnpilot 从我的本地浙大课程资料中定位相关讲解，并结合课件解释这个知识点。"

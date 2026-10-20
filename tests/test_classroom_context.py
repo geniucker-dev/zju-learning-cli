@@ -19,7 +19,7 @@ import av
 import numpy as np
 from PIL import Image
 
-SCRIPT = Path(__file__).resolve().parents[1] / "zju.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "skills/zju-learnpilot/scripts/zju.py"
 spec = importlib.util.spec_from_file_location("zju_context_tests", SCRIPT)
 zju = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(zju)
@@ -353,7 +353,7 @@ class ClassroomContext(unittest.TestCase):
         standalone = self.root / "standalone"
         standalone.mkdir()
         shutil.copy2(SCRIPT, standalone / "zju.py")
-        base = [sys.executable, str(standalone / "zju.py"), "classroom", "context", "--library", str(self.root),
+        base = [shutil.which("uv"), "run", "--script", str(standalone / "zju.py"), "classroom", "context", "--library", str(self.root),
                 "--course", "1", "--sub", "11", "--json"]
         env = dict(os.environ, ZJU_STATE_DIR=str(self.root / "no-account"), PYTHONUTF8="1")
         result = subprocess.run(base + ["--at", "20"], capture_output=True, text=True, encoding="utf-8", env=env)

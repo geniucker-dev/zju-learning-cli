@@ -5,7 +5,7 @@ import unittest
 from course_fixtures import initialize, register, minimal_mp4
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent / "skills/zju-learnpilot/scripts"
 spec = importlib.util.spec_from_file_location("zju", ROOT / "zju.py")
 zju = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(zju)

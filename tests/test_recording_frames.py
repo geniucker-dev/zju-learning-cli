@@ -24,7 +24,7 @@ import httpx
 import numpy as np
 from PIL import Image
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1] / "skills/zju-learnpilot/scripts"
 sys.path.insert(0, str(ROOT))
 
 spec = importlib.util.spec_from_file_location("zju_frame_tests", ROOT / "zju.py")
@@ -738,7 +738,8 @@ with mock.patch.object(zju, 'recording_frame_source', return_value=(Path(sys.arg
         source.write_bytes(self.small.read_bytes())
         register(zju, self.dest, source, dict(course_id=89253, sub_id=2038840), "录播", "mp4")
         uv = shutil.which("uv")
-        runner = [uv, "run", "--script", str(script)] if uv else [sys.executable, "-I", str(script)]
+        self.assertIsNotNone(uv, "Tests require uv")
+        runner = [uv, "run", "--script", str(script)]
         env = dict(os.environ, ZJU_STATE_DIR=str(self.dest / "state"), PYTHONIOENCODING="utf-8")
         env.pop("PYTHONPATH", None)
         for option in ("--help", "recording-frame"):
