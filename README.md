@@ -15,11 +15,11 @@ Bun / Node.js 只用于下面相应的 Skill 安装器，CLI 运行不需要它�
 使用 [Vercel skills](https://github.com/vercel-labs/skills)：
 
 ```bash
-bunx skills add geniucker-dev/zju-learnpilot --skill zju-learnpilot -g
+bunx skills add -g geniucker-dev/zju-learnpilot
 # 没有 Bun、已有 Node.js 时也可用 npx skills add …
 ```
 
-按安装器提示选择 Agent。去掉 `-g` 安装到当前项目；只给 Codex 安装可追加 `--agent codex`。Agent 加载 Skill 后可提出：
+安装器会自动发现唯一的 `zju-learnpilot` Skill，无需填写 `--skill`。按提示选择 Agent；安装器识别到 Agent 时也可能自动完成安装。去掉 `-g` 安装到当前项目；只给 Codex 安装可追加 `--agent codex`，需要明确筛选时可加 `--skill zju-learnpilot`。安装后开启新的 Agent 会话，或按宿主提示重新加载 Skill，即可提出：
 
 - “帮我学习现代控制理论的能控性，优先用已有课程资料。”
 - “解释这个课程目录中某堂课 01:23:45 附近的推导。”
