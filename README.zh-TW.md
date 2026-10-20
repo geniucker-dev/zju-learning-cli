@@ -12,14 +12,35 @@ Bun / Node.js 只用於下列對應的 Skill 安裝器，CLI 執行不需要它�
 
 ## 方式一：安裝 Agent Skill（內含完整 CLI）
 
-使用 [Vercel skills](https://github.com/vercel-labs/skills)：
+使用 [Vercel skills](https://github.com/vercel-labs/skills)，依使用範圍選擇安裝方式。兩種方式都包含完整的 `scripts/zju.py`，不需另外複製倉庫或下載 CLI。
+
+以下 CLI 路徑以 **Vercel skills 的 Codex 安裝**為例；其他 Agent 或安裝器可能使用不同目錄，請以安裝器回報的 Skill 路徑為準，執行其中的 `scripts/zju.py`。
+
+### 專案級安裝
+
+適合在指定工作區使用。在希望使用 Skill 的工作目錄中執行：
+
+```bash
+bunx skills add geniucker-dev/zju-learnpilot
+# 安裝後直接執行內附 CLI（Codex 路徑範例，在該工作目錄中執行）
+uv run --script ".agents/skills/zju-learnpilot/scripts/zju.py" --help
+```
+
+### 使用者級安裝
+
+適合希望在多個專案中使用同一 Skill 的使用者：
 
 ```bash
 bunx skills add -g geniucker-dev/zju-learnpilot
-# 沒有 Bun、已有 Node.js 時亦可用 npx skills add …
+# 安裝後可從其他目錄執行內附 CLI（Codex 路徑範例）
+uv run --script "$HOME/.agents/skills/zju-learnpilot/scripts/zju.py" --help
 ```
 
-安裝器會自動發現唯一的 `zju-learnpilot` Skill，無需填寫 `--skill`。按提示選擇 Agent；識別到 Agent 時也可能自動完成安裝。移除 `-g` 安裝到目前專案；只安裝給 Codex 可加上 `--agent codex`，需要明確篩選時可加 `--skill zju-learnpilot`。安裝後開啟新的 Agent 會話，或依宿主提示重新載入 Skill，即可提出：
+沒有 Bun、已有 Node.js 時可將 `bunx` 換成 `npx`。安裝器會自動發現唯一的 `zju-learnpilot` Skill，無需傳入 `--skill`。依提示選擇 Agent；識別到 Agent 時也可能自動完成安裝。只安裝給 Codex 可加上 `--agent codex`。上例 `$HOME` 同樣適用 PowerShell。安裝器**不會自動建立全域 `zju` 命令**；兩種作用域下執行 CLI 都需要 uv。
+
+Skill 安裝作用域決定 Agent 從哪裡發現 Skill，與 CLI 的課程資料庫位置無關。兩種安裝皆可透過 `--library`、`--course-dir` 或既有設定選擇資料位置，參見[路徑說明](#路徑與設定)。Skill 相對自身定位腳本，不依賴範例路徑或目前工作目錄。
+
+安裝後在對應工作區開啟新的 Agent 會話，或依宿主提示重新載入 Skill，即可提出：
 
 - 「幫我學習現代控制理論的能控性，優先使用既有課程資料。」
 - 「解釋這個課程目錄中某堂課 01:23:45 附近的推導。」
@@ -27,25 +48,11 @@ bunx skills add -g geniucker-dev/zju-learnpilot
 
 Skill 先搜尋本地轉寫，再以 `classroom context` 定位原文與候選 PPT，必要時少量取幀。回答引用堂次、時間與頁碼，區分課堂內容和 AI 補充。PPT 與媒體時間尚未精確校準，多段錄播不猜所屬分段。遠端查詢/下載需要登入；上傳、交作業及發帖須有明確授權。
 
-安裝一次即取得 `scripts/zju.py`，不需再複製倉庫或下載 CLI。安裝器**不會自動建立全域 `zju` 命令**。使用安裝器回報的 Skill 目錄：
-
-```bash
-uv run --script "/實際安裝目錄/zju-learnpilot/scripts/zju.py" --help
-```
-
-例如 Vercel skills 的 Codex 使用者級安裝使用 `~/.agents/skills/zju-learnpilot/`：
-
-```bash
-uv run --script "$HOME/.agents/skills/zju-learnpilot/scripts/zju.py" classroom courses --local --json
-```
-
-`$HOME` 同樣適用 PowerShell；其他 Agent/安裝器可能使用不同路徑，以實際結果為準。Skill 相對自身定位腳本，不依賴這個範例路徑或目前工作目錄。
-
 ### 其他安裝器與更新
 
-- **[OpenSkills](https://github.com/numman-ali/openskills)**：`npx openskills install geniucker-dev/zju-learnpilot -g`。預設使用者級目錄是 `~/.claude/skills`；不加 `-g` 為專案級，`--universal` 使用 `.agent/skills`。在需要的 Agent 專案執行 `npx openskills sync`，選擇本 Skill，將發現資訊寫入該專案的 `AGENTS.md`。更新使用 `npx openskills update zju-learnpilot`。
+- **[OpenSkills](https://github.com/numman-ali/openskills)**：`npx openskills install geniucker-dev/zju-learnpilot` 預設安裝到目前專案的 `.claude/skills`；加 `-g` 安裝到使用者級 `~/.claude/skills`，`--universal` 改用對應作用域的 `.agent/skills`。在需要的 Agent 專案執行 `npx openskills sync`，選擇本 Skill，將發現資訊寫入該專案的 `AGENTS.md`。更新使用 `npx openskills update zju-learnpilot`。
 - **Codex 原生 Skill 安裝器**：請 Codex 的 `$skill-installer` 安裝 `https://github.com/geniucker-dev/zju-learnpilot/tree/main/skills/zju-learnpilot`。通常位於 `~/.codex/skills/zju-learnpilot`，完成後按提示重新載入/啟動 Agent。原生安裝器拒絕覆寫同名目錄；更新前備份並移除該 Skill 的舊安裝副本，再重新安裝，不清空其他 Skills。
-- **標準目錄分發**：將完整 `skills/zju-learnpilot/` 放進宿主支援的 Skill 目錄，不只複製 `SKILL.md`。遵循 [Agent Skills 規範](https://agentskills.io/specification)，附帶 `scripts/`、`references/` 與 `LICENSE`。
+- **標準目錄分發**：將完整 `skills/zju-learnpilot/` 放進宿主支援的 Skill 目錄，不只複製 `SKILL.md`。遵循 [Agent Skills 規範](https://agentskills.io/specification)，附帶 `scripts/`、`references/` 與 `LICENSE`；規範定義 Skill 結構，安裝位置由宿主或安裝器決定。
 
 Vercel skills 可重跑相同 `add` 命令更新，亦提供 `skills update`。更新時整體替換 Skill，讓說明與 CLI 同步。課程資料及憑據存放在 Skill 外，不放進安裝目錄。各安裝器的路徑、發現與更新行為不同，不能假定共用全域註冊或 PATH 命令。
 
